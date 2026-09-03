@@ -71,16 +71,29 @@ class CoordinatesTest {
 
     @Test
     fun `parse lands on the cell centre`() {
-        // A 4-digit grid is a 1 km square. Parsing must aim at the middle of it,
-        // so the metre-level easting and northing both end in 500. If someone
-        // "fixes" this back to the SW corner, re-formatting can fall into the
-        // neighbouring cell and this test is why it must not happen.
+        // A 4-digit grid is a 1 km square. Parsing must aim at the middle of it:
+        // if someone "fixes" this back to the SW corner, re-formatting can fall
+        // into the neighbouring cell, and this test is why it must not happen.
+        //
+        // Asserted with tolerance rather than an exact "500": the point makes a
+        // round trip through our Snyder inverse and then NGA's own forward
+        // projection, and the two agree to about a metre, not to the millimetre.
+        // A corner would read 000 and a centre reads 499-501, so a metre of slack
+        // costs nothing and keeps the test from failing for the wrong reason.
         val parsed = Coordinates.parseMgrs("33UXP0000")
         assertNotNull(parsed)
         val fine = Coordinates.mgrs(parsed!!.first, parsed.second, 10)
         assertNotNull(fine)
-        assertTrue("easting ${fine!!.easting} is not a cell centre", fine.easting.endsWith("500"))
-        assertTrue("northing ${fine.northing} is not a cell centre", fine.northing.endsWith("500"))
+        val eastingInCell = fine!!.easting.takeLast(3).toInt()
+        val northingInCell = fine.northing.takeLast(3).toInt()
+        assertTrue(
+            "easting ${fine.easting} is not a cell centre (got $eastingInCell m into the cell)",
+            eastingInCell in 400..600,
+        )
+        assertTrue(
+            "northing ${fine.northing} is not a cell centre (got $northingInCell m into the cell)",
+            northingInCell in 400..600,
+        )
     }
 
     @Test
