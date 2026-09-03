@@ -96,6 +96,7 @@ import app.gridfix.android.data.DataPackage
 import app.gridfix.android.data.DEFAULT_FOLDER
 import app.gridfix.android.data.GeoVertex
 import app.gridfix.android.data.GraphicsRepository
+import app.gridfix.android.data.simplifyTrack
 import app.gridfix.android.data.InterchangeFiles
 import app.gridfix.android.data.KIND_UNIT
 import app.gridfix.android.data.SettingsRepository
@@ -105,6 +106,7 @@ import app.gridfix.android.data.WaypointRepository
 import app.gridfix.android.location.Declination
 import app.gridfix.android.location.TrackRecorderService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import org.osmdroid.util.GeoPoint
 import kotlin.random.Random
@@ -260,7 +262,21 @@ fun GridFixApp() {
         }
     }
 
+    // Wait for the stored settings before deciding anything from them, so an
+    // existing user never sees the first-run screen flash past on launch.
+    var settingsLoaded by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        runCatching { repo.settings.first() }
+        settingsLoaded = true
+    }
+
     GridFixTheme(nightMode = settings.nightMode) {
+        // What a phone GPS is and is not, once, before anything else.
+        if (settingsLoaded && !settings.disclaimerAccepted) {
+            DisclaimerScreen(onAccept = { scope.launch { repo.setDisclaimerAccepted(true) } })
+            return@GridFixTheme
+        }
+
         // Subscription gate. Debug builds (sideloaded field-test APKs) always
         // run unlocked; the Play release build requires GridFix Pro.
         if (paywallPreview) {
@@ -639,13 +655,14 @@ fun GridFixApp() {
                                 val pts = TrackRepository.readPoints(context, t.id)
                                 if (pts.size >= 2) {
                                     val reversed = pts.reversed()
-                                    val stride = kotlin.math.max(1, reversed.size / 19)
-                                    val dec = ArrayList<GeoVertex>()
-                                    var i = 0
-                                    while (i < reversed.size) {
-                                        dec.add(GeoVertex(reversed[i].lat, reversed[i].lon))
-                                        i += stride
-                                    }
+                                    // Keep the shape, not every twentieth fix: a uniform
+                                    // stride cuts the corner off every switchback and
+                                    // ridgeline, which is exactly what you are following
+                                    // back. Douglas-Peucker at 20 m keeps the turns and
+                                    // drops the straights, then cap at the vertex limit.
+                                    val dec = ArrayList(
+                                        simplifyTrack(reversed.map { GeoVertex(it.lat, it.lon) }, 20.0)
+                                    )
                                     val last = reversed.last()
                                     if (dec.last().lat != last.lat || dec.last().lon != last.lon) {
                                         dec.add(GeoVertex(last.lat, last.lon))
@@ -822,7 +839,9 @@ fun GridFixApp() {
                         scope.launch {
                             val folderName =
                                 "Course " + Coordinates.dtg(System.currentTimeMillis()).take(7)
-                            waypointRepo.addFolder(folderName)
+                            // The folder is created only once points exist: a tight radius
+                            // can fail to place them, and an empty "Course DDHHMM" folder
+                            // would be left behind on every failed attempt.
                             val pts = mutableListOf<Pair<Double, Double>>()
                             var attempts = 0
                             while (pts.size < count && attempts < 400) {
@@ -838,6 +857,8 @@ fun GridFixApp() {
                                 }
                                 if (separated) pts.add(p.latitude to p.longitude)
                             }
+                            if (pts.size < 2) return@launch
+                            waypointRepo.addFolder(folderName)
                             val ids = mutableListOf<String>()
                             pts.forEachIndexed { i, (la, lo) ->
                                 ids.add(

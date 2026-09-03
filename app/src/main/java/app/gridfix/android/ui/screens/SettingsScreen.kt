@@ -47,6 +47,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.gridfix.android.AppInfo
 import app.gridfix.android.data.AppSettings
 import app.gridfix.android.data.SettingsRepository
 import app.gridfix.android.location.Declination
@@ -263,10 +264,17 @@ fun SettingsScreen(
                 "Elevation data: Terrarium tiles via AWS Open Data (Mapzen) — " +
                 "SRTM, USGS 3DEP/NED, GMTED2010, ETOPO1.\n" +
                 "Fonts: Saira Semi Condensed, Fira Mono, Antonio (SIL Open Font License).\n\n" +
+                "Map data: OpenStreetMap contributors (ODbL), OpenTopoMap (CC-BY-SA), " +
+                "USGS, MapTiler.\n" +
+                "Map engine: osmdroid; QR codes: ZXing (Apache 2.0).\n\n" +
                 "MGRS GPS is a training and recreation aid, not a primary means of navigation.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Row {
+            TextButton(onClick = { uriHandler.openUri(AppInfo.PRIVACY_URL) }) { Text("Privacy policy") }
+            TextButton(onClick = { uriHandler.openUri(AppInfo.TERMS_URL) }) { Text("Terms") }
+        }
     }
 }
 
@@ -390,8 +398,10 @@ private fun DeclinationSetting(override: Float?, model: Float?, angleUnit: Int, 
         return if (mils) (v * 6400f / 360f).roundToInt().toString()
         else String.format(Locale.US, "%.1f", v)
     }
-    var text by remember(manual, mils) { mutableStateOf(if (override != null) toDisplay(override) else "") }
-    var east by remember(manual) { mutableStateOf(override == null || override >= 0f) }
+    // Keyed on the value too: a backup restore changes `override` without changing
+    // `manual`, and the field would otherwise keep showing the old number.
+    var text by remember(manual, mils, override) { mutableStateOf(if (override != null) toDisplay(override) else "") }
+    var east by remember(manual, override) { mutableStateOf(override == null || override >= 0f) }
     fun push(t: String, e: Boolean) {
         val v = t.toFloatOrNull() ?: return
         val deg = if (mils) v * 360f / 6400f else v

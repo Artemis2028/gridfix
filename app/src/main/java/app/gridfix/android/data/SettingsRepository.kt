@@ -28,6 +28,7 @@ data class AppSettings(
     val face: Int = 1,            // Position/Navigate face: 0 = Glance, 1 = Lensatic, 2 = Dial
     val orientation: Int = 0,     // 0 = follow the device, 1 = portrait, 2 = landscape, 3 = landscape flipped
     val declinationOverride: Float? = null,   // degrees, east positive; null = the phone's World Magnetic Model
+    val disclaimerAccepted: Boolean = false,  // the "not a primary means of navigation" screen
 )
 
 class SettingsRepository(private val context: Context) {
@@ -43,6 +44,7 @@ class SettingsRepository(private val context: Context) {
         val PACE_PER_100M = intPreferencesKey("pace_per_100m")
         val FACE = intPreferencesKey("face")
         val ORIENTATION = intPreferencesKey("orientation")
+        val DISCLAIMER = booleanPreferencesKey("disclaimer_accepted")
         val DECL_MANUAL = booleanPreferencesKey("decl_manual")
         val DECL_VALUE = floatPreferencesKey("decl_value")
     }
@@ -60,6 +62,7 @@ class SettingsRepository(private val context: Context) {
             face = (p[Keys.FACE] ?: 1).coerceIn(0, 2),
             orientation = (p[Keys.ORIENTATION] ?: 0).coerceIn(0, 3),
             declinationOverride = if (p[Keys.DECL_MANUAL] == true) (p[Keys.DECL_VALUE] ?: 0f).coerceIn(-180f, 180f) else null,
+            disclaimerAccepted = p[Keys.DISCLAIMER] ?: false,
         )
     }
 
@@ -76,9 +79,14 @@ class SettingsRepository(private val context: Context) {
             p[Keys.PACE_PER_100M] = s.pacePer100m
             p[Keys.FACE] = s.face
             p[Keys.ORIENTATION] = s.orientation
+            p[Keys.DISCLAIMER] = s.disclaimerAccepted
             p[Keys.DECL_MANUAL] = s.declinationOverride != null
             p[Keys.DECL_VALUE] = s.declinationOverride ?: 0f
         }
+    }
+
+    suspend fun setDisclaimerAccepted(value: Boolean) {
+        context.dataStore.edit { it[Keys.DISCLAIMER] = value }
     }
 
     /** Manual declination in degrees (east positive), or null to follow the magnetic model. */

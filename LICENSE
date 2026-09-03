@@ -1,0 +1,38 @@
+MIT License
+
+Copyright (c) 2026 MGRS GPS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+This product includes third-party software under separate licenses:
+
+  NGA MGRS (mil.nga:mgrs)              MIT License
+  osmdroid                             Apache License 2.0
+  ZXing core                           Apache License 2.0
+  AndroidX / Jetpack Compose           Apache License 2.0
+  Google Play Billing Library          Android Software Development Kit License
+  Saira Semi Condensed, Fira Mono,
+  Antonio (bundled fonts)              SIL Open Font License 1.1
+
+Map and elevation data are provided by their respective sources under their own
+terms: OpenStreetMap contributors (ODbL), OpenTopoMap (CC-BY-SA 3.0), USGS
+(public domain), MapTiler (commercial terms), and the Terrarium terrain tiles on
+AWS Open Data (SRTM, USGS 3DEP/NED, GMTED2010, ETOPO1).

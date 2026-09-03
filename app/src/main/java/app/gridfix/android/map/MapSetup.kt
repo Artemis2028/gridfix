@@ -1,6 +1,7 @@
 package app.gridfix.android.map
 
 import android.content.Context
+import app.gridfix.android.AppInfo
 import app.gridfix.android.BuildConfig
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
@@ -41,7 +42,7 @@ object MapSetup {
         Configuration.getInstance().apply {
             osmdroidBasePath = base
             osmdroidTileCache = tiles
-            userAgentValue = "MGRS GPS/" + BuildConfig.VERSION_NAME + " (rafaelm2002@gmail.com)"
+            userAgentValue = AppInfo.userAgent(BuildConfig.VERSION_NAME)
             tileFileSystemCacheMaxBytes = 600L * 1024 * 1024
             tileFileSystemCacheTrimBytes = 500L * 1024 * 1024
             // Keep serving cached tiles long after their nominal expiry — offline-first.
@@ -144,8 +145,14 @@ object MapSetup {
      * Satellite layers come from MapTiler under its commercial terms; without one
      * (a developer build missing the secret) the app falls back to the public
      * community servers so the map still works.
+     *
+     * That fallback is DEBUG-ONLY. The OpenStreetMap Foundation's tile servers are
+     * a volunteer-funded resource with a usage policy that a paid app has no
+     * business leaning on, and the same goes for the community ArcGIS endpoints.
+     * A release build that somehow shipped without a key gets USGS topo, which is
+     * public domain and is also the only layer we offer for area download.
      */
-    val baseLayers: List<BaseLayer> = if (hasMapTiler) listOf(
+    private val allLayers: List<BaseLayer> = if (hasMapTiler) listOf(
         BaseLayer(
             key = "streets",
             label = "Streets",
@@ -221,7 +228,16 @@ object MapSetup {
         ),
     )
 
-    fun layerFor(key: String): BaseLayer = baseLayers.firstOrNull { it.key == key } ?: baseLayers[1]
+    /**
+     * The layers the app actually offers. In a release build with no MapTiler key
+     * that is USGS topo alone rather than the community servers.
+     */
+    val baseLayers: List<BaseLayer> =
+        if (hasMapTiler || BuildConfig.DEBUG) allLayers
+        else allLayers.filter { it.bulkDownload }.ifEmpty { allLayers.take(1) }
+
+    fun layerFor(key: String): BaseLayer =
+        baseLayers.firstOrNull { it.key == key } ?: baseLayers.first()
 
     /** Folder where imported MBTiles files live. */
     fun mbtilesDir(context: Context): File =

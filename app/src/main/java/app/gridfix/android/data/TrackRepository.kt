@@ -37,7 +37,17 @@ data class TrackInfo(
     val folder: String = DEFAULT_FOLDER,   // overlay folder, shares the eye switch with waypoints and graphics
 )
 
+/**
+ * A logged fix. [alt] is metres above mean sea level, or [NO_ALTITUDE] when the
+ * receiver gave no height: writing a real number there would put the leg at sea
+ * level on every profile that reads it.
+ */
 data class TrackPoint(val lat: Double, val lon: Double, val time: Long, val alt: Double)
+
+/** "this fix had no altitude" — omitted from GPX rather than written as a height. */
+const val NO_ALTITUDE = -32768.0
+
+fun Double.hasAltitude(): Boolean = this > NO_ALTITUDE + 1.0
 
 class TrackRepository(private val context: Context) {
 
@@ -279,7 +289,7 @@ class TrackRepository(private val context: Context) {
                             lat = parts[0].toDouble(),
                             lon = parts[1].toDouble(),
                             time = parts[2].toLong(),
-                            alt = parts.getOrNull(3)?.toDouble() ?: 0.0,
+                            alt = parts.getOrNull(3)?.toDouble() ?: NO_ALTITUDE,
                         )
                     }.getOrNull()
                 }
@@ -294,11 +304,12 @@ class TrackRepository(private val context: Context) {
             sb.append("<gpx version=\"1.1\" creator=\"MGRS GPS\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n")
             sb.append("  <trk>\n    <name>").append(escapeXml(name)).append("</name>\n    <trkseg>\n")
             for (p in points) {
+                val ele = if (p.alt.hasAltitude()) String.format(Locale.US, "<ele>%.1f</ele>", p.alt) else ""
                 sb.append(
                     String.format(
                         Locale.US,
-                        "      <trkpt lat=\"%.7f\" lon=\"%.7f\"><ele>%.1f</ele><time>%s</time></trkpt>\n",
-                        p.lat, p.lon, p.alt, sdf.format(Date(p.time)),
+                        "      <trkpt lat=\"%.7f\" lon=\"%.7f\">%s<time>%s</time></trkpt>\n",
+                        p.lat, p.lon, ele, sdf.format(Date(p.time)),
                     )
                 )
             }

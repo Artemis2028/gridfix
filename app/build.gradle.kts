@@ -12,8 +12,8 @@ android {
         applicationId = "app.gridfix.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 43
-        versionName = "0.9.15"
+        versionCode = 44
+        versionName = "0.9.16"
         // MapTiler API key from the CI secret; empty in builds without it (community-tile fallback)
         buildConfigField("String", "MAPTILER_KEY", "\"" + (System.getenv("MAPTILER_KEY") ?: "") + "\"")
     }
@@ -36,9 +36,18 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8: shrink + obfuscate. The CI keeps mapping.txt with every build so a
+            // Play crash report can be de-obfuscated, and also builds a signed release
+            // APK so this exact output can be installed and smoke-tested before upload.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.findByName("release")
         }
+    }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
 
     compileOptions {
@@ -82,4 +91,8 @@ dependencies {
 
     // Transitive androidx.fragment 1.1.0 is flagged outdated by Play; pin a current one
     implementation("androidx.fragment:fragment:1.8.5")
+
+    // Field math (MGRS, UTM, zone exceptions, ray fixes, sun/moon) is plain JVM code
+    // and is the part that must never silently drift. See app/src/test.
+    testImplementation("junit:junit:4.13.2")
 }

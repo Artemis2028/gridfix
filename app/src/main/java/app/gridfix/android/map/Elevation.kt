@@ -1,6 +1,7 @@
 package app.gridfix.android.map
 
 import android.content.Context
+import app.gridfix.android.AppInfo
 import app.gridfix.android.BuildConfig
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -30,6 +31,32 @@ object Elevation {
 
     private fun cacheDir(context: Context): File =
         File(context.filesDir, "dem").apply { mkdirs() }
+
+    /**
+     * Terrain tiles are permanent once fetched, so without a ceiling a few area
+     * prefetches quietly fill the device (osmdroid caps its own map tiles at 600 MB;
+     * this had no cap at all). Oldest tiles go first, and only every so often, since
+     * listing the directory during a viewshed sweep would cost more than it saves.
+     */
+    private const val CACHE_LIMIT_BYTES = 300L * 1024 * 1024
+    private var lastTrimAt = 0L
+    private const val TRIM_INTERVAL_MS = 10 * 60_000L
+
+    private fun trimCache(context: Context) {
+        val now = System.currentTimeMillis()
+        if (now - lastTrimAt < TRIM_INTERVAL_MS) return
+        lastTrimAt = now
+        runCatching {
+            val files = cacheDir(context).listFiles()?.filter { it.isFile } ?: return
+            var total = files.sumOf { it.length() }
+            if (total <= CACHE_LIMIT_BYTES) return
+            for (f in files.sortedBy { it.lastModified() }) {
+                if (total <= CACHE_LIMIT_BYTES) break
+                val size = f.length()
+                if (f.delete()) total -= size
+            }
+        }
+    }
 
     private fun tileX(lon: Double, z: Int): Double = (lon + 180.0) / 360.0 * (1 shl z)
 
@@ -108,7 +135,7 @@ object Elevation {
                 val conn = url.openConnection() as HttpURLConnection
                 conn.connectTimeout = 8000
                 conn.readTimeout = 8000
-                conn.setRequestProperty("User-Agent", "MGRS GPS/" + BuildConfig.VERSION_NAME + " (rafaelm2002@gmail.com)")
+                conn.setRequestProperty("User-Agent", AppInfo.userAgent(BuildConfig.VERSION_NAME))
                 try {
                     // Only a real PNG tile gets cached: a captive-portal page or an
                     // error body must never be stored as elevation data.
@@ -142,6 +169,7 @@ object Elevation {
                 return null
             }
             failedAt.remove(key)
+            trimCache(context)
         }
         val bmp = runCatching { BitmapFactory.decodeFile(file.absolutePath) }.getOrNull()
             ?: run {

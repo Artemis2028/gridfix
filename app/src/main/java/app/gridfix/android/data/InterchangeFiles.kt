@@ -81,7 +81,7 @@ object InterchangeFiles {
         var rtePts = ArrayList<GeoVertex>()
         var inRte = false
         var pendingTime = 0L
-        var pendingEle = 0.0
+        var pendingEle = NO_ALTITUDE
         var textBuf = ""
 
         var event = parser.eventType
@@ -110,7 +110,7 @@ object InterchangeFiles {
                             val lat = coord(parser.getAttributeValue(null, "lat"), 90.0)
                             val lon = coord(parser.getAttributeValue(null, "lon"), 180.0)
                             pendingTime = 0L
-                            pendingEle = 0.0
+                            pendingEle = NO_ALTITUDE
                             if (!lat.isNaN() && !lon.isNaN() && inTrk) {
                                 trkPts.add(TrackPoint(lat, lon, 0L, 0.0))
                             }
@@ -133,7 +133,7 @@ object InterchangeFiles {
                             else if (inTrk && trkName.isEmpty()) trkName = t
                             else if (inRte && rteName.isEmpty()) rteName = t
                         }
-                        "ele" -> pendingEle = textBuf.trim().toDoubleOrNull()?.takeIf { it.isFinite() } ?: 0.0
+                        "ele" -> pendingEle = textBuf.trim().toDoubleOrNull()?.takeIf { it.isFinite() } ?: NO_ALTITUDE
                         "time" -> pendingTime = parseIsoTime(textBuf.trim())
                         "trkpt" -> {
                             if (inTrk && trkPts.isNotEmpty()) {
@@ -210,11 +210,12 @@ object InterchangeFiles {
         for ((info, pts) in tracks) {
             sb.append("  <trk><name>").append(escapeXml(info.name)).append("</name><trkseg>\n")
             for (p in pts) {
+                val ele = if (p.alt.hasAltitude()) String.format(Locale.US, "<ele>%.1f</ele>", p.alt) else ""
                 sb.append(
                     String.format(
                         Locale.US,
-                        "    <trkpt lat=\"%.7f\" lon=\"%.7f\"><ele>%.1f</ele><time>%s</time></trkpt>\n",
-                        p.lat, p.lon, p.alt, sdf.format(Date(p.time)),
+                        "    <trkpt lat=\"%.7f\" lon=\"%.7f\">%s<time>%s</time></trkpt>\n",
+                        p.lat, p.lon, ele, sdf.format(Date(p.time)),
                     )
                 )
             }

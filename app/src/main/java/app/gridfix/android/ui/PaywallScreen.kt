@@ -51,6 +51,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import app.gridfix.android.AppInfo
 import app.gridfix.android.billing.BillingManager
 import app.gridfix.android.ui.theme.LabelFamily
 import app.gridfix.android.ui.theme.MonoFamily
@@ -131,7 +132,7 @@ fun PaywallScreen(
             Spacer(Modifier.height(22.dp))
 
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Benefit("Offline topo and satellite, downloaded by area")
+                Benefit("Offline maps: download USGS topo by area, or bring your own MBTiles")
                 Benefit("MGRS grid overlay, 4- to 10-digit, anywhere on earth")
                 Benefit("Terrain: line of sight, viewshed, contours, elevation")
                 Benefit("Tracks, routes, route cards, GPX / KML / ATAK export")
@@ -245,7 +246,22 @@ fun PaywallScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "Subscription managed by Google Play · ",
+                    "Cancel anytime in Google Play · ",
+                    fontFamily = LabelFamily,
+                    fontSize = 11.sp,
+                    color = cs.onSurfaceVariant,
+                )
+                Text(
+                    "Terms",
+                    fontFamily = LabelFamily,
+                    fontSize = 11.sp,
+                    color = cs.onSurfaceVariant,
+                    modifier = Modifier
+                        .clickable { uriHandler.openUri(AppInfo.TERMS_URL) }
+                        .padding(vertical = 8.dp, horizontal = 4.dp),
+                )
+                Text(
+                    "·",
                     fontFamily = LabelFamily,
                     fontSize = 11.sp,
                     color = cs.onSurfaceVariant,
@@ -256,10 +272,8 @@ fun PaywallScreen(
                     fontSize = 11.sp,
                     color = cs.onSurfaceVariant,
                     modifier = Modifier
-                        .clickable {
-                            uriHandler.openUri("https://github.com/Artemis2028/gridfix-legal/blob/main/PRIVACY.md")
-                        }
-                        .padding(vertical = 8.dp, horizontal = 2.dp),
+                        .clickable { uriHandler.openUri(AppInfo.PRIVACY_URL) }
+                        .padding(vertical = 8.dp, horizontal = 4.dp),
                 )
             }
             if (onClose != null) {

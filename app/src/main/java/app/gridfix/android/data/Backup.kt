@@ -76,6 +76,7 @@ object Backup {
             .put("face", settings.face)
             .put("orientation", settings.orientation)
             .put("declinationOverride", settings.declinationOverride?.toDouble() ?: JSONObject.NULL)
+            .put("disclaimerAccepted", settings.disclaimerAccepted)
         )
         root.put("tracks", JSONArray().also { a ->
             for (t in tracks) a.put(
@@ -238,7 +239,7 @@ object Backup {
                         TrackPoint(
                             lat = parts[0].toDouble(), lon = parts[1].toDouble(),
                             time = parts[2].toLong(),
-                            alt = parts.getOrNull(3)?.toDouble() ?: 0.0,
+                            alt = parts.getOrNull(3)?.toDouble() ?: NO_ALTITUDE,
                         )
                     }.getOrNull()
                 }
@@ -261,6 +262,7 @@ object Backup {
                     face = s.optInt("face", 1),
                     orientation = s.optInt("orientation", 0),
                     declinationOverride = if (s.isNull("declinationOverride")) null else s.optDouble("declinationOverride").toFloat(),
+                    disclaimerAccepted = s.optBoolean("disclaimerAccepted", false),
                 )
             )
             settingsApplied = true

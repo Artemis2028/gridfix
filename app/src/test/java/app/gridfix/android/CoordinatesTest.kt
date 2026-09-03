@@ -1,0 +1,158 @@
+package app.gridfix.android
+
+import app.gridfix.android.coords.Coordinates
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * The field math is the part of this app that must never drift quietly: a wrong
+ * grid looks exactly like a right one. These run on the JVM in CI on every build.
+ */
+class CoordinatesTest {
+
+    // ---- MGRS round trip -------------------------------------------------
+
+    @Test
+    fun `mgrs round trips at every precision`() {
+        val places = listOf(
+            24.4539 to 54.3773,      // Abu Dhabi
+            36.1699 to -115.1398,    // Las Vegas
+            -33.8688 to 151.2093,    // Sydney, southern hemisphere
+            51.5074 to -0.1278,      // London, straddling the prime meridian
+            -1.2921 to 36.8219,      // Nairobi, near the equator
+        )
+        for ((lat, lon) in places) {
+            for (digits in listOf(4, 6, 8, 10)) {
+                val first = Coordinates.mgrs(lat, lon, digits)
+                assertNotNull("no MGRS for $lat,$lon at $digits", first)
+                val parsed = Coordinates.parseMgrs(first!!.full)
+                assertNotNull("could not parse ${first.full}", parsed)
+                val again = Coordinates.mgrs(parsed!!.first, parsed.second, digits)
+                assertEquals(
+                    "round trip changed the grid at $digits digits",
+                    first.full,
+                    again?.full,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `single digit zones keep their leading zero handling`() {
+        // Zone 1, western Aleutians: the GZD is "1" not "01", and must survive a round trip.
+        val g = Coordinates.mgrs(52.0, -177.0, 8)
+        assertNotNull(g)
+        assertTrue("unexpected GZD ${g!!.gzd}", g.gzd.startsWith("1"))
+        val parsed = Coordinates.parseMgrs(g.full)
+        assertNotNull(parsed)
+        assertEquals(g.full, Coordinates.mgrs(parsed!!.first, parsed.second, 8)?.full)
+    }
+
+    // ---- Zone exceptions -------------------------------------------------
+
+    @Test
+    fun `norway 32V exception`() {
+        // South-west Norway: zone 32 is widened, so 59N 6E is 32V, not 31V.
+        assertEquals("32V", Coordinates.mgrs(59.0, 6.0, 8)?.gzd)
+    }
+
+    @Test
+    fun `svalbard zone exceptions`() {
+        assertEquals("31X", Coordinates.mgrs(78.0, 5.0, 8)?.gzd)
+        assertEquals("33X", Coordinates.mgrs(78.0, 15.0, 8)?.gzd)
+        assertEquals("35X", Coordinates.mgrs(78.0, 25.0, 8)?.gzd)
+        assertEquals("37X", Coordinates.mgrs(78.0, 35.0, 8)?.gzd)
+    }
+
+    // ---- Cell centre, not the SW corner ----------------------------------
+
+    @Test
+    fun `parse lands on the cell centre`() {
+        // A 4-digit grid is a 1 km square. Parsing must aim at the middle of it,
+        // so the metre-level easting and northing both end in 500. If someone
+        // "fixes" this back to the SW corner, re-formatting can fall into the
+        // neighbouring cell and this test is why it must not happen.
+        val parsed = Coordinates.parseMgrs("33UXP0000")
+        assertNotNull(parsed)
+        val fine = Coordinates.mgrs(parsed!!.first, parsed.second, 10)
+        assertNotNull(fine)
+        assertTrue("easting ${fine!!.easting} is not a cell centre", fine.easting.endsWith("500"))
+        assertTrue("northing ${fine.northing} is not a cell centre", fine.northing.endsWith("500"))
+    }
+
+    @Test
+    fun `parse accepts spaces and lower case`() {
+        val a = Coordinates.parseMgrs("33U XP 0000 0000")
+        val b = Coordinates.parseMgrs("33uxp00000000")
+        assertNotNull(a)
+        assertNotNull(b)
+        assertEquals(a!!.first, b!!.first, 1e-9)
+        assertEquals(a.second, b.second, 1e-9)
+    }
+
+    @Test
+    fun `rubbish does not parse`() {
+        assertNull(Coordinates.parseMgrs("not a grid"))
+        assertNull(Coordinates.parseMgrs(""))
+    }
+
+    // ---- Angle formatting wrap -------------------------------------------
+
+    @Test
+    fun `angles wrap instead of showing 360`() {
+        assertEquals("000°", Coordinates.formatAngle(359.5f, 0))
+        assertEquals("000°", Coordinates.formatAngle(360f, 0))
+        assertEquals("359°", Coordinates.formatAngle(359.4f, 0))
+        assertEquals("045°", Coordinates.formatAngle(45f, 0))
+        assertEquals("0 mils", Coordinates.formatAngle(360f, 1))
+        assertEquals("800 mils", Coordinates.formatAngle(45f, 1))
+    }
+
+    @Test
+    fun `negative angles normalise`() {
+        assertEquals("270°", Coordinates.formatAngle(-90f, 0))
+        assertEquals("4800 mils", Coordinates.formatAngle(-90f, 1))
+    }
+
+    // ---- Ray intersection ------------------------------------------------
+
+    @Test
+    fun `converging rays give a fix ahead of both observers`() {
+        val fix = Coordinates.rayIntersection(36.0, 45.0, 45.0, 36.0, 45.01, 315.0)
+        assertNotNull("converging rays should intersect", fix)
+        assertTrue("fix should be north of both observers", fix!!.lat > 36.0)
+        assertTrue(fix.dist1 > 0.0 && fix.dist2 > 0.0)
+    }
+
+    @Test
+    fun `parallel rays give no fix`() {
+        assertNull(Coordinates.rayIntersection(36.0, 45.0, 90.0, 36.01, 45.0, 90.0))
+    }
+
+    @Test
+    fun `a crossing behind the observers gives no fix`() {
+        // Both rays point away from each other: they only "cross" behind.
+        assertNull(Coordinates.rayIntersection(36.0, 45.0, 225.0, 36.0, 45.01, 135.0))
+    }
+
+    @Test
+    fun `a crossing beyond 100 km gives no fix`() {
+        // Almost parallel: the crossing is far outside any believable compass shot.
+        assertNull(Coordinates.rayIntersection(36.0, 45.0, 1.0, 36.0, 45.01, 0.5))
+    }
+
+    // ---- Grid convergence -------------------------------------------------
+
+    @Test
+    fun `convergence is zero on the central meridian and grows towards the edge`() {
+        // Zone 38 runs 42E-48E, central meridian 45E.
+        assertEquals(0.0, Coordinates.gridConvergence(36.0, 45.0), 1e-6)
+        val east = Coordinates.gridConvergence(36.0, 47.5)
+        val west = Coordinates.gridConvergence(36.0, 42.5)
+        assertTrue("east of the CM should be positive, was $east", east > 0.5)
+        assertTrue("west of the CM should be negative, was $west", west < -0.5)
+    }
+}

@@ -20,6 +20,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import app.gridfix.android.MainActivity
 import app.gridfix.android.R
+import app.gridfix.android.data.NO_ALTITUDE
 import app.gridfix.android.data.TrackRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -55,13 +56,17 @@ class TrackRecorderService : Service() {
     private val listener = object : LocationListener {
         override fun onLocationChanged(loc: Location) {
             val id = trackId ?: return
-            // Skip junk fixes: poor accuracy, and jitter smaller than the fix's own error
-            if (loc.hasAccuracy() && loc.accuracy > 30f) return
+            // Reject junk fixes outright, but never let the fix's own error become the
+            // step length: under canopy a 25 m CEP would demand a 25 m move before any
+            // point is kept, and a whole dogleg inside that circle would simply not exist.
+            // Spacing is a fixed 5 m, with a time fallback so a slow move still records.
+            if (loc.hasAccuracy() && loc.accuracy > MAX_ACCURACY_M) return
             val last = lastPoint
             if (last != null) {
                 val d = loc.distanceTo(last)
-                val floor = if (loc.hasAccuracy()) maxOf(5f, loc.accuracy) else 5f
-                if (d < floor) return
+                val gap = loc.elapsedRealtimeNanos - last.elapsedRealtimeNanos
+                val stale = gap > MIN_INTERVAL_NANOS
+                if (d < MIN_STEP_M && !(stale && d > 1f)) return
                 distance += d
             }
             lastPoint = loc
@@ -73,7 +78,11 @@ class TrackRecorderService : Service() {
             TrackRepository.appendPoint(
                 this@TrackRecorderService, id,
                 loc.latitude, loc.longitude, loc.time,
-                if (loc.hasAltitude()) loc.altitude else 0.0,
+                // GPX <ele> is metres above mean sea level, and the map's contours are
+                // MSL too, so store the converted height when the phone can give one.
+                // NO_ALTITUDE when it cannot: writing 0.0 would plot the whole leg at
+                // sea level, which is a worse lie than leaving the elevation out.
+                loc.bestAltitude() ?: NO_ALTITUDE,
             )
             _active.value = ActiveTrack(id, startedAt, ArrayList(points), distance)
             updateNotification()
@@ -212,6 +221,15 @@ class TrackRecorderService : Service() {
         private const val ACTION_STOP = "app.gridfix.android.track.STOP"
         private const val EXTRA_TRACK_ID = "track_id"
         private const val MAX_LIVE_POINTS = 4000
+
+        /** A fix worse than this is not worth logging at all. */
+        private const val MAX_ACCURACY_M = 30f
+
+        /** Minimum move between logged points. A step, not the fix's error circle. */
+        private const val MIN_STEP_M = 5f
+
+        /** ...but log anyway after this long, so a slow or stationary leg still exists. */
+        private const val MIN_INTERVAL_NANOS = 15_000_000_000L
 
         private val _active = MutableStateFlow<ActiveTrack?>(null)
         val active: StateFlow<ActiveTrack?> = _active.asStateFlow()

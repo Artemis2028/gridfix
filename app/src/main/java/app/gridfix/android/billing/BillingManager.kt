@@ -4,6 +4,8 @@ import android.app.Activity
 import android.content.Context
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.preferencesDataStore
@@ -84,11 +86,26 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
         const val MANAGE_URL =
             "https://play.google.com/store/account/subscriptions?package=app.gridfix.android"
         private val ENTITLED_KEY = booleanPreferencesKey("entitled")
+        private val CONFIRMED_KEY = longPreferencesKey("entitled_confirmed_at")
+        private val EMPTY_STREAK_KEY = intPreferencesKey("entitled_empty_streak")
         private const val STARTUP_TIMEOUT_MS = 10_000L
+
+        /**
+         * How long a confirmed subscription is honoured after Play last said yes.
+         * Long enough to cover a rotation into the field with no signal, or a Play
+         * outage; short enough that a genuine cancellation takes effect.
+         */
+        private const val ENTITLEMENT_GRACE_MS = 14L * 24 * 60 * 60 * 1000
     }
 
     private suspend fun cachedEntitled(): Boolean =
         runCatching { context.billingStore.data.first()[ENTITLED_KEY] ?: false }.getOrDefault(false)
+
+    private suspend fun confirmedAt(): Long =
+        runCatching { context.billingStore.data.first()[CONFIRMED_KEY] ?: 0L }.getOrDefault(0L)
+
+    private suspend fun emptyStreak(): Int =
+        runCatching { context.billingStore.data.first()[EMPTY_STREAK_KEY] ?: 0 }.getOrDefault(0)
 
     fun start() {
         scope.launch {
@@ -145,6 +162,9 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
             .enablePendingPurchases(
                 PendingPurchasesParams.newBuilder().enableOneTimeProducts().build()
             )
+            // Billing 8+ reconnects with its own backoff; without this the app races it
+            // and testers see "Google Play disconnected" far more often than they should.
+            .enableAutoServiceReconnection()
             .build()
         client = c
         c.startConnection(object : BillingClientStateListener {
@@ -174,10 +194,15 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
     }
 
     /** A plan query that never answers must not leave the paywall spinning. */
+    /** Bumped by every query; a timeout only fires for the query that armed it. */
+    private var plansGeneration = 0
+
     private fun armPlansTimeout() {
+        val generation = ++plansGeneration
         scope.launch {
             delay(STARTUP_TIMEOUT_MS)
-            if (plansStatusFlow.value == PlansStatus.LOADING) {
+            // A later query may already have answered; only the newest timer may speak.
+            if (generation == plansGeneration && plansStatusFlow.value == PlansStatus.LOADING) {
                 plansStatusFlow.value = PlansStatus.ERROR
                 if (noticeFlow.value == null) {
                     noticeFlow.value = "Google Play is not answering — check your connection and tap Retry"
@@ -208,18 +233,48 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
             val ack = AcknowledgePurchaseParams.newBuilder()
                 .setPurchaseToken(p.purchaseToken)
                 .build()
-            c.acknowledgePurchase(ack) { }
+            // Google refunds a purchase that is never acknowledged, so a failure here
+            // has to be visible and retried on the next refresh, not swallowed.
+            c.acknowledgePurchase(ack) { r ->
+                if (r.responseCode != BillingClient.BillingResponseCode.OK) {
+                    noticeFlow.value =
+                        "Could not confirm the purchase with Google Play \u2014 reopen the app while online"
+                }
+            }
         }
         val entitled = active.isNotEmpty()
         val pending = purchases.any { it.purchaseState == Purchase.PurchaseState.PENDING }
         val fromRestore = userRestore
         userRestore = false
+        val now = System.currentTimeMillis()
         scope.launch {
-            runCatching { context.billingStore.edit { it[ENTITLED_KEY] = entitled } }
-            stateFlow.value = if (entitled) State.ENTITLED else State.LOCKED
+            // Play answering "no purchases" is not always the truth: the wrong Google
+            // account can be signed in, a work profile can be active, an account can be
+            // briefly deauthorised. Locking a paying subscriber out of a navigation app
+            // over one such answer is the worst thing this class can do.
+            //
+            // The policy, exactly: a previously-entitled user keeps access while EITHER
+            // this is the first empty answer in a row, OR the last confirmed purchase is
+            // inside the grace window. So a spurious empty is always absorbed, and a
+            // genuine cancellation costs one more session before the app locks - two
+            // empty answers past the grace window locks it for good. That one session is
+            // the price of never locking out someone who actually paid.
+            val wasEntitled = cachedEntitled()
+            val streak = if (entitled) 0 else emptyStreak() + 1
+            val withinGrace = now - confirmedAt() < ENTITLEMENT_GRACE_MS
+            val keepOnTrust = !entitled && wasEntitled && (streak < 2 || withinGrace)
+            runCatching {
+                context.billingStore.edit {
+                    it[ENTITLED_KEY] = entitled || keepOnTrust
+                    it[EMPTY_STREAK_KEY] = streak
+                    if (entitled) it[CONFIRMED_KEY] = now
+                }
+            }
+            stateFlow.value = if (entitled || keepOnTrust) State.ENTITLED else State.LOCKED
             noticeFlow.value = when {
                 entitled -> null
-                pending -> "Purchase pending — finish payment, then tap Restore purchases"
+                keepOnTrust -> "Google Play did not report your subscription \u2014 access continues for now. Open the app with a signal to confirm it."
+                pending -> "Purchase pending \u2014 finish payment, then tap Restore purchases"
                 fromRestore -> "No active subscription found for this Google account"
                 else -> null
             }

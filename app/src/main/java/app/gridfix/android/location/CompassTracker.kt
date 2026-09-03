@@ -67,10 +67,7 @@ class CompassTracker(context: Context) : SensorEventListener {
         // The raw azimuth is the device's natural "up" edge. Remap to the current
         // display rotation so a landscape phone (or landscape-natural tablet)
         // does not read 90 or 180 degrees off.
-        val rotation = runCatching {
-            (appContext.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager)
-                .defaultDisplay.rotation
-        }.getOrDefault(android.view.Surface.ROTATION_0)
+        val rotation = displayRotation()
         val (ax, ay) = when (rotation) {
             android.view.Surface.ROTATION_90 -> SensorManager.AXIS_Y to SensorManager.AXIS_MINUS_X
             android.view.Surface.ROTATION_180 -> SensorManager.AXIS_MINUS_X to SensorManager.AXIS_MINUS_Y
@@ -97,6 +94,19 @@ class CompassTracker(context: Context) : SensorEventListener {
             it.copy(azimuthMagnetic = smoothed.toFloat(), hasReading = true)
         }
     }
+
+    /**
+     * Which way the display is turned, for remapping the sensor axes. Read through
+     * DisplayManager rather than the deprecated WindowManager.defaultDisplay (which
+     * also cannot be called from an application context on newer releases). A phone
+     * folded onto a second display would want the Activity's own display; that needs
+     * the Activity here and is a separate change.
+     */
+    private fun displayRotation(): Int = runCatching {
+        (appContext.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager)
+            .getDisplay(android.view.Display.DEFAULT_DISPLAY)
+            ?.rotation ?: android.view.Surface.ROTATION_0
+    }.getOrDefault(android.view.Surface.ROTATION_0)
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
         if (sensor?.type == Sensor.TYPE_ROTATION_VECTOR || sensor?.type == Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR) {
