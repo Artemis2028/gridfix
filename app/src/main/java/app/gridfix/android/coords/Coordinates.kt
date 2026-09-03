@@ -287,6 +287,33 @@ object Coordinates {
         ll[0] to ll[1]
     }.getOrNull()
 
+    /**
+     * Parse an MGRS string to the SW corner of its cell (no centre offset).
+     * Roadmap A (photo-map calibration): control points are grid LINE
+     * intersections = cell corners. Never use [parseMgrs] here — it aims at
+     * the cell centre and would bake a half-cell error into the homography.
+     */
+    fun parseMgrsCorner(text: String): Pair<Double, Double>? = runCatching {
+        val cleaned = asciiDigits(text.trim()).uppercase(Locale.US).replace(" ", "")
+        if (cleaned.isEmpty()) return null
+        val mgrs = MGRS.parse(cleaned)
+        val utm = mgrs.toUTM()
+        val north = utm.hemisphere.toString().uppercase(Locale.US).startsWith("N")
+        val ll = utmInverse(utm.easting, utm.northing, utm.zone, north)
+        ll[0] to ll[1]
+    }.getOrNull()
+
+    /**
+     * Scale a typed grid line number to 5 digits ("45" -> 45000).
+     * Control-point entry takes 2-5 digits per roadmap A; null otherwise.
+     * Pure — shared with iOS calibration screen verbatim.
+     */
+    fun scaleGridLineNumber(raw: String): Double? {
+        val digits = raw.filter { it.isDigit() }
+        if (digits.length !in 2..5 || digits.length != raw.trim().length) return null
+        return (digits + "0".repeat(5 - digits.length)).toDoubleOrNull()
+    }
+
     // ---- Grid-overlay math: forced-zone UTM forward and the Snyder-series inverse ----
     // Validated by roundtrip against the forward formulas above: < 1 mm error worldwide,
     // < 7 mm out to 4.5 degrees from the central meridian (grid lines never go further).

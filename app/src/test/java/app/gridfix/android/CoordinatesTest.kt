@@ -168,4 +168,60 @@ class CoordinatesTest {
         assertTrue("east of the CM should be positive, was $east", east > 0.5)
         assertTrue("west of the CM should be negative, was $west", west < -0.5)
     }
+
+    // ---- Corner parse (roadmap A: photo-map control points) ----------------
+
+    @Test
+    fun `corner parse lands half a cell south-west of the centre parse`() {
+        // A 4-digit grid is a 1 km cell, so the centre sits 500 m east and
+        // 500 m north of the corner. Compared in UTM so no geodesic is needed.
+        val corner = Coordinates.parseMgrsCorner("33UXP1234")
+        val centre = Coordinates.parseMgrs("33UXP1234")
+        assertNotNull(corner)
+        assertNotNull(centre)
+        val cu = Coordinates.utm(corner!!.first, corner.second)!!
+        val mu = Coordinates.utm(centre!!.first, centre.second)!!
+        assertEquals(cu.zone.toLong(), mu.zone.toLong())
+        assertEquals(500.0, (mu.easting - cu.easting).toDouble(), 2.0)
+        assertEquals(500.0, (mu.northing - cu.northing).toDouble(), 2.0)
+    }
+
+    @Test
+    fun `corner parse sits on the grid lines it names`() {
+        // 33UXP1234 names easting line 12000 and northing line 34000 inside
+        // the 100 km square. The round trip is good to about a metre.
+        val corner = Coordinates.parseMgrsCorner("33U XP 12 34")
+        assertNotNull(corner)
+        val u = Coordinates.utm(corner!!.first, corner.second)!!
+        assertEquals(12000.0, (u.easting % 100000L).toDouble(), 2.0)
+        assertEquals(34000.0, (u.northing % 100000L).toDouble(), 2.0)
+    }
+
+    @Test
+    fun `corner parse rejects junk the same way the centre parse does`() {
+        assertNull(Coordinates.parseMgrsCorner(""))
+        assertNull(Coordinates.parseMgrsCorner("not a grid"))
+    }
+
+    // ---- Grid line number scaling ------------------------------------------
+
+    @Test
+    fun `grid line numbers scale to five digits`() {
+        assertEquals(45000.0, Coordinates.scaleGridLineNumber("45")!!, 0.0)
+        assertEquals(45600.0, Coordinates.scaleGridLineNumber("456")!!, 0.0)
+        assertEquals(45670.0, Coordinates.scaleGridLineNumber("4567")!!, 0.0)
+        assertEquals(45678.0, Coordinates.scaleGridLineNumber("45678")!!, 0.0)
+        assertEquals(0.0, Coordinates.scaleGridLineNumber("00")!!, 0.0)
+        assertEquals(45000.0, Coordinates.scaleGridLineNumber(" 45 ")!!, 0.0)
+    }
+
+    @Test
+    fun `grid line numbers reject the shapes a control point cannot use`() {
+        assertNull(Coordinates.scaleGridLineNumber(""))
+        assertNull(Coordinates.scaleGridLineNumber("4"))
+        assertNull(Coordinates.scaleGridLineNumber("456789"))
+        assertNull(Coordinates.scaleGridLineNumber("4a5"))
+        assertNull(Coordinates.scaleGridLineNumber("45.6"))
+        assertNull(Coordinates.scaleGridLineNumber("-45"))
+    }
 }
