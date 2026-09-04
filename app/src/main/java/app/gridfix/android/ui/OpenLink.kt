@@ -80,3 +80,28 @@ fun sendFeedback(context: Context) {
         Toast.makeText(context, "No mail app — write to " + AppInfo.SUPPORT_EMAIL, Toast.LENGTH_LONG).show()
     }
 }
+
+/**
+ * Offer a saved crash report to the user's mail app. Called only from the prompt on the
+ * launch after a crash, and only when they tap Send - the trace has been sitting in
+ * app-private storage until this moment.
+ */
+fun sendCrashReport(context: Context, report: String) {
+    val uri = Uri.parse(
+        "mailto:" + Uri.encode(AppInfo.SUPPORT_EMAIL) +
+            "?subject=" + Uri.encode("MGRS GPS crash " + BuildConfig.VERSION_NAME) +
+            "&body=" + Uri.encode(
+                "What were you doing when it closed?\n\n\n" +
+                    "---- crash report, please leave below ----\n" + report
+            )
+    )
+    val opened = runCatching {
+        context.startActivity(
+            Intent(Intent.ACTION_SENDTO, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+        )
+        true
+    }.getOrDefault(false)
+    if (!opened) {
+        Toast.makeText(context, "No mail app — write to " + AppInfo.SUPPORT_EMAIL, Toast.LENGTH_LONG).show()
+    }
+}

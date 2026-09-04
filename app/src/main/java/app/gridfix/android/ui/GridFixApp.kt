@@ -34,6 +34,7 @@ import androidx.compose.material.icons.outlined.MyLocation
 import androidx.compose.material.icons.outlined.ScreenLockRotation
 import androidx.compose.material.icons.outlined.ScreenRotation
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
@@ -90,6 +91,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.core.content.FileProvider
+import app.gridfix.android.CrashLog
 import app.gridfix.android.coords.Coordinates
 import app.gridfix.android.BuildConfig
 import app.gridfix.android.billing.BillingManager
@@ -399,6 +401,36 @@ fun GridFixApp() {
     }
 
     GridFixTheme(nightMode = settings.nightMode) {
+        // Offered before every other gate, because a crash on the disclaimer or the
+        // paywall is exactly the one worth hearing about, and those screens return early.
+        // It is a Dialog, so it floats over whatever is underneath.
+        var crashReport by remember { mutableStateOf(CrashLog.pending(context)) }
+        crashReport?.let { report ->
+            AlertDialog(
+                onDismissRequest = { CrashLog.clear(context); crashReport = null },
+                title = { Text("MGRS GPS closed unexpectedly") },
+                text = {
+                    Text(
+                        "A report of what went wrong is saved on this phone. Nothing has been " +
+                            "sent anywhere. Sending it opens your mail app so you can add what " +
+                            "you were doing at the time — that part is what makes it fixable."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        sendCrashReport(context, report)
+                        CrashLog.clear(context)
+                        crashReport = null
+                    }) { Text("Send report") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { CrashLog.clear(context); crashReport = null }) {
+                        Text("Discard")
+                    }
+                },
+            )
+        }
+
         // What a phone GPS is and is not, once, before anything else.
         if (settingsLoaded && !settings.disclaimerAccepted) {
             DisclaimerScreen(onAccept = { scope.launch { repo.setDisclaimerAccepted(true) } })

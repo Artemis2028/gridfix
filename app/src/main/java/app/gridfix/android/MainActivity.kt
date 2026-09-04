@@ -9,6 +9,8 @@ import app.gridfix.android.ui.GridFixApp
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Before anything else, so a crash during startup is caught as well.
+        CrashLog.install(this)
         enableEdgeToEdge()
         setContent {
             GridFixApp()
