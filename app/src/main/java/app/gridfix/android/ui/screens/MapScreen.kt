@@ -1351,14 +1351,23 @@ fun MapScreen(
             Column(
                 Modifier
                     .fillMaxHeight()
-                    .drawBehind { drawLine(rule, Offset(0f, 0f), Offset(0f, size.height), 1.dp.toPx()) },
+                    .drawBehind { drawLine(rule, Offset(0f, 0f), Offset(0f, size.height), 1.dp.toPx()) }
+                    // Since the status bar went away in landscape there is no inset holding
+                    // this rail off the top of the screen, so the first tool's label sat on
+                    // the glass. The hairline is drawn before this padding, so it still runs
+                    // the full height of the rail.
+                    .padding(vertical = 6.dp),
             ) {
                 deckTools.forEach { t ->
                     ToolCell(t.icon, t.label, t.active, Modifier.weight(1f).fillMaxWidth(), compact = true, onClick = t.onClick)
                 }
                 Box(
+                    // A fixed block rather than the largest weight in the column. At 1.3f it
+                    // was taking half a tool's worth of height off seven tools to make one
+                    // button bigger than it needs to be - and the tools are the things that
+                    // have a label to fit.
                     Modifier
-                        .weight(1.3f)
+                        .height(48.dp)
                         .fillMaxWidth()
                         .background(MaterialTheme.colorScheme.primary)
                         .clickable(onClick = addWaypointAtCrosshair),
