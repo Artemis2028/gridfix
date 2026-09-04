@@ -12,8 +12,8 @@ android {
         applicationId = "app.gridfix.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 48
-        versionName = "0.9.20"
+        versionCode = 49
+        versionName = "0.9.21"
         // MapTiler API key from the CI secret; empty in builds without it (community-tile fallback)
         buildConfigField("String", "MAPTILER_KEY", "\"" + (System.getenv("MAPTILER_KEY") ?: "") + "\"")
     }
@@ -73,7 +73,13 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.navigation:navigation-compose:2.7.7")
-    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.2")
+    // 2.8.3+ only. With Compose 1.6 (this BOM), lifecycle 2.8's LocalLifecycleOwner
+    // finds Compose UI's copy by REFLECTION, and 2.8.2 shipped no keep rule for
+    // it: the debug build ran, the R8 build died on first composition with
+    // "CompositionLocal LocalLifecycleOwner not present" (lifecycle b/346808608,
+    // fixed 2.8.3). 2.8.5 is the last 2.8.x before the Compose Runtime 1.7.1
+    // dependency; do not go past it without moving the BOM to Compose 1.7.
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.5")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 

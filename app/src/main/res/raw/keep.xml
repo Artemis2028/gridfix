@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Resource-shrinker keep list for the release build.
+
+  The 112 NATO symbol PNGs in drawable-nodpi are looked up BY NAME at runtime
+  (NatoSymbols.resId -> Resources.getIdentifier("nato_<aff>_<func>")), never by
+  R.drawable constant, so nothing in the code references them statically. The
+  shrinker's safe mode is supposed to infer the "nato_" prefix from the string
+  constant next to getIdentifier(); this makes that explicit so a symbol set
+  cannot vanish from a release build on a heuristic.
+-->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/nato_*" />
