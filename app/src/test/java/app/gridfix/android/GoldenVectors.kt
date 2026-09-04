@@ -51,6 +51,11 @@ object GoldenVectors {
         val lat: Double, val lon: Double, val zone: Int, val degrees: Double,
     )
 
+    /** Expected GeoJSON geometry for a tactical graphic. "none" = emit nothing. */
+    data class GraphicGeometry(
+        val type: String, val vertexCount: Int, val kind: String,
+    )
+
     private fun rows(csv: String): List<List<String>> =
         csv.trim().lines().filter { it.isNotBlank() }.map { it.split(",") }
 
@@ -84,6 +89,12 @@ object GoldenVectors {
     val convergence: List<Convergence> by lazy {
         rows(CONVERGENCE_CSV).map {
             Convergence(it[0].toDouble(), it[1].toDouble(), it[2].toInt(), it[3].toDouble())
+        }
+    }
+
+    val graphicGeometry: List<GraphicGeometry> by lazy {
+        rows(GRAPHIC_GEOMETRY_CSV).map {
+            GraphicGeometry(it[0], it[1].toInt(), it[2])
         }
     }
 
@@ -435,4 +446,191 @@ one-degree-lon-eq,0.0,0.0,0.0,1.0,111319.4908,90.0
 -45.0311,172.0,59,-0.707526374
 -45.0311,173.5,59,-1.769286963
 """
+
+    // type,vertexCount,kind
+    private const val GRAPHIC_GEOMETRY_CSV = """
+phase_line,0,none
+phase_line,1,Point
+phase_line,2,LineString
+phase_line,3,LineString
+phase_line,4,LineString
+phase_line,7,LineString
+boundary,0,none
+boundary,1,Point
+boundary,2,LineString
+boundary,3,LineString
+boundary,4,LineString
+boundary,7,LineString
+axis,0,none
+axis,1,Point
+axis,2,LineString
+axis,3,LineString
+axis,4,LineString
+axis,7,LineString
+doa,0,none
+doa,1,Point
+doa,2,LineString
+doa,3,LineString
+doa,4,LineString
+doa,7,LineString
+objective,0,none
+objective,1,Point
+objective,2,LineString
+objective,3,Polygon
+objective,4,Polygon
+objective,7,Polygon
+aa,0,none
+aa,1,Point
+aa,2,LineString
+aa,3,Polygon
+aa,4,Polygon
+aa,7,Polygon
+route,0,none
+route,1,Point
+route,2,LineString
+route,3,LineString
+route,4,LineString
+route,7,LineString
+lz,0,none
+lz,1,Point
+lz,2,LineString
+lz,3,Polygon
+lz,4,Polygon
+lz,7,Polygon
+pz,0,none
+pz,1,Point
+pz,2,LineString
+pz,3,Polygon
+pz,4,Polygon
+pz,7,Polygon
+bp,0,none
+bp,1,Point
+bp,2,LineString
+bp,3,Polygon
+bp,4,Polygon
+bp,7,Polygon
+ea,0,none
+ea,1,Point
+ea,2,LineString
+ea,3,Polygon
+ea,4,Polygon
+ea,7,Polygon
+nai,0,none
+nai,1,Point
+nai,2,LineString
+nai,3,Polygon
+nai,4,Polygon
+nai,7,Polygon
+tai,0,none
+tai,1,Point
+tai,2,LineString
+tai,3,Polygon
+tai,4,Polygon
+tai,7,Polygon
+area,0,none
+area,1,Point
+area,2,LineString
+area,3,Polygon
+area,4,Polygon
+area,7,Polygon
+screen_l,0,none
+screen_l,1,Point
+screen_l,2,LineString
+screen_l,3,LineString
+screen_l,4,LineString
+screen_l,7,LineString
+guard_l,0,none
+guard_l,1,Point
+guard_l,2,LineString
+guard_l,3,LineString
+guard_l,4,LineString
+guard_l,7,LineString
+cover_l,0,none
+cover_l,1,Point
+cover_l,2,LineString
+cover_l,3,LineString
+cover_l,4,LineString
+cover_l,7,LineString
+flot,0,none
+flot,1,Point
+flot,2,LineString
+flot,3,LineString
+flot,4,LineString
+flot,7,LineString
+obstacle_line,0,none
+obstacle_line,1,Point
+obstacle_line,2,LineString
+obstacle_line,3,LineString
+obstacle_line,4,LineString
+obstacle_line,7,LineString
+wire,0,none
+wire,1,Point
+wire,2,LineString
+wire,3,LineString
+wire,4,LineString
+wire,7,LineString
+lane,0,none
+lane,1,Point
+lane,2,LineString
+lane,3,LineString
+lane,4,LineString
+lane,7,LineString
+minefield,0,none
+minefield,1,Point
+minefield,2,LineString
+minefield,3,Polygon
+minefield,4,Polygon
+minefield,7,Polygon
+strongpoint,0,none
+strongpoint,1,Point
+strongpoint,2,LineString
+strongpoint,3,Polygon
+strongpoint,4,Polygon
+strongpoint,7,Polygon
+roadblock,0,none
+roadblock,1,Point
+roadblock,2,LineString
+roadblock,3,LineString
+roadblock,4,LineString
+roadblock,7,LineString
+ring,0,none
+ring,1,Point
+ring,2,LineString
+ring,3,LineString
+ring,4,LineString
+ring,7,LineString
+sector,0,none
+sector,1,Point
+sector,2,LineString
+sector,3,LineString
+sector,4,LineString
+sector,7,LineString
+trp,0,none
+trp,1,Point
+trp,2,LineString
+trp,3,LineString
+trp,4,LineString
+trp,7,LineString
+checkpoint,0,none
+checkpoint,1,Point
+checkpoint,2,LineString
+checkpoint,3,LineString
+checkpoint,4,LineString
+checkpoint,7,LineString
+dp,0,none
+dp,1,Point
+dp,2,LineString
+dp,3,LineString
+dp,4,LineString
+dp,7,LineString
+text,0,none
+text,1,Point
+text,2,LineString
+text,3,LineString
+text,4,LineString
+text,7,LineString
+"""
+
+    /** The graphic types that close into a polygon when they have 3+ vertices. */
+    val areaTypes: Set<String> = setOf("aa", "area", "bp", "ea", "lz", "minefield", "nai", "objective", "pz", "strongpoint", "tai")
 }

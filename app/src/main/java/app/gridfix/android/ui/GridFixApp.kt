@@ -2,6 +2,7 @@ package app.gridfix.android.ui
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -51,6 +52,8 @@ import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.ScaffoldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -185,6 +188,65 @@ fun GridFixApp() {
     }
     val scope = rememberCoroutineScope()
     val recordGate = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+
+    // The app had no way to tell the operator that anything had failed. A
+    // recording that silently does not start is the worst version of that:
+    // the button responds, nothing records, and the patrol is not on the map.
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    /**
+     * Start recording, and say so when it does not work.
+     *
+     * [silentNotifications] is true when POST_NOTIFICATIONS was refused. The
+     * service still runs — the permission only controls whether its
+     * notification is visible — but an operator who cannot see the recording
+     * in the shade also cannot stop it from there, and should be told rather
+     * than left to discover it.
+     */
+    val startRecording: (Boolean) -> Unit = { silentNotifications ->
+        if (recordGate.compareAndSet(false, true)) {
+            scope.launch {
+                val id = trackRepo.startTrack(System.currentTimeMillis())
+                val started = runCatching {
+                    TrackRecorderService.start(context.applicationContext, id)
+                }.isSuccess
+                recordGate.set(false)
+                if (!started) {
+                    // Android 12+ refuses a foreground service started from the
+                    // background. The track row is thrown away so the list does
+                    // not fill with empty recordings.
+                    trackRepo.discard(id)
+                    snackbarHostState.showSnackbar(
+                        "Could not start recording. Open MGRS GPS and try again."
+                    )
+                } else if (silentNotifications) {
+                    snackbarHostState.showSnackbar(
+                        "Recording. Notifications are off, so it will not show " +
+                            "in the shade and cannot be stopped from there."
+                    )
+                }
+            }
+        }
+    }
+
+    val notificationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> startRecording(!granted) }
+
+    // Ask before starting, not after: on Android 13+ a foreground service
+    // whose notification is suppressed is a recording with no visible sign
+    // that it is running.
+    val beginRecording = {
+        val needsNotifications = Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(
+                context, Manifest.permission.POST_NOTIFICATIONS,
+            ) != PackageManager.PERMISSION_GRANTED
+        if (needsNotifications) {
+            notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            startRecording(false)
+        }
+    }
 
     // Location permission + shared tracker, hoisted so every screen can use the fix
     var hasPermission by remember {
@@ -345,6 +407,7 @@ fun GridFixApp() {
         }
         Scaffold(
             containerColor = MaterialTheme.colorScheme.background,
+            snackbarHost = { SnackbarHost(snackbarHostState) },
             // Sideways, a camera cutout sits on a long edge: keep the rail and the deck clear of it
             contentWindowInsets = ScaffoldDefaults.contentWindowInsets.union(WindowInsets.displayCutout),
             topBar = {
@@ -546,18 +609,7 @@ fun GridFixApp() {
                             }
                         },
                         viewedTrackId = shownTrackId,
-                        onRecordStart = {
-                            if (recordGate.compareAndSet(false, true)) {
-                                scope.launch {
-                                    val id = trackRepo.startTrack(System.currentTimeMillis())
-                                    val ok = runCatching {
-                                        TrackRecorderService.start(context.applicationContext, id)
-                                    }.isSuccess
-                                    if (!ok) trackRepo.discard(id)
-                                    recordGate.set(false)
-                                }
-                            }
-                        },
+                        onRecordStart = beginRecording,
                         onRecordStop = { name, discard ->
                             val id = TrackRecorderService.active.value?.trackId
                             TrackRecorderService.stop(context.applicationContext)

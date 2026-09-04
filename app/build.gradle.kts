@@ -12,8 +12,8 @@ android {
         applicationId = "app.gridfix.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 47
-        versionName = "0.9.19"
+        versionCode = 48
+        versionName = "0.9.20"
         // MapTiler API key from the CI secret; empty in builds without it (community-tile fallback)
         buildConfigField("String", "MAPTILER_KEY", "\"" + (System.getenv("MAPTILER_KEY") ?: "") + "\"")
     }
@@ -95,4 +95,8 @@ dependencies {
     // Field math (MGRS, UTM, zone exceptions, ray fixes, sun/moon) is plain JVM code
     // and is the part that must never silently drift. See app/src/test.
     testImplementation("junit:junit:4.13.2")
+    // org.json ships in android.jar as a stub that returns defaults under
+    // isReturnDefaultValues, so a JVM test cannot parse its own output
+    // without the real artifact on the test classpath ahead of it.
+    testImplementation("org.json:json:20240303")
 }
