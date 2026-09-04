@@ -15,10 +15,10 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Write source files (v0.9.27 (multi-select with batch visibility swap and batch delete) delta, plain text, auditable below)
+      - name: Write source files (v0.9.28 (in-app feedback path and a CI check that the AAB carries a readable crash mapping) delta, plain text, auditable below)
         run: |
-          if [ "$(cat .github/last-payload 2>/dev/null)" = "v0.9.27-ee5449795a09" ]; then
-            echo "payload v0.9.27-ee5449795a09 already applied - skipping (edit the files in git, not here)"
+          if [ "$(cat .github/last-payload 2>/dev/null)" = "v0.9.28-85b6d8703da8" ]; then
+            echo "payload v0.9.28-85b6d8703da8 already applied - skipping (edit the files in git, not here)"
           else
           mkdir -p 'app'
           cat > 'app/build.gradle.kts' <<'EOF_GRIDFIX'
@@ -36,8 +36,8 @@ jobs:
                   applicationId = "app.gridfix.android"
                   minSdk = 26
                   targetSdk = 36
-                  versionCode = 55
-                  versionName = "0.9.27"
+                  versionCode = 56
+                  versionName = "0.9.28"
                   // MapTiler API key from the CI secret; empty in builds without it (community-tile fallback)
                   buildConfigField("String", "MAPTILER_KEY", "\"" + (System.getenv("MAPTILER_KEY") ?: "") + "\"")
               }
@@ -131,1488 +131,681 @@ jobs:
               testImplementation("org.json:json:20240303")
           }
           EOF_GRIDFIX
-          mkdir -p 'app/src/main/java/app/gridfix/android/data'
-          cat > 'app/src/main/java/app/gridfix/android/data/GraphicsRepository.kt' <<'EOF_GRIDFIX'
-          package app.gridfix.android.data
-
-          import android.content.Context
-          import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
-          import androidx.datastore.preferences.core.edit
-          import androidx.datastore.preferences.core.emptyPreferences
-          import androidx.datastore.preferences.core.stringPreferencesKey
-          import androidx.datastore.preferences.preferencesDataStore
-          import kotlinx.coroutines.flow.Flow
-          import kotlinx.coroutines.flow.map
-          import org.json.JSONArray
-          import org.json.JSONObject
-          import java.util.UUID
-
-          private val Context.graphicsStore by preferencesDataStore(
-              name = "graphics",
-              corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
-          )
-
-          /** A simple lat/lon vertex for tactical graphics. */
-          data class GeoVertex(val lat: Double, val lon: Double)
+          mkdir -p 'app/src/main/java/app/gridfix/android'
+          cat > 'app/src/main/java/app/gridfix/android/AppInfo.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android
 
           /**
-           * A tactical control-measure graphic drawn on the map.
-           * Types: phase_line, boundary, axis, doa, objective, aa, route.
-           * Area types (objective, aa) are closed automatically when rendered.
+           * The few strings that identify the app to the outside world. They live in one
+           * place because they change for reasons that have nothing to do with the code:
+           * a support address, a moved privacy policy, a new store listing.
            */
-          data class TacGraphic(
-              val id: String,
-              val name: String,
-              val type: String,
-              val points: List<GeoVertex>,
-              val folder: String = DEFAULT_FOLDER,
-              val affiliation: String = "none",
-              val createdAt: Long = 0L,
-              val echelon: String = "",   // boundary lines carry the echelon mark on the line
-              /** Drawn on the map, or held but hidden. See [Waypoint.visible]. */
-              val visible: Boolean = true,
-          )
+          object AppInfo {
+              /** Public contact for tile servers. Never a personal address: this goes out on every request. */
+              const val CONTACT_URL = "https://github.com/Artemis2028/gridfix-legal"
 
-          object GraphicTypes {
-              /** type key -> (label, minimum vertices, isArea) */
-              val all = listOf(
-                  Triple("phase_line", "Phase line", 2),
-                  Triple("boundary", "Boundary", 2),
-                  Triple("axis", "Axis of advance", 2),
-                  Triple("doa", "Direction of attack", 2),
-                  Triple("objective", "Objective", 3),
-                  Triple("aa", "Assembly area", 3),
-                  Triple("route", "Route", 2),
-                  Triple("lz", "Landing zone", 3),
-                  Triple("pz", "Pickup zone", 3),
-                  Triple("bp", "Battle position", 3),
-                  Triple("ea", "Engagement area", 3),
-                  Triple("nai", "NAI", 3),
-                  Triple("tai", "TAI", 3),
-                  Triple("area", "Area (sketch)", 3),
-                  Triple("screen_l", "Screen line", 2),
-                  Triple("guard_l", "Guard line", 2),
-                  Triple("cover_l", "Cover line", 2),
-                  Triple("flot", "FLOT", 2),
-                  Triple("obstacle_line", "Obstacle line", 2),
-                  Triple("wire", "Wire obstacle", 2),
-                  Triple("lane", "Lane", 2),
-                  Triple("minefield", "Minefield", 3),
-                  Triple("strongpoint", "Strongpoint", 3),
-                  Triple("roadblock", "Roadblock", 1),
-                  Triple("ring", "Range ring", 2),
-                  Triple("sector", "Sector of fire", 3),
-                  Triple("trp", "Target ref point", 1),
-                  Triple("checkpoint", "Checkpoint", 1),
-                  Triple("dp", "Decision point", 1),
-                  Triple("text", "Text label", 1),
-              )
+              const val PRIVACY_URL = "https://github.com/Artemis2028/gridfix-legal/blob/main/PRIVACY.md"
 
-              fun label(type: String): String = all.firstOrNull { it.first == type }?.second ?: type
-
-              fun minPoints(type: String): Int = all.firstOrNull { it.first == type }?.third ?: 2
-
-              fun isArea(type: String): Boolean = type in setOf(
-                  "objective", "aa", "lz", "pz", "area", "bp", "ea", "nai", "tai",
-                  "minefield", "strongpoint",
-              )
-
-              /** Security line graphics: letter box mid-line, arrows outward both ends. */
-              fun securityLetter(type: String): String? = when (type) {
-                  "screen_l" -> "S"
-                  "guard_l" -> "G"
-                  "cover_l" -> "C"
-                  else -> null
-              }
+              const val TERMS_URL = "https://github.com/Artemis2028/gridfix-legal/blob/main/TERMS.md"
 
               /**
-               * Types placed with a fixed number of taps finish themselves — no Done press.
-               * Ring: center then range edge. Sector: apex, left limit, right limit.
+               * Where a tester or a user writes to. Already public in PRIVACY.md, and only ever
+               * reached by a deliberate tap in Settings - unlike [CONTACT_URL], which goes out in
+               * the User-Agent on every tile request and must stay impersonal.
                */
-              fun fixedPoints(type: String): Int? = when (type) {
-                  "ring" -> 2
-                  "sector" -> 3
-                  "trp", "checkpoint", "dp", "text", "roadblock" -> 1
-                  else -> null
-              }
-
-              /** Placement hint shown when the type is picked. */
-              fun placeHint(type: String): String? = when (type) {
-                  "ring" -> "Tap the center, then the range edge"
-                  "sector" -> "Tap the apex, then left limit, then right limit"
-                  "trp", "checkpoint", "dp", "roadblock" -> "Tap the map to place it"
-                  "text" -> "Tap the map where the text goes"
-                  "screen_l", "guard_l", "cover_l" -> "Tap along the security line, then Done"
-                  "flot" -> "Trace your forward line — the scallops face left of your drawing direction (toward the enemy)"
-                  "lane" -> "Trace the cleared lane's centerline"
-                  "obstacle_line", "wire" -> "Trace along the obstacle"
-                  else -> null
-              }
-
-              /** Display prefix used in the on-map label, per doctrine shorthand. */
-              fun labelPrefix(type: String): String = when (type) {
-                  "phase_line" -> "PL "
-                  "objective" -> "OBJ "
-                  "aa" -> "AA "
-                  "lz" -> "LZ "
-                  "pz" -> "PZ "
-                  "bp" -> "BP "
-                  "ea" -> "EA "
-                  "nai" -> "NAI "
-                  "tai" -> "TAI "
-                  "trp" -> "TRP "
-                  "checkpoint" -> "CP "
-                  "dp" -> "DP "
-                  else -> ""
-              }
-          }
-
-          class GraphicsRepository(private val context: Context) {
-
-              private val listKey = stringPreferencesKey("list")
-
-              val graphics: Flow<List<TacGraphic>> = context.graphicsStore.data.map { p ->
-                  decode(p[listKey] ?: "[]")
-              }
-
-              suspend fun add(
-                  name: String,
-                  type: String,
-                  points: List<GeoVertex>,
-                  folder: String,
-                  affiliation: String,
-                  nowMillis: Long,
-                  echelon: String = "",
-              ): String {
-                  val g = TacGraphic(
-                      id = UUID.randomUUID().toString(),
-                      name = name.trim(),
-                      type = type,
-                      points = points,
-                      folder = canonicalFolder(folder),
-                      affiliation = affiliation,
-                      createdAt = nowMillis,
-                      echelon = echelon,
-                  )
-                  context.graphicsStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]") + g)
-                  }
-                  return g.id
-              }
-
-              suspend fun rename(
-                  id: String,
-                  name: String,
-                  folder: String,
-                  affiliation: String,
-                  echelon: String = "",
-              ) {
-                  context.graphicsStore.edit { p ->
-                      p[listKey] = encode(
-                          decode(p[listKey] ?: "[]").map {
-                              if (it.id == id) it.copy(
-                                  name = name.trim(),
-                                  folder = canonicalFolder(folder),
-                                  affiliation = affiliation,
-                                  echelon = echelon,
-                              ) else it
-                          }
-                      )
-                  }
-              }
-
-              /** Merge a backup by id — already-present graphics are skipped. Returns added count. */
-              suspend fun restore(imported: List<TacGraphic>): Int {
-                  var added = 0
-                  context.graphicsStore.edit { p ->
-                      val current = decode(p[listKey] ?: "[]")
-                      val ids = current.map { it.id }.toSet()
-                      val fresh = imported.filter { it.id !in ids }
-                      added = fresh.size
-                      p[listKey] = encode(current + fresh)
-                  }
-                  return added
-              }
-
-              /** Replace a graphic's vertices — the map's edit-points mode saves through this. */
-              suspend fun updatePoints(id: String, points: List<GeoVertex>) {
-                  context.graphicsStore.edit { p ->
-                      p[listKey] = encode(
-                          decode(p[listKey] ?: "[]").map {
-                              if (it.id == id) it.copy(points = points) else it
-                          }
-                      )
-                  }
-              }
-
-              suspend fun delete(id: String) {
-                  context.graphicsStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id == id })
-                  }
-              }
+              const val SUPPORT_EMAIL = "ozwash1776@gmail.com"
 
               /**
-               * Show or hide one graphic on the map without deleting it, independently of its
-               * folder's eye. The list still shows it, marked hidden.
+               * User-Agent for OpenStreetMap, OpenTopoMap and the Terrarium terrain tiles.
+               * OSM's tile usage policy asks for an identifiable app and a way to make
+               * contact; the URL above is that contact.
                */
-              suspend fun setVisible(id: String, visible: Boolean) {
-                  context.graphicsStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.id == id) it.copy(visible = visible) else it })
-                  }
-              }
-
-              /**
-               * Flip the eye on each of [ids] **individually** - a mixed selection swaps, it does
-               * not get forced to one value. Selecting some shown and some hidden graphics and
-               * tapping the eye is how you exchange one set for the other in a single gesture,
-               * which is the whole point of the action.
-               *
-               * One transaction for the batch: the store is a single JSON blob, so N calls to
-               * [setVisible] would rewrite the whole list N times.
-               */
-              suspend fun toggleVisible(ids: Set<String>) {
-                  if (ids.isEmpty()) return
-                  context.graphicsStore.edit { p ->
-                      p[listKey] = encode(
-                          decode(p[listKey] ?: "[]").map { if (it.id in ids) it.copy(visible = !it.visible) else it }
-                      )
-                  }
-              }
-
-              /** Delete every id in [ids] in one transaction. */
-              suspend fun deleteAll(ids: Set<String>) {
-                  if (ids.isEmpty()) return
-                  context.graphicsStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id in ids })
-                  }
-              }
-
-              /** Move every graphic in [from] to [to] (folder rename, or emptying a folder into Base). */
-              suspend fun renameFolder(from: String, to: String) {
-                  val target = canonicalFolder(to)
-                  if (from == target) return
-                  context.graphicsStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.folder == from) it.copy(folder = target) else it })
-                  }
-              }
-
-              /** Remove every graphic in [folder] — "clear the sketch" in one go. */
-              suspend fun deleteFolder(folder: String) {
-                  context.graphicsStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.folder == folder })
-                  }
-              }
-
-              // One damaged record must not take the whole list with it: skip it, keep the rest.
-              private fun decode(json: String): List<TacGraphic> {
-                  val arr = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
-                  return buildList {
-                      for (i in 0 until arr.length()) {
-                          runCatching {
-                              val o = arr.getJSONObject(i)
-                              val pts = o.getJSONArray("points")
-                              val vertices = buildList {
-                                  for (j in 0 until pts.length()) {
-                                      val v = pts.getJSONArray(j)
-                                      add(GeoVertex(v.getDouble(0), v.getDouble(1)))
-                                  }
-                              }
-                              TacGraphic(
-                                  id = o.getString("id"),
-                                  name = o.getString("name"),
-                                  type = o.getString("type"),
-                                  points = vertices,
-                                  folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
-                                  affiliation = o.optString("affiliation", "none"),
-                                  createdAt = o.optLong("createdAt"),
-                                  echelon = o.optString("echelon", ""),
-                                  visible = o.optBoolean("visible", true),
-                              )
-                          }.getOrNull()?.let { add(it) }
-                      }
-                  }
-              }
-
-              private fun encode(list: List<TacGraphic>): String {
-                  val arr = JSONArray()
-                  for (g in list) {
-                      val pts = JSONArray()
-                      for (v in g.points) {
-                          pts.put(JSONArray().put(v.lat).put(v.lon))
-                      }
-                      arr.put(
-                          JSONObject()
-                              .put("id", g.id)
-                              .put("name", g.name)
-                              .put("type", g.type)
-                              .put("points", pts)
-                              .put("folder", g.folder)
-                              .put("affiliation", g.affiliation)
-                              .put("createdAt", g.createdAt)
-                              .put("echelon", g.echelon)
-                              .put("visible", g.visible)
-                      )
-                  }
-                  return arr.toString()
-              }
-          }
-          EOF_GRIDFIX
-          cat > 'app/src/main/java/app/gridfix/android/data/TrackRepository.kt' <<'EOF_GRIDFIX'
-          package app.gridfix.android.data
-
-          import android.content.Context
-          import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
-          import androidx.datastore.preferences.core.edit
-          import androidx.datastore.preferences.core.emptyPreferences
-          import androidx.datastore.preferences.core.stringPreferencesKey
-          import androidx.datastore.preferences.preferencesDataStore
-          import app.gridfix.android.coords.Geodesy
-          import kotlinx.coroutines.Dispatchers
-          import kotlinx.coroutines.flow.Flow
-          import kotlinx.coroutines.flow.first
-          import kotlinx.coroutines.flow.map
-          import kotlinx.coroutines.withContext
-          import org.json.JSONArray
-          import org.json.JSONObject
-          import java.io.File
-          import java.text.SimpleDateFormat
-          import java.util.Date
-          import java.util.Locale
-          import java.util.TimeZone
-          import java.util.UUID
-
-          private val Context.trackStore by preferencesDataStore(
-              name = "tracks",
-              corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
-          )
-
-          /** Track metadata; the point log lives in files/tracks/<id>.txt (one point per line). */
-          data class TrackInfo(
-              val id: String,
-              val name: String,
-              val startedAt: Long,
-              val endedAt: Long,        // 0 while recording
-              val distanceM: Double,
-              val pointCount: Int,
-              val folder: String = DEFAULT_FOLDER,   // overlay folder, shares the eye switch with waypoints and graphics
-              /** Drawn on the map, or held but hidden. See [Waypoint.visible]. */
-              val visible: Boolean = true,
-          )
-
-          /**
-           * A logged fix. [alt] is metres above mean sea level, or [NO_ALTITUDE] when the
-           * receiver gave no height: writing a real number there would put the leg at sea
-           * level on every profile that reads it.
-           */
-          data class TrackPoint(val lat: Double, val lon: Double, val time: Long, val alt: Double)
-
-          /** "this fix had no altitude" — omitted from GPX rather than written as a height. */
-          const val NO_ALTITUDE = -32768.0
-
-          fun Double.hasAltitude(): Boolean = this > NO_ALTITUDE + 1.0
-
-          class TrackRepository(private val context: Context) {
-
-              private val listKey = stringPreferencesKey("list")
-
-              val tracks: Flow<List<TrackInfo>> = context.trackStore.data.map { p ->
-                  decode(p[listKey] ?: "[]").sortedByDescending { it.startedAt }
-              }
-
-              suspend fun startTrack(nowMillis: Long): String {
-                  val id = UUID.randomUUID().toString()
-                  val info = TrackInfo(
-                      id = id,
-                      name = "Track " + dtgShort(nowMillis),
-                      startedAt = nowMillis,
-                      endedAt = 0L,
-                      distanceM = 0.0,
-                      pointCount = 0,
-                  )
-                  withContext(Dispatchers.IO) { pointsFile(context, id).parentFile?.mkdirs() }
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]") + info)
-                  }
-                  return id
-              }
-
-              /** Close out a finished recording: compute stats from the point log. */
-              suspend fun finishTrack(id: String, name: String?, nowMillis: Long) {
-                  val pts = readPoints(context, id)
-                  var dist = 0.0
-                  for (i in 1 until pts.size) {
-                      dist += Geodesy.distanceAndBearing(
-                          pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon
-                      )[0]
-                  }
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(
-                          decode(p[listKey] ?: "[]").map {
-                              if (it.id == id) it.copy(
-                                  name = name?.trim()?.ifBlank { it.name } ?: it.name,
-                                  endedAt = nowMillis,
-                                  distanceM = dist,
-                                  pointCount = pts.size,
-                              ) else it
-                          }
-                      )
-                  }
-              }
-
-              /** Create a finished track from imported points (GPX trk import). */
-              suspend fun importTrack(name: String, points: List<TrackPoint>, nowMillis: Long): String {
-                  val id = UUID.randomUUID().toString()
-                  withContext(Dispatchers.IO) {
-                      val f = pointsFile(context, id)
-                      f.parentFile?.mkdirs()
-                      f.bufferedWriter().use { out ->
-                          for (p in points) {
-                              out.write(
-                                  String.format(Locale.US, "%.7f %.7f %d %.1f\n", p.lat, p.lon, p.time, p.alt)
-                              )
-                          }
-                      }
-                  }
-                  var dist = 0.0
-                  for (i in 1 until points.size) {
-                      dist += Geodesy.distanceAndBearing(
-                          points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon
-                      )[0]
-                  }
-                  val start = points.firstOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
-                  val end = points.lastOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
-                  val info = TrackInfo(
-                      id = id,
-                      name = name.trim().ifBlank { "Imported track" },
-                      startedAt = start,
-                      endedAt = end,
-                      distanceM = dist,
-                      pointCount = points.size,
-                  )
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]") + info)
-                  }
-                  return id
-              }
-
-              /** Restore one track from a backup, keeping its id; skipped when already present. */
-              suspend fun restore(info: TrackInfo, points: List<TrackPoint>): Boolean {
-                  var added = false
-                  context.trackStore.edit { p ->
-                      val current = decode(p[listKey] ?: "[]")
-                      if (current.none { it.id == info.id }) {
-                          val f = pointsFile(context, info.id)
-                          f.parentFile?.mkdirs()
-                          f.writeText(
-                              points.joinToString("") {
-                                  String.format(Locale.US, "%.7f %.7f %d %.1f\n", it.lat, it.lon, it.time, it.alt)
-                              }
-                          )
-                          p[listKey] = encode(current + info)
-                          added = true
-                      }
-                  }
-                  return added
-              }
-
-              suspend fun rename(id: String, name: String) {
-                  if (name.isBlank()) return
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(
-                          decode(p[listKey] ?: "[]").map {
-                              if (it.id == id) it.copy(name = name.trim()) else it
-                          }
-                      )
-                  }
-              }
-
-              suspend fun setFolder(id: String, folder: String) {
-                  val clean = canonicalFolder(folder)
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(
-                          decode(p[listKey] ?: "[]").map {
-                              if (it.id == id) it.copy(folder = clean) else it
-                          }
-                      )
-                  }
-              }
-
-              suspend fun delete(id: String) {
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id == id })
-                  }
-                  withContext(Dispatchers.IO) { pointsFile(context, id).delete() }
-              }
-
-              /**
-               * Show or hide one track on the map without deleting it, independently of its
-               * folder's eye. The list still shows it, marked hidden.
-               */
-              suspend fun setVisible(id: String, visible: Boolean) {
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.id == id) it.copy(visible = visible) else it })
-                  }
-              }
-
-              /**
-               * Flip the eye on each of [ids] **individually** - a mixed selection swaps, it does
-               * not get forced to one value. Selecting some shown and some hidden tracks and
-               * tapping the eye is how you exchange one set for the other in a single gesture,
-               * which is the whole point of the action.
-               *
-               * One transaction for the batch: the store is a single JSON blob, so N calls to
-               * [setVisible] would rewrite the whole list N times.
-               */
-              suspend fun toggleVisible(ids: Set<String>) {
-                  if (ids.isEmpty()) return
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(
-                          decode(p[listKey] ?: "[]").map { if (it.id in ids) it.copy(visible = !it.visible) else it }
-                      )
-                  }
-              }
-
-              /** Delete every id in [ids] in one transaction. */
-              suspend fun deleteAll(ids: Set<String>) {
-                  if (ids.isEmpty()) return
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id in ids })
-                  }
-                  // The log files go with them, after the store is written: a leftover file is
-                  // recoverable, a store entry pointing at nothing is not.
-                  withContext(Dispatchers.IO) { ids.forEach { pointsFile(context, it).delete() } }
-              }
-
-              /** Move every track in [from] to [to] (folder rename, or emptying a folder into Base). */
-              suspend fun renameFolder(from: String, to: String) {
-                  val target = canonicalFolder(to)
-                  if (from == target) return
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.folder == from) it.copy(folder = target) else it })
-                  }
-              }
-
-              /** Delete every track in [folder], point logs included. */
-              suspend fun deleteFolder(folder: String) {
-                  val doomed = decode(context.trackStore.data.first()[listKey] ?: "[]").filter { it.folder == folder }
-                  for (t in doomed) delete(t.id)
-              }
-
-              /** Remove a recording that was discarded before saving. */
-              suspend fun discard(id: String) = delete(id)
-
-              /**
-               * Heal recordings the OS killed mid-way: any track still open (endedAt == 0)
-               * that is not the one currently recording is closed out from its point log
-               * (the points are on disk — only the summary was lost), or removed when it
-               * never logged a point.
-               */
-              suspend fun finalizeOrphans(activeId: String?) {
-                  val open = decode(context.trackStore.data.first()[listKey] ?: "[]")
-                      .filter { it.endedAt == 0L && it.id != activeId }
-                  for (t in open) {
-                      val pts = readPoints(context, t.id)
-                      if (pts.isEmpty()) {
-                          delete(t.id)
-                      } else {
-                          val last = pts.last().time
-                          finishTrack(t.id, null, if (last > t.startedAt) last else System.currentTimeMillis())
-                      }
-                  }
-              }
-
-              // One damaged record must not take the whole list with it: skip it, keep the rest.
-              private fun decode(json: String): List<TrackInfo> {
-                  val arr = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
-                  return buildList {
-                      for (i in 0 until arr.length()) {
-                          runCatching {
-                              val o = arr.getJSONObject(i)
-                              TrackInfo(
-                                  id = o.getString("id"),
-                                  name = o.getString("name"),
-                                  startedAt = o.optLong("startedAt"),
-                                  endedAt = o.optLong("endedAt"),
-                                  distanceM = o.optDouble("distanceM", 0.0),
-                                  pointCount = o.optInt("pointCount", 0),
-                                  folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
-                                  visible = o.optBoolean("visible", true),
-                              )
-                          }.getOrNull()?.let { add(it) }
-                      }
-                  }
-              }
-
-              private fun encode(list: List<TrackInfo>): String {
-                  val arr = JSONArray()
-                  for (t in list) {
-                      arr.put(
-                          JSONObject()
-                              .put("id", t.id)
-                              .put("name", t.name)
-                              .put("startedAt", t.startedAt)
-                              .put("endedAt", t.endedAt)
-                              .put("distanceM", t.distanceM)
-                              .put("pointCount", t.pointCount)
-                              .put("folder", t.folder)
-                              .put("visible", t.visible)
-                      )
-                  }
-                  return arr.toString()
-              }
-
-              companion object {
-                  fun pointsFile(context: Context, id: String): File =
-                      File(File(context.filesDir, "tracks"), "$id.txt")
-
-                  /** Append one point; called from the recorder service's worker thread. */
-                  fun appendPoint(context: Context, id: String, lat: Double, lon: Double, time: Long, alt: Double) {
-                      runCatching {
-                          val f = pointsFile(context, id)
-                          f.parentFile?.mkdirs()
-                          f.appendText(
-                              String.format(Locale.US, "%.7f %.7f %d %.1f\n", lat, lon, time, alt)
-                          )
-                      }
-                  }
-
-                  suspend fun readPoints(context: Context, id: String): List<TrackPoint> =
-                      withContext(Dispatchers.IO) {
-                          val f = pointsFile(context, id)
-                          if (!f.exists()) return@withContext emptyList()
-                          f.readLines().mapNotNull { line ->
-                              val parts = line.trim().split(" ")
-                              if (parts.size < 3) return@mapNotNull null
-                              runCatching {
-                                  TrackPoint(
-                                      lat = parts[0].toDouble(),
-                                      lon = parts[1].toDouble(),
-                                      time = parts[2].toLong(),
-                                      alt = parts.getOrNull(3)?.toDouble() ?: NO_ALTITUDE,
-                                  )
-                              }.getOrNull()
-                          }
-                      }
-
-                  /** Minimal GPX 1.1 document for one track. */
-                  fun buildGpx(name: String, points: List<TrackPoint>): String {
-                      val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
-                      sdf.timeZone = TimeZone.getTimeZone("UTC")
-                      val sb = StringBuilder()
-                      sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-                      sb.append("<gpx version=\"1.1\" creator=\"MGRS GPS\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n")
-                      sb.append("  <trk>\n    <name>").append(escapeXml(name)).append("</name>\n    <trkseg>\n")
-                      for (p in points) {
-                          val ele = if (p.alt.hasAltitude()) String.format(Locale.US, "<ele>%.1f</ele>", p.alt) else ""
-                          sb.append(
-                              String.format(
-                                  Locale.US,
-                                  "      <trkpt lat=\"%.7f\" lon=\"%.7f\">%s<time>%s</time></trkpt>\n",
-                                  p.lat, p.lon, ele, sdf.format(Date(p.time)),
-                              )
-                          )
-                      }
-                      sb.append("    </trkseg>\n  </trk>\n</gpx>\n")
-                      return sb.toString()
-                  }
-
-                  private fun escapeXml(s: String): String = s
-                      .replace("&", "&amp;")
-                      .replace("<", "&lt;")
-                      .replace(">", "&gt;")
-                      .replace("\"", "&quot;")
-
-                  private fun dtgShort(timeMillis: Long): String {
-                      val sdf = SimpleDateFormat("ddHHmm'Z'", Locale.US)
-                      sdf.timeZone = TimeZone.getTimeZone("UTC")
-                      return sdf.format(Date(timeMillis))
-                  }
-              }
-          }
-          EOF_GRIDFIX
-          cat > 'app/src/main/java/app/gridfix/android/data/WaypointRepository.kt' <<'EOF_GRIDFIX'
-          package app.gridfix.android.data
-
-          import android.content.Context
-          import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
-          import androidx.datastore.preferences.core.edit
-          import androidx.datastore.preferences.core.emptyPreferences
-          import androidx.datastore.preferences.core.stringPreferencesKey
-          import androidx.datastore.preferences.preferencesDataStore
-          import kotlinx.coroutines.flow.Flow
-          import kotlinx.coroutines.flow.first
-          import kotlinx.coroutines.flow.map
-          import org.json.JSONArray
-          import org.json.JSONObject
-          import java.util.Locale
-          import java.util.UUID
-
-          private val Context.wpStore by preferencesDataStore(
-              name = "waypoints",
-              corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
-          )
-
-          const val DEFAULT_FOLDER = "Base"
-
-          /**
-           * Folder names as stored. Before 0.9.9 waypoints defaulted to "Waypoints" and drawn
-           * graphics to "Graphics"; both collapse into the one base folder that now holds
-           * waypoints, graphics and tracks together, so one eye switch clears the map.
-           */
-          fun canonicalFolder(raw: String?): String = when (raw?.trim().orEmpty()) {
-              "", "Waypoints", "Graphics" -> DEFAULT_FOLDER
-              else -> raw!!.trim()
-          }
-
-          /** A one-line warning for folder name fields when the typed name will not be kept as typed. */
-          fun reservedFolderHint(raw: String): String? {
-              val t = raw.trim()
-              if (t.isEmpty() || t == DEFAULT_FOLDER) return null
-              return if (canonicalFolder(t) == DEFAULT_FOLDER) "\"$t\" is a reserved name — this goes into $DEFAULT_FOLDER" else null
-          }
-
-          /**
-           * The stored spelling of a folder: "recon" and "Recon" are one folder. [known] is
-           * every folder name currently in use; the first case-insensitive match wins.
-           */
-          fun matchFolder(known: Iterable<String>, raw: String?): String {
-              val clean = canonicalFolder(raw)
-              return known.firstOrNull { it.equals(clean, ignoreCase = true) } ?: clean
-          }
-          const val DEFAULT_SYMBOL = "flag"
-
-          data class Waypoint(
-              val id: String,
-              val name: String,
-              val lat: Double,
-              val lon: Double,
-              val createdAt: Long,
-              val folder: String = DEFAULT_FOLDER,
-              val symbol: String = DEFAULT_SYMBOL,
-              val affiliation: String = "none",
-              val echelon: String = "",       // "", tm, sqd, sec, plt, co, bn, rgt, bde
-              val designation: String = "",   // free-text unit designation amplifier
-              val kind: String = KIND_WP,     // KIND_WP (navigation point) or KIND_UNIT (plotted unit)
-              val rotation: Float = 0f,       // degrees clockwise from north; direction of fire for task symbols
-              /**
-               * Drawn on the map, or held but hidden. Independent of the folder's eye: a
-               * hidden folder hides everything in it, and this hides one item inside a folder
-               * that is otherwise shown. Defaults true, so every existing record and every
-               * backup written before 0.9.26 reads back visible.
-               */
-              val visible: Boolean = true,
-          )
-
-          const val KIND_WP = "wp"
-          const val KIND_UNIT = "unit"
-
-          /** Everything needed to create or update a waypoint. */
-          data class WaypointDraft(
-              val name: String,
-              val lat: Double,
-              val lon: Double,
-              val folder: String,
-              val symbol: String,
-              val affiliation: String,
-              val echelon: String = "",
-              val designation: String = "",
-              val kind: String = KIND_WP,
-              val rotation: Float = 0f,
-          )
-
-          /** A waypoint folder ("overlay"): can exist empty, and can be toggled visible/hidden. */
-          data class FolderInfo(val name: String, val visible: Boolean = true)
-
-          class WaypointRepository(private val context: Context) {
-
-              private val listKey = stringPreferencesKey("list")
-              private val selectedKey = stringPreferencesKey("selected")
-              private val foldersKey = stringPreferencesKey("folders")
-
-              val waypoints: Flow<List<Waypoint>> = context.wpStore.data.map { p ->
-                  decode(p[listKey] ?: "[]")
-              }
-
-              val selectedId: Flow<String?> = context.wpStore.data.map { p -> p[selectedKey] }
-
-              /** Stored folders unioned with any folder referenced by a waypoint: Base first, then by name. */
-              val folders: Flow<List<FolderInfo>> = context.wpStore.data.map { p ->
-                  val stored = decodeFolders(p[foldersKey] ?: "[]")
-                  val referenced = decode(p[listKey] ?: "[]").map { it.folder }
-                  val names = (stored.map { it.name } + referenced + DEFAULT_FOLDER).distinct()
-                  names.map { n -> stored.firstOrNull { it.name == n } ?: FolderInfo(n) }
-                      .sortedWith(compareBy({ it.name != DEFAULT_FOLDER }, { it.name.lowercase(Locale.US) }))
-              }
-
-              /** Every folder name in use right now (stored entries and waypoint references). */
-              private fun knownNames(p: androidx.datastore.preferences.core.Preferences): List<String> =
-                  (decodeFolders(p[foldersKey] ?: "[]").map { it.name } + decode(p[listKey] ?: "[]").map { it.folder } + DEFAULT_FOLDER).distinct()
-
-              /** The spelling this name will be stored under (case-insensitive match against existing folders). */
-              suspend fun resolveFolder(raw: String): String =
-                  matchFolder(knownNames(context.wpStore.data.first()), raw)
-
-              /** Create a folder (or match an existing one, ignoring case). Returns the stored name. */
-              suspend fun addFolder(name: String): String {
-                  if (name.isBlank()) return DEFAULT_FOLDER
-                  var stored = canonicalFolder(name)
-                  context.wpStore.edit { p ->
-                      stored = matchFolder(knownNames(p), name)
-                      p[foldersKey] = encodeFolders(
-                          upsertFolder(decodeFolders(p[foldersKey] ?: "[]"), stored, null)
-                      )
-                  }
-                  return stored
-              }
-
-              suspend fun setFolderVisible(name: String, visible: Boolean) {
-                  context.wpStore.edit { p ->
-                      p[foldersKey] = encodeFolders(
-                          upsertFolder(decodeFolders(p[foldersKey] ?: "[]"), name, visible)
-                      )
-                  }
-              }
-
-              /**
-               * Rename a folder, moving its waypoints. Renaming onto an existing folder (any
-               * case) merges into it. Base cannot be renamed. Returns the name now in use.
-               */
-              suspend fun renameFolder(from: String, to: String): String {
-                  if (from == DEFAULT_FOLDER || to.isBlank()) return from
-                  var target = canonicalFolder(to)
-                  context.wpStore.edit { p ->
-                      val stored = decodeFolders(p[foldersKey] ?: "[]")
-                      target = matchFolder(knownNames(p).filter { it != from }, to)
-                      if (target == from) return@edit
-                      val src = stored.firstOrNull { it.name == from }
-                      val merged = stored.filterNot { it.name == from }.toMutableList()
-                      mergeFolder(merged, FolderInfo(target, src?.visible ?: true))
-                      p[foldersKey] = encodeFolders(merged)
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.folder == from) it.copy(folder = target) else it })
-                  }
-                  return target
-              }
-
-              /**
-               * Remove a folder: its waypoints are deleted with it, or moved to Base when
-               * [deleteContents] is false. Base cannot be deleted.
-               */
-              suspend fun deleteFolder(name: String, deleteContents: Boolean) {
-                  if (name == DEFAULT_FOLDER) return
-                  context.wpStore.edit { p ->
-                      val current = decode(p[listKey] ?: "[]")
-                      val kept = if (deleteContents) current.filterNot { it.folder == name }
-                      else current.map { if (it.folder == name) it.copy(folder = DEFAULT_FOLDER) else it }
-                      p[listKey] = encode(kept)
-                      p[foldersKey] = encodeFolders(decodeFolders(p[foldersKey] ?: "[]").filterNot { it.name == name })
-                      val sel = p[selectedKey]
-                      if (sel != null && kept.none { it.id == sel }) p.remove(selectedKey)
-                  }
-              }
-
-              suspend fun add(draft: WaypointDraft, nowMillis: Long): String {
-                  val newId = UUID.randomUUID().toString()
-                  context.wpStore.edit { p ->
-                      val current = decode(p[listKey] ?: "[]")
-                      val wp = Waypoint(
-                          id = newId,
-                          name = draft.name,
-                          lat = draft.lat,
-                          lon = draft.lon,
-                          createdAt = nowMillis,
-                          folder = matchFolder(knownNames(p), draft.folder),
-                          symbol = draft.symbol.ifBlank { DEFAULT_SYMBOL },
-                          affiliation = draft.affiliation,
-                          echelon = draft.echelon,
-                          designation = draft.designation,
-                          kind = draft.kind,
-                          rotation = draft.rotation,
-                      )
-                      p[listKey] = encode(current + wp)
-                      p[foldersKey] = encodeFolders(
-                          upsertFolder(decodeFolders(p[foldersKey] ?: "[]"), wp.folder, null)
-                      )
-                      if (p[selectedKey] == null) {
-                          p[selectedKey] = wp.id
-                      }
-                  }
-                  return newId
-              }
-
-              /** Bulk add (imports): one datastore write however many points arrive. */
-              suspend fun addAll(drafts: List<WaypointDraft>, nowMillis: Long) {
-                  if (drafts.isEmpty()) return
-                  context.wpStore.edit { p ->
-                      val current = decode(p[listKey] ?: "[]")
-                      var folders = decodeFolders(p[foldersKey] ?: "[]")
-                      val known = knownNames(p).toMutableList()
-                      val added = drafts.map { draft ->
-                          val f = matchFolder(known, draft.folder)
-                          if (f !in known) known.add(f)
-                          folders = upsertFolder(folders, f, null)
-                          Waypoint(
-                              id = UUID.randomUUID().toString(),
-                              name = draft.name,
-                              lat = draft.lat,
-                              lon = draft.lon,
-                              createdAt = nowMillis,
-                              folder = f,
-                              symbol = draft.symbol.ifBlank { DEFAULT_SYMBOL },
-                              affiliation = draft.affiliation,
-                              echelon = draft.echelon,
-                              designation = draft.designation,
-                              kind = draft.kind,
-                              rotation = draft.rotation,
-                          )
-                      }
-                      p[listKey] = encode(current + added)
-                      p[foldersKey] = encodeFolders(folders)
-                  }
-              }
-
-              /**
-               * Merge a backup: waypoints keep their original ids and ids already on the
-               * device are skipped, so restoring twice never duplicates. Folder entries
-               * merge by name (existing visibility wins). Returns how many were added.
-               */
-              suspend fun restore(imported: List<Waypoint>, importedFolders: List<FolderInfo>): Int {
-                  var added = 0
-                  context.wpStore.edit { p ->
-                      val current = decode(p[listKey] ?: "[]")
-                      val ids = current.map { it.id }.toSet()
-                      val fresh = imported.filter { it.id !in ids }
-                      added = fresh.size
-                      p[listKey] = encode(current + fresh)
-                      val merged = decodeFolders(p[foldersKey] ?: "[]").toMutableList()
-                      val known = merged.map { it.name }.toSet()
-                      // folders new to this device come in with their backed-up visibility; existing ones keep theirs
-                      for (f in importedFolders.map { it.copy(name = canonicalFolder(it.name)) }) {
-                          if (f.name !in known) mergeFolder(merged, f)
-                      }
-                      var folders: List<FolderInfo> = merged
-                      for (w in fresh) folders = upsertFolder(folders, w.folder, null)
-                      p[foldersKey] = encodeFolders(folders)
-                  }
-                  return added
-              }
-
-              suspend fun update(id: String, draft: WaypointDraft) {
-                  context.wpStore.edit { p ->
-                      val current = decode(p[listKey] ?: "[]")
-                      val folder = matchFolder(knownNames(p), draft.folder)
-                      p[listKey] = encode(
-                          current.map {
-                              if (it.id == id) it.copy(
-                                  name = draft.name,
-                                  lat = draft.lat,
-                                  lon = draft.lon,
-                                  folder = folder,
-                                  symbol = draft.symbol.ifBlank { DEFAULT_SYMBOL },
-                                  affiliation = draft.affiliation,
-                                  echelon = draft.echelon,
-                                  designation = draft.designation,
-                                  kind = draft.kind,
-                                  rotation = draft.rotation,
-                              ) else it
-                          }
-                      )
-                      p[foldersKey] = encodeFolders(
-                          upsertFolder(decodeFolders(p[foldersKey] ?: "[]"), folder, null)
-                      )
-                  }
-              }
-
-              suspend fun delete(id: String) {
-                  context.wpStore.edit { p ->
-                      val current = decode(p[listKey] ?: "[]")
-                      p[listKey] = encode(current.filterNot { it.id == id })
-                      if (p[selectedKey] == id) {
-                          p.remove(selectedKey)
-                      }
-                  }
-              }
-
-              /**
-               * Show or hide one waypoint on the map without deleting it, independently of its
-               * folder's eye. The list still shows it, marked hidden.
-               */
-              suspend fun setVisible(id: String, visible: Boolean) {
-                  context.wpStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.id == id) it.copy(visible = visible) else it })
-                  }
-              }
-
-              /**
-               * Flip the eye on each of [ids] **individually** - a mixed selection swaps, it does
-               * not get forced to one value. Selecting some shown and some hidden waypoints and
-               * tapping the eye is how you exchange one set for the other in a single gesture,
-               * which is the whole point of the action.
-               *
-               * One transaction for the batch: the store is a single JSON blob, so N calls to
-               * [setVisible] would rewrite the whole list N times.
-               */
-              suspend fun toggleVisible(ids: Set<String>) {
-                  if (ids.isEmpty()) return
-                  context.wpStore.edit { p ->
-                      p[listKey] = encode(
-                          decode(p[listKey] ?: "[]").map { if (it.id in ids) it.copy(visible = !it.visible) else it }
-                      )
-                  }
-              }
-
-              /** Delete every id in [ids] in one transaction. */
-              suspend fun deleteAll(ids: Set<String>) {
-                  if (ids.isEmpty()) return
-                  context.wpStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id in ids })
-                      if (p[selectedKey] in ids) p.remove(selectedKey)
-                  }
-              }
-
-              suspend fun select(id: String) {
-                  context.wpStore.edit { p -> p[selectedKey] = id }
-              }
-
-              // One damaged record must not take the whole list with it: skip it, keep the rest.
-              private fun decode(json: String): List<Waypoint> {
-                  val arr = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
-                  return buildList {
-                      for (i in 0 until arr.length()) {
-                          val o = runCatching { arr.getJSONObject(i) }.getOrNull() ?: continue
-                          runCatching {
-                              Waypoint(
-                                  id = o.getString("id"),
-                                  name = o.getString("name"),
-                                  lat = o.getDouble("lat"),
-                                  lon = o.getDouble("lon"),
-                                  createdAt = o.optLong("createdAt"),
-                                  folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
-                                  symbol = o.optString("symbol", DEFAULT_SYMBOL),
-                                  affiliation = o.optString("affiliation", "none"),
-                                  echelon = o.optString("echelon", ""),
-                                  designation = o.optString("designation", ""),
-                                  kind = o.optString(
-                                      "kind",
-                                      // migrate pre-0.5 data: NATO symbols were always units
-                                      if (o.optString("symbol", "").startsWith("nato_")) KIND_UNIT else KIND_WP,
-                                  ),
-                                  rotation = o.optDouble("rotation", 0.0).toFloat(),
-                                  visible = o.optBoolean("visible", true),
-                              )
-                          }.getOrNull()?.let { add(it) }
-                      }
-                  }
-              }
-
-              /** Add or update a folder entry; visible == null keeps the existing visibility. */
-              private fun upsertFolder(list: List<FolderInfo>, name: String, visible: Boolean?): List<FolderInfo> {
-                  val existing = list.firstOrNull { it.name == name }
-                  return when {
-                      existing == null -> list + FolderInfo(name, visible ?: true)
-                      visible == null -> list
-                      else -> list.map { if (it.name == name) it.copy(visible = visible) else it }
-                  }
-              }
-
-              private fun decodeFolders(json: String): List<FolderInfo> = runCatching {
-                  val arr = JSONArray(json)
-                  val out = ArrayList<FolderInfo>()
-                  for (i in 0 until arr.length()) {
-                      val o = arr.getJSONObject(i)
-                      mergeFolder(out, FolderInfo(canonicalFolder(o.getString("name")), o.optBoolean("visible", true)))
-                  }
-                  out
-              }.getOrDefault(emptyList())
-
-              /**
-               * Add a folder entry, merging by canonical name. Legacy "Waypoints" and "Graphics"
-               * both map to Base: if either was visible, Base is visible - nothing a user could
-               * see before an upgrade disappears from the map because of the merge.
-               */
-              private fun mergeFolder(list: MutableList<FolderInfo>, f: FolderInfo) {
-                  val idx = list.indexOfFirst { it.name == f.name }
-                  if (idx < 0) list.add(f)
-                  else if (f.visible && !list[idx].visible) list[idx] = list[idx].copy(visible = true)
-              }
-
-              private fun encodeFolders(list: List<FolderInfo>): String {
-                  val arr = JSONArray()
-                  for (f in list) {
-                      arr.put(JSONObject().put("name", f.name).put("visible", f.visible))
-                  }
-                  return arr.toString()
-              }
-
-              private fun encode(list: List<Waypoint>): String {
-                  val arr = JSONArray()
-                  for (w in list) {
-                      arr.put(
-                          JSONObject()
-                              .put("id", w.id)
-                              .put("name", w.name)
-                              .put("lat", w.lat)
-                              .put("lon", w.lon)
-                              .put("createdAt", w.createdAt)
-                              .put("folder", w.folder)
-                              .put("symbol", w.symbol)
-                              .put("affiliation", w.affiliation)
-                              .put("echelon", w.echelon)
-                              .put("designation", w.designation)
-                              .put("kind", w.kind)
-                              .put("rotation", w.rotation.toDouble())
-                              .put("visible", w.visible)
-                      )
-                  }
-                  return arr.toString()
-              }
+              fun userAgent(versionName: String): String = "MGRS GPS/$versionName (+$CONTACT_URL)"
           }
           EOF_GRIDFIX
           mkdir -p 'app/src/main/java/app/gridfix/android/ui'
-          base64 -d <<'EOF_GRIDFIX_GZ' | gunzip > 'app/src/main/java/app/gridfix/android/ui/GridFixApp.kt'
-          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
-          EOF_GRIDFIX_GZ
+          cat > 'app/src/main/java/app/gridfix/android/ui/OpenLink.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android.ui
+
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.widget.Toast
+          import app.gridfix.android.AppInfo
+          import app.gridfix.android.BuildConfig
+
+          /**
+           * Open an external link, or say so instead of dying.
+           *
+           * `UriHandler.openUri` throws when nothing on the device handles the intent, and a
+           * locked-down unit phone can genuinely have no browser installed. The three screens
+           * that link out - the disclaimer, the paywall and settings - include the two a user
+           * meets before they have ever seen the map, so an unguarded call there is a crash on
+           * first launch for exactly the phones this app is meant for.
+           *
+           * The toast is deliberate rather than a snackbar: the disclaimer and the paywall are
+           * drawn outside the Scaffold that owns the app's SnackbarHost.
+           */
+          fun openLink(context: Context, url: String) {
+              val opened = runCatching {
+                  context.startActivity(
+                      Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                  )
+                  true
+              }.getOrDefault(false)
+              if (!opened) {
+                  Toast.makeText(context, "No app on this phone can open $url", Toast.LENGTH_LONG).show()
+              }
+          }
+
+          /**
+           * Open a mail app with a feedback message already addressed and stamped.
+           *
+           * A closed test is twelve people who cannot reach you. The one thing worth more than
+           * their report is a report that says which build it came from: "it crashed" is noise,
+           * "0.9.28 build 56, Pixel 7, Android 14, it crashed opening the paywall" is a bug.
+           * So the version, the device and the OS go in the body before they type a word.
+           *
+           * ACTION_SENDTO with a mailto: URI rather than ACTION_SEND, so only mail apps offer to
+           * handle it - a send chooser full of messaging apps is how this gets abandoned. Guarded
+           * the same way as [openLink]: a phone with no mail app configured must not crash the
+           * settings screen.
+           */
+          fun sendFeedback(context: Context) {
+              val body = buildString {
+                  append("\n\n")
+                  append("---- please leave the lines below ----\n")
+                  append("App:     MGRS GPS ")
+                  append(BuildConfig.VERSION_NAME)
+                  append(" (build ")
+                  append(BuildConfig.VERSION_CODE)
+                  append(")\n")
+                  append("Device:  ")
+                  append(Build.MANUFACTURER)
+                  append(" ")
+                  append(Build.MODEL)
+                  append("\n")
+                  append("Android: ")
+                  append(Build.VERSION.RELEASE)
+                  append(" (API ")
+                  append(Build.VERSION.SDK_INT)
+                  append(")\n")
+              }
+              val uri = Uri.parse(
+                  "mailto:" + Uri.encode(AppInfo.SUPPORT_EMAIL) +
+                      "?subject=" + Uri.encode("MGRS GPS feedback " + BuildConfig.VERSION_NAME) +
+                      "&body=" + Uri.encode(body)
+              )
+              val opened = runCatching {
+                  context.startActivity(
+                      Intent(Intent.ACTION_SENDTO, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                  )
+                  true
+              }.getOrDefault(false)
+              if (!opened) {
+                  Toast.makeText(context, "No mail app — write to " + AppInfo.SUPPORT_EMAIL, Toast.LENGTH_LONG).show()
+              }
+          }
+          EOF_GRIDFIX
           mkdir -p 'app/src/main/java/app/gridfix/android/ui/screens'
-          base64 -d <<'EOF_GRIDFIX_GZ' | gunzip > 'app/src/main/java/app/gridfix/android/ui/screens/WaypointsScreen.kt'
-          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
-          EOF_GRIDFIX_GZ
-          echo "v0.9.27-ee5449795a09" > .github/last-payload
+          cat > 'app/src/main/java/app/gridfix/android/ui/screens/SettingsScreen.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android.ui.screens
+
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxHeight
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.selection.selectable
+          import androidx.compose.foundation.selection.selectableGroup
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.outlined.ChevronRight
+          import androidx.compose.material3.HorizontalDivider
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.drawBehind
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.semantics.Role
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import app.gridfix.android.AppInfo
+          import app.gridfix.android.data.AppSettings
+          import app.gridfix.android.data.SettingsRepository
+          import app.gridfix.android.location.Declination
+          import app.gridfix.android.ui.ScreenOrientation
+          import app.gridfix.android.ui.faces.Face
+          import app.gridfix.android.ui.theme.LabelFamily
+          import app.gridfix.android.ui.theme.MonoFamily
+          import kotlinx.coroutines.launch
+          import java.util.Locale
+          import kotlin.math.abs
+          import kotlin.math.roundToInt
+
+          @Composable
+          fun SettingsScreen(
+              repo: SettingsRepository,
+              settings: AppSettings,
+              modelDeclination: Float? = null,   // the phone's magnetic model at the current fix, for the caption
+              gridConvergence: Float? = null,    // true -> grid at the current fix; converts a typed G-M angle
+              entitled: Boolean = false,
+              onPreviewPaywall: () -> Unit = {},
+              onOpenReference: () -> Unit = {},
+              onBackup: (android.net.Uri, (String) -> Unit) -> Unit = { _, _ -> },
+              onRestore: (android.net.Uri, (String) -> Unit) -> Unit = { _, _ -> },
+          ) {
+              val scope = rememberCoroutineScope()
+              val context = androidx.compose.ui.platform.LocalContext.current
+              var backupStatus by remember { mutableStateOf<String?>(null) }
+              val backupLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.CreateDocument("application/zip")
+              ) { uri -> if (uri != null) onBackup(uri) { backupStatus = it } }
+              val restoreLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.OpenDocument()
+              ) { uri -> if (uri != null) onRestore(uri) { backupStatus = it } }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .verticalScroll(rememberScrollState())
+                      .padding(horizontal = 20.dp, vertical = 12.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp),
+              ) {
+                  // ---------------- DISPLAY ----------------
+                  SectionHeader("Display", first = true)
+
+                  Setting("Position & Navigate face") {
+                      Segmented(
+                          options = Face.names,
+                          selected = settings.face,
+                      ) { index -> scope.launch { repo.setFace(index) } }
+                      Spacer(Modifier.height(6.dp))
+                      Text(
+                          when (settings.face) {
+                              Face.GLANCE -> "Glance: the grid as two big numbers, one row of data, an arrow to the target."
+                              Face.LENSATIC -> "Lensatic: the issued compass dial with your grid on the glass. Navigate sets the bezel to the azimuth — turn until the north arrow sits under the line."
+                              else -> "Dial: a clean compass card that turns with you, with a needle to the target."
+                          },
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+
+                  Setting("Orientation") {
+                      Segmented(
+                          options = ScreenOrientation.names,
+                          selected = settings.orientation,
+                      ) { index -> scope.launch { repo.setOrientation(index) } }
+                      Spacer(Modifier.height(6.dp))
+                      Text(
+                          when (settings.orientation) {
+                              ScreenOrientation.PORTRAIT -> "Pinned upright, whatever the phone's auto-rotate says."
+                              ScreenOrientation.LANDSCAPE -> "Pinned sideways for a phone worn on armour. Flipped turns it the other way up."
+                              ScreenOrientation.LANDSCAPE_FLIPPED -> "Pinned sideways, the other way up. Landscape turns it back."
+                              else -> "Follows the phone. The rotate icon in the top bar pins it from any screen."
+                          },
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+
+                  SettingSwitch(
+                      title = "Night mode",
+                      subtitle = "Red-on-black display to preserve night vision",
+                      checked = settings.nightMode,
+                  ) { scope.launch { repo.setNightMode(it) } }
+
+                  SettingSwitch(
+                      title = "Keep screen on",
+                      subtitle = "Prevent the display from sleeping while MGRS GPS is open",
+                      checked = settings.keepScreenOn,
+                  ) { scope.launch { repo.setKeepScreenOn(it) } }
+
+                  // ---------------- GRID & UNITS ----------------
+                  SectionHeader("Grid & units")
+
+                  Setting("MGRS precision") {
+                      Segmented(
+                          options = listOf("4", "6", "8", "10"),
+                          selected = when (settings.mgrsDigits) {
+                              4 -> 0
+                              6 -> 1
+                              8 -> 2
+                              else -> 3
+                          },
+                      ) { index -> scope.launch { repo.setMgrsDigits(listOf(4, 6, 8, 10)[index]) } }
+                  }
+
+                  Setting("Lat / Lon format") {
+                      Segmented(options = listOf("DD", "DDM", "DMS"), selected = settings.latLonFormat) { index ->
+                          scope.launch { repo.setLatLonFormat(index) }
+                      }
+                  }
+
+                  Setting("Units") {
+                      Segmented(options = listOf("Metric", "Imperial", "Nautical"), selected = settings.units) { index ->
+                          scope.launch { repo.setUnits(index) }
+                      }
+                  }
+
+                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                      Box(Modifier.weight(1f)) {
+                          Setting("Angle") {
+                              Segmented(options = listOf("Degrees", "Mils"), selected = settings.angleUnit) { index ->
+                                  scope.launch { repo.setAngleUnit(index) }
+                              }
+                          }
+                      }
+                      Box(Modifier.weight(1f)) {
+                          Setting("North") {
+                              Segmented(options = listOf("True", "Mag", "Grid"), selected = settings.northRef) { index ->
+                                  scope.launch { repo.setNorthRef(index) }
+                              }
+                          }
+                      }
+                  }
+
+                  DeclinationSetting(
+                      override = settings.declinationOverride,
+                      model = modelDeclination,
+                      convergence = gridConvergence,
+                      angleUnit = settings.angleUnit,
+                      onChange = { v -> scope.launch { repo.setDeclinationOverride(v) } },
+                  )
+
+                  PaceSetting(
+                      current = settings.pacePer100m,
+                      onChange = { v -> scope.launch { repo.setPacePer100m(v) } },
+                  )
+
+                  // ---------------- DATA ----------------
+                  SectionHeader("Data")
+
+                  DataRow(
+                      title = "Field reference",
+                      subtitle = "Phonetic alphabet · grid reading · pace counts · contours · symbols",
+                      onClick = onOpenReference,
+                  )
+
+                  HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+
+                  Column {
+                      Text("Backup & restore", style = MaterialTheme.typography.titleMedium)
+                      Text(
+                          "Everything — waypoints, units, graphics, tracks, settings, practice log — " +
+                              "in one file you keep. Restoring never duplicates what's already here.",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                      Row {
+                          TextButton(onClick = {
+                              val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmm", java.util.Locale.US)
+                                  .format(java.util.Date())
+                              backupLauncher.launch("gridfix-backup-$stamp.zip")
+                          }) { Text("Back up now") }
+                          TextButton(onClick = {
+                              restoreLauncher.launch(arrayOf("application/zip", "application/octet-stream"))
+                          }) { Text("Restore…") }
+                      }
+                      backupStatus?.let {
+                          Text(
+                              it,
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.primary,
+                          )
+                      }
+                  }
+
+                  HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+
+                  Column {
+                      Text("MGRS GPS Pro", style = MaterialTheme.typography.titleMedium)
+                      Text(
+                          when {
+                              entitled -> "Subscription active."
+                              app.gridfix.android.BuildConfig.DEBUG ->
+                                  "No subscription on this device — debug builds run unlocked."
+                              else -> "No active subscription on this device."
+                          },
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                      Row {
+                          TextButton(onClick = {
+                              app.gridfix.android.ui.openLink(context, app.gridfix.android.billing.BillingManager.MANAGE_URL)
+                          }) { Text("Manage subscription") }
+                          if (app.gridfix.android.BuildConfig.DEBUG) {
+                              TextButton(onClick = onPreviewPaywall) { Text("Preview paywall") }
+                          }
+                      }
+                  }
+
+                  HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+
+                  Text(
+                      "MGRS GPS " + app.gridfix.android.BuildConfig.VERSION_NAME + "\n" +
+                          "MGRS conversion by the NGA MGRS library (MIT license).\n" +
+                          "Elevation data: Terrarium tiles via AWS Open Data (Mapzen) — " +
+                          "SRTM, USGS 3DEP/NED, GMTED2010, ETOPO1.\n" +
+                          "Fonts: Saira Semi Condensed, Fira Mono, Antonio (SIL Open Font License).\n\n" +
+                          "Map data: OpenStreetMap contributors (ODbL), OpenTopoMap (CC-BY-SA), " +
+                          "USGS, MapTiler.\n" +
+                          "Map engine: osmdroid; QR codes: ZXing (Apache 2.0).\n\n" +
+                          "MGRS GPS is a training and recreation aid, not a primary means of navigation.",
+                      style = MaterialTheme.typography.bodySmall,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                  Row {
+                      TextButton(onClick = { app.gridfix.android.ui.openLink(context, AppInfo.PRIVACY_URL) }) { Text("Privacy policy") }
+                      TextButton(onClick = { app.gridfix.android.ui.openLink(context, AppInfo.TERMS_URL) }) { Text("Terms") }
+                  }
+                  // The only way anyone can reach the developer from inside the app. During a
+                  // closed test it is the difference between a tester telling you what broke and
+                  // a tester uninstalling - and an uninstall is what actually costs you the
+                  // 14-day opt-in count.
+                  DataRow(
+                      title = "Send feedback",
+                      subtitle = "Email the developer — your version and device are filled in for you",
+                      onClick = { app.gridfix.android.ui.sendFeedback(context) },
+                  )
+              }
+          }
+
+          /** Amber section title with a rule above it (except the first). */
+          @Composable
+          private fun SectionHeader(title: String, first: Boolean = false) {
+              Column {
+                  if (!first) {
+                      HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                      Spacer(Modifier.height(16.dp))
+                  }
+                  Text(
+                      title.uppercase(),
+                      fontFamily = LabelFamily,
+                      fontSize = 12.sp,
+                      fontWeight = FontWeight.SemiBold,
+                      letterSpacing = 3.sp,
+                      color = MaterialTheme.colorScheme.primary,
+                  )
+              }
+          }
+
+          /** Small uppercase caption above a control. */
+          @Composable
+          private fun Setting(label: String, content: @Composable () -> Unit) {
+              Column {
+                  Text(
+                      label.uppercase(),
+                      fontFamily = LabelFamily,
+                      fontSize = 11.sp,
+                      fontWeight = FontWeight.Medium,
+                      letterSpacing = 1.8.sp,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                  Spacer(Modifier.height(8.dp))
+                  content()
+              }
+          }
+
+          /**
+           * Joined segmented control: the active segment fills amber, the rest are outlined.
+           * Announced as a radio group (TalkBack reads the selected state), 48 dp touch targets.
+           */
+          @Composable
+          private fun Segmented(options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
+              val line = MaterialTheme.colorScheme.outline
+              val on = MaterialTheme.colorScheme.primary
+              val onText = MaterialTheme.colorScheme.onPrimary
+              val offText = MaterialTheme.colorScheme.onSurfaceVariant
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .height(48.dp)
+                      .border(1.dp, line)
+                      .selectableGroup(),
+              ) {
+                  options.forEachIndexed { index, label ->
+                      val sel = index == selected
+                      Box(
+                          Modifier
+                              .weight(1f)
+                              .fillMaxHeight()
+                              .background(if (sel) on else Color.Transparent)
+                              .drawBehind {
+                                  if (index > 0) drawLine(line, Offset(0f, 0f), Offset(0f, size.height), 1.dp.toPx())
+                              }
+                              .selectable(selected = sel, role = Role.RadioButton) { onSelect(index) },
+                          contentAlignment = Alignment.Center,
+                      ) {
+                          Text(
+                              label.uppercase(),
+                              fontFamily = LabelFamily,
+                              fontSize = 12.sp,
+                              fontWeight = FontWeight.Medium,
+                              letterSpacing = 1.2.sp,
+                              color = if (sel) onText else offText,
+                              maxLines = 1,
+                              softWrap = false,
+                          )
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun DataRow(title: String, subtitle: String, onClick: () -> Unit) {
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .clickable(onClick = onClick),
+                  verticalAlignment = Alignment.CenterVertically,
+              ) {
+                  Column(Modifier.weight(1f)) {
+                      Text(title, style = MaterialTheme.typography.titleMedium)
+                      Text(
+                          subtitle,
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+                  Spacer(Modifier.width(8.dp))
+                  Icon(
+                      Icons.Outlined.ChevronRight,
+                      contentDescription = null,
+                      tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+              }
+          }
+
+          /**
+           * Magnetic declination: the phone's World Magnetic Model, or an angle typed from the
+           * map sheet / the order. Entered in degrees (or mils, per the angle unit) with an E/W
+           * switch; always **stored** as declination, east-positive.
+           *
+           * The store has always held declination - true north to magnetic north - and every
+           * azimuth is computed as `magnetic = true - declination`. But the field's hint told
+           * the user to type "the G-M angle from your map sheet", and on a declination diagram
+           * the G-M angle is *grid* north to magnetic north. The two differ by the grid
+           * convergence: about 1.1 deg at Abu Dhabi, which is 19 mils, which is 38 m off at the
+           * end of a 2 km leg, and approaches 2.5 deg at a zone edge in high latitudes. So a
+           * soldier who read his sheet exactly right got every magnetic azimuth wrong.
+           *
+           * The fix is to ask which angle he has rather than guess, and convert on entry:
+           * `declination = G-M + convergence`. Nothing about the stored format changes, so
+           * existing settings and backups keep their meaning.
+           */
+          @Composable
+          private fun DeclinationSetting(
+              override: Float?,
+              model: Float?,
+              convergence: Float?,
+              angleUnit: Int,
+              onChange: (Float?) -> Unit,
+          ) {
+              val manual = override != null
+              val mils = angleUnit == 1
+              val conv = convergence ?: 0f
+              var asGm by remember(manual) { mutableStateOf(true) }
+              fun toStored(typed: Float): Float = if (asGm) typed + conv else typed
+              fun fromStored(stored: Float): Float = if (asGm) stored - conv else stored
+              fun toDisplay(deg: Float): String {
+                  val v = abs(deg)
+                  return if (mils) (v * 6400f / 360f).roundToInt().toString()
+                  else String.format(Locale.US, "%.1f", v)
+              }
+              // Keyed on the value too: a backup restore changes `override` without changing
+              // `manual`, and the field would otherwise keep showing the old number. Keyed on
+              // `asGm` as well, so switching which angle you are typing re-reads the same stored
+              // declination in the other convention instead of silently reinterpreting it.
+              var text by remember(manual, mils, override, asGm) {
+                  mutableStateOf(if (override != null) toDisplay(fromStored(override)) else "")
+              }
+              var east by remember(manual, override, asGm) {
+                  mutableStateOf(override == null || fromStored(override) >= 0f)
+              }
+              fun push(t: String, e: Boolean) {
+                  val v = t.toFloatOrNull() ?: return
+                  val deg = if (mils) v * 360f / 6400f else v
+                  if (deg in 0f..180f) onChange(toStored(if (e) deg else -deg))
+              }
+              Setting("Declination") {
+                  Segmented(options = listOf("Model", "Manual"), selected = if (manual) 1 else 0) { index ->
+                      if (index == 0) onChange(null)
+                      else onChange(model ?: 0f)
+                  }
+                  Spacer(Modifier.height(6.dp))
+                  if (manual) {
+                      Segmented(options = listOf("G-M angle", "Declination"), selected = if (asGm) 0 else 1) { index ->
+                          asGm = index == 0
+                      }
+                      Spacer(Modifier.height(6.dp))
+                      Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                          OutlinedTextField(
+                              value = text,
+                              onValueChange = { v ->
+                                  text = v.filter { it.isDigit() || it == '.' }.take(6)
+                                  push(text, east)
+                              },
+                              singleLine = true,
+                              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                              textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = MonoFamily),
+                              suffix = { Text(if (mils) "mils" else "°", style = MaterialTheme.typography.bodySmall) },
+                              modifier = Modifier.width(128.dp),
+                          )
+                          Spacer(Modifier.width(12.dp))
+                          Box(Modifier.weight(1f)) {
+                              Segmented(options = listOf("East", "West"), selected = if (east) 0 else 1) { index ->
+                                  east = index == 0
+                                  push(text, east)
+                              }
+                          }
+                      }
+                      Spacer(Modifier.height(6.dp))
+                  }
+                  Text(
+                      when {
+                          manual -> {
+                              val stored = override ?: 0f
+                              "G-M " + Declination.format(stored - conv, angleUnit) +
+                                  " → declination " + Declination.format(stored, angleUnit) +
+                                  (if (convergence == null) " (no fix yet — grid convergence taken as zero until you have one)"
+                                  else " here, using a grid convergence of " + Declination.format(conv, angleUnit)) +
+                                  (model?.let { ". The phone's model says " + Declination.format(it, angleUnit) } ?: "") +
+                                  ". Every azimuth, the compass faces and the route cards use the declination."
+                          }
+                          model != null -> "Phone's World Magnetic Model at your fix: " + Declination.format(model, angleUnit) +
+                              ". Switch to Manual to type the G-M angle from your map sheet or the order — " +
+                              "it is converted to declination using the grid convergence where you are."
+                          else -> "Phone's World Magnetic Model at your fix. Switch to Manual to type the G-M angle " +
+                              "from your map sheet or the order — it is converted to declination using the grid convergence."
+                      },
+                      style = MaterialTheme.typography.bodySmall,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+              }
+          }
+
+          @Composable
+          private fun PaceSetting(current: Int, onChange: (Int) -> Unit) {
+              var text by remember(current) { mutableStateOf(current.toString()) }
+              Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                  Column(Modifier.weight(1f)) {
+                      Text("Pace count per 100 m", style = MaterialTheme.typography.titleMedium)
+                      Text(
+                          "Your paces for 100 m on flat ground — used on route cards. Walk a known 100 m to find it.",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+                  Spacer(Modifier.width(12.dp))
+                  OutlinedTextField(
+                      value = text,
+                      onValueChange = { v ->
+                          text = v.filter { it.isDigit() }.take(3)
+                          text.toIntOrNull()?.let { n -> if (n in 30..200) onChange(n) }
+                      },
+                      singleLine = true,
+                      keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                      textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = MonoFamily),
+                      suffix = { Text("paces", style = MaterialTheme.typography.bodySmall) },
+                      modifier = Modifier.width(128.dp),
+                  )
+              }
+          }
+
+          @Composable
+          private fun SettingSwitch(
+              title: String,
+              subtitle: String,
+              checked: Boolean,
+              onChange: (Boolean) -> Unit,
+          ) {
+              Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                  Column(Modifier.weight(1f)) {
+                      Text(title, style = MaterialTheme.typography.titleMedium)
+                      Text(
+                          subtitle,
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+                  Switch(checked = checked, onCheckedChange = onChange)
+              }
+          }
+          EOF_GRIDFIX
+          echo "v0.9.28-85b6d8703da8" > .github/last-payload
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
-            git -c user.name='GridFix CI' -c user.email='ci@gridfix.local' commit -qm 'Sync v0.9.27 (multi-select with batch visibility swap and batch delete) source from bootstrap workflow'
+            git -c user.name='GridFix CI' -c user.email='ci@gridfix.local' commit -qm 'Sync v0.9.28 (in-app feedback path and a CI check that the AAB carries a readable crash mapping) source from bootstrap workflow'
             git push origin HEAD:main
           fi
           fi
@@ -1760,6 +953,22 @@ jobs:
           cp app/build/outputs/bundle/release/app-release.aab gridfix-release.aab
           echo "signed release AAB ready: gridfix-release.aab"
 
+          # Deobfuscation check. AGP is supposed to embed mapping.txt in the bundle at
+          # BUNDLE-METADATA/com.android.tools.build.obfuscation/proguard.map, and Play
+          # reads it from there so crash reports come back with real class names. If it
+          # is ever absent, every crash a tester generates is unreadable - and the only
+          # way to find out is to look. So look, every build, and record the answer where
+          # it can be read without opening the log.
+          MAPENTRY=BUNDLE-METADATA/com.android.tools.build.obfuscation/proguard.map
+          MAPBYTES=$(unzip -l gridfix-release.aab "$MAPENTRY" 2>/dev/null | awk 'NR==4 {print $1}')
+          if [ -n "$MAPBYTES" ] && [ "$MAPBYTES" -gt 0 ] 2>/dev/null; then
+            echo "AAB_MAPPING=$MAPBYTES" >> "$GITHUB_ENV"
+            echo "deobfuscation map embedded in the AAB: $MAPBYTES bytes"
+          else
+            echo "AAB_MAPPING=MISSING" >> "$GITHUB_ENV"
+            echo "WARNING: no $MAPENTRY in the AAB - Play crash reports will be unreadable"
+          fi
+
       - name: Build signed release APK (the same R8 output as the AAB, installable for a smoke test)
         if: steps.gradle.outcome == 'success' && steps.tests.outcome == 'success'
         continue-on-error: true
@@ -1798,6 +1007,7 @@ jobs:
             echo "run=${{ github.run_number }}"
             echo "sha=${{ github.sha }}"
             echo "tests=${{ steps.tests.outcome }}"
+            echo "aab_mapping=${AAB_MAPPING:-n/a}"
             echo "finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > outcome.txt
           tail -n 400 "$GITHUB_WORKSPACE/build.log" > buildlog.txt 2>/dev/null || echo "no log" > buildlog.txt
