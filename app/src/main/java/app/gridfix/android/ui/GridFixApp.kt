@@ -8,6 +8,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -19,12 +20,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.displayCutout
-import androidx.compose.foundation.layout.only
-import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.union
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.outlined.Check
@@ -43,6 +40,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -81,6 +79,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LifecycleStartEffect
@@ -128,6 +128,15 @@ import app.gridfix.android.ui.theme.LabelFamily
 import kotlinx.coroutines.launch
 
 private data class NavItem(val route: String, val label: String, val icon: ImageVector)
+
+// Rail budget, sideways. With the top strip gone the rail carries everything: four
+// destinations, back on a sub-screen, and two or three app actions. A phone on its
+// side is roughly 360-400 dp tall, and seven items do not always fit with labels, so
+// these are the numbers the fit is decided from rather than a guessed threshold.
+private val RAIL_ITEM_LABELLED = 58.dp
+private val RAIL_ITEM_COMPACT = 46.dp
+private val ACTION_BUTTON = 48.dp
+private val RAIL_DIVIDER = 13.dp   // 6 dp padding either side of a 1 dp line
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -311,6 +320,31 @@ fun GridFixApp() {
     }
     val landscape = isLandscape()
 
+    // Immersive sideways. A phone worn on armour is a map, not a phone: the status bar
+    // and the navigation bar are black chrome showing a clock and three buttons nobody
+    // looks at on a movement. Hidden with the transient behaviour, so a swipe from the
+    // edge still brings them back for as long as they are wanted. Upright they always
+    // come back - portrait is where the phone is a phone again.
+    DisposableEffect(landscape, view) {
+        val window = view.context.hostActivity()?.window
+        if (window != null) {
+            val bars = WindowInsetsControllerCompat(window, view)
+            if (landscape) {
+                bars.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                bars.hide(WindowInsetsCompat.Type.systemBars())
+            } else {
+                bars.show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+        onDispose {
+            // Never hand the device back to another screen without its system bars.
+            view.context.hostActivity()?.window?.let { w ->
+                WindowInsetsControllerCompat(w, view).show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+
     // A viewed track in a hidden folder would draw nothing: gate the id once, for
     // the map and the list alike, and un-hide the folder when a track is viewed.
     val shownTrackId = viewedTrackId?.takeIf { id ->
@@ -421,11 +455,11 @@ fun GridFixApp() {
             contentWindowInsets = ScaffoldDefaults.contentWindowInsets.union(WindowInsets.displayCutout),
             topBar = {
                 if (landscape) {
-                    // Sideways there is no vertical room to spare: a 48 dp strip with no
-                    // wordmark in it. The wordmark moves into the map's grid-readout block,
-                    // which is on screen anyway - branding is not worth 48 dp of map when
-                    // the phone is on its side.
-                    CompactTopBar(navigationIcon = backButton, actions = barActions)
+                    // Nothing at the top sideways. The system bars are hidden and the 48 dp
+                    // strip is gone: back and the three app actions moved into the rail,
+                    // which is on screen anyway. That is the whole band of black at the top
+                    // of the screen handed back to the map.
+                    Unit
                 } else {
                     CenterAlignedTopAppBar(
                         title = barTitle,
@@ -482,42 +516,80 @@ fun GridFixApp() {
             Row(Modifier.fillMaxSize().padding(innerPadding)) {
             if (landscape) {
                 val rule = MaterialTheme.colorScheme.outline
-                NavigationRail(
-                    containerColor = MaterialTheme.colorScheme.background,
-                    windowInsets = WindowInsets(0, 0, 0, 0),
-                    modifier = Modifier
-                        .fillMaxHeight()
-                        .drawBehind {
-                            drawLine(rule, Offset(size.width, 0f), Offset(size.width, size.height), 1.dp.toPx())
-                        },
-                ) {
-                    Spacer(Modifier.weight(1f))
-                    items.forEach { item ->
-                        NavigationRailItem(
-                            selected = currentRoute == item.route,
-                            onClick = { goTo(item.route) },
-                            icon = { Icon(item.icon, contentDescription = item.label) },
-                            label = {
-                                Text(
-                                    item.label.uppercase(),
-                                    fontFamily = LabelFamily,
-                                    fontSize = 9.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    letterSpacing = 1.sp,
-                                    maxLines = 1,
-                                    softWrap = false,
-                                )
+                // The rail is now the whole of the app's chrome sideways: destinations,
+                // back, and the three actions that used to sit in the top strip. Seven
+                // things in the height of a phone on its side is a real budget, so the
+                // labels come off when they will not fit. BoxWithConstraints' maxHeight
+                // is read into a val here, at the top - it is hidden by @LayoutScopeMarker
+                // inside the nested lambdas below.
+                BoxWithConstraints(Modifier.fillMaxHeight()) {
+                    val railHeight = maxHeight
+                    val actionCount = if (onSubScreen) 2 else 3   // the gear hides on sub-screens
+                    val chromeHeight = ACTION_BUTTON * actionCount +
+                        RAIL_DIVIDER +
+                        (if (onSubScreen) ACTION_BUTTON else 0.dp)
+                    val labelled = railHeight >= chromeHeight + RAIL_ITEM_LABELLED * items.size
+                    val itemHeight = if (labelled) RAIL_ITEM_LABELLED else RAIL_ITEM_COMPACT
+                    NavigationRail(
+                        containerColor = MaterialTheme.colorScheme.background,
+                        windowInsets = WindowInsets(0, 0, 0, 0),
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .drawBehind {
+                                drawLine(rule, Offset(size.width, 0f), Offset(size.width, size.height), 1.dp.toPx())
                             },
-                            colors = NavigationRailItemDefaults.colors(
-                                selectedIconColor = MaterialTheme.colorScheme.primary,
-                                selectedTextColor = MaterialTheme.colorScheme.primary,
-                                unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                indicatorColor = Color.Transparent,
-                            ),
+                    ) {
+                        Spacer(Modifier.weight(1f))
+                        if (onSubScreen) {
+                            IconButton(
+                                onClick = { navController.popBackStack() },
+                                modifier = Modifier.size(ACTION_BUTTON),
+                            ) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.ArrowBack,
+                                    contentDescription = "Back",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        items.forEach { item ->
+                            NavigationRailItem(
+                                modifier = Modifier.height(itemHeight),
+                                selected = currentRoute == item.route,
+                                onClick = { goTo(item.route) },
+                                icon = { Icon(item.icon, contentDescription = item.label) },
+                                label = if (!labelled) null else {
+                                    {
+                                        Text(
+                                            item.label.uppercase(),
+                                            fontFamily = LabelFamily,
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            letterSpacing = 1.sp,
+                                            maxLines = 1,
+                                            softWrap = false,
+                                        )
+                                    }
+                                },
+                                colors = NavigationRailItemDefaults.colors(
+                                    selectedIconColor = MaterialTheme.colorScheme.primary,
+                                    selectedTextColor = MaterialTheme.colorScheme.primary,
+                                    unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    indicatorColor = Color.Transparent,
+                                ),
+                            )
+                        }
+                        HorizontalDivider(
+                            modifier = Modifier.padding(vertical = 6.dp),
+                            color = MaterialTheme.colorScheme.outline,
                         )
+                        // The same three actions the portrait app bar carries, stacked instead
+                        // of in a row - barActions() just emits them as siblings, so the
+                        // container decides the direction and the two can never drift apart.
+                        barActions()
+                        Spacer(Modifier.weight(1f))
                     }
-                    Spacer(Modifier.weight(1f))
                 }
             }
             NavHost(
@@ -997,49 +1069,6 @@ fun GridFixApp() {
                 courseSummary = courseHistory.first()
                 summaryPending = false
             }
-        }
-    }
-}
-
-/**
- * A 48 dp actions strip for landscape: back on the left, actions on the right, no title.
- *
- * The background is not decoration. Material's own app bars paint one; this hand-rolled
- * Box did not, so anything behind it showed through - which is how the wordmark came to
- * look translucent over the map. Painted before the inset padding so the fill reaches
- * under the status bar too.
- */
-@Composable
-private fun CompactTopBar(
-    navigationIcon: @Composable () -> Unit,
-    actions: @Composable () -> Unit,
-) {
-    Box(
-        Modifier
-            .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.background)
-            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Top))
-            .height(48.dp),
-    ) {
-        Row(
-            Modifier
-                .align(Alignment.CenterStart)
-                .padding(start = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            androidx.compose.runtime.CompositionLocalProvider(
-                androidx.compose.material3.LocalContentColor provides MaterialTheme.colorScheme.onSurfaceVariant,
-            ) { navigationIcon() }
-        }
-        Row(
-            Modifier
-                .align(Alignment.CenterEnd)
-                .padding(end = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            androidx.compose.runtime.CompositionLocalProvider(
-                androidx.compose.material3.LocalContentColor provides MaterialTheme.colorScheme.onSurfaceVariant,
-            ) { actions() }
         }
     }
 }
