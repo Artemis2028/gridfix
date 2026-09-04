@@ -15,10 +15,10 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Write source files (v0.9.25 (map tool rail - smaller primary action and clearance off the screen edge) delta, plain text, auditable below)
+      - name: Write source files (v0.9.26 (per-item visibility and swipe actions on every list row) delta, plain text, auditable below)
         run: |
-          if [ "$(cat .github/last-payload 2>/dev/null)" = "v0.9.25-3cb37ff982bd" ]; then
-            echo "payload v0.9.25-3cb37ff982bd already applied - skipping (edit the files in git, not here)"
+          if [ "$(cat .github/last-payload 2>/dev/null)" = "v0.9.26-6e96cc0cbbfd" ]; then
+            echo "payload v0.9.26-6e96cc0cbbfd already applied - skipping (edit the files in git, not here)"
           else
           mkdir -p 'app'
           cat > 'app/build.gradle.kts' <<'EOF_GRIDFIX'
@@ -36,8 +36,8 @@ jobs:
                   applicationId = "app.gridfix.android"
                   minSdk = 26
                   targetSdk = 36
-                  versionCode = 53
-                  versionName = "0.9.25"
+                  versionCode = 54
+                  versionName = "0.9.26"
                   // MapTiler API key from the CI secret; empty in builds without it (community-tile fallback)
                   buildConfigField("String", "MAPTILER_KEY", "\"" + (System.getenv("MAPTILER_KEY") ?: "") + "\"")
               }
@@ -131,330 +131,2001 @@ jobs:
               testImplementation("org.json:json:20240303")
           }
           EOF_GRIDFIX
+          mkdir -p 'app/src/main/java/app/gridfix/android/data'
+          cat > 'app/src/main/java/app/gridfix/android/data/Backup.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android.data
+
+          import android.content.Context
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.InputStream
+          import java.io.OutputStream
+          import java.util.Locale
+          import java.util.zip.ZipEntry
+          import java.util.zip.ZipInputStream
+          import java.util.zip.ZipOutputStream
+
+          /**
+           * Whole-app backup as one zip: a JSON snapshot of waypoints, folders,
+           * graphics, settings, and the practice log, plus each track's point file.
+           * Restore is idempotent — everything keeps its original id and anything
+           * already on the device is skipped, so restoring twice never duplicates.
+           */
+          object Backup {
+
+              const val VERSION = 1
+
+              suspend fun export(
+                  context: Context,
+                  out: OutputStream,
+                  waypoints: List<Waypoint>,
+                  folders: List<FolderInfo>,
+                  graphics: List<TacGraphic>,
+                  settings: AppSettings,
+                  tracks: List<TrackInfo>,
+                  courseHistory: List<CourseResult>,
+                  nowMillis: Long,
+              ) = withContext(Dispatchers.IO) {
+                  val root = JSONObject()
+                      .put("app", "GridFix")
+                      .put("version", VERSION)
+                      .put("exportedAt", nowMillis)
+                  root.put("waypoints", JSONArray().also { a ->
+                      for (w in waypoints) a.put(
+                          JSONObject()
+                              .put("id", w.id).put("name", w.name)
+                              .put("lat", w.lat).put("lon", w.lon)
+                              .put("createdAt", w.createdAt).put("folder", w.folder)
+                              .put("symbol", w.symbol).put("affiliation", w.affiliation)
+                              .put("echelon", w.echelon).put("designation", w.designation)
+                              .put("kind", w.kind).put("rotation", w.rotation.toDouble())
+                              .put("visible", w.visible)
+                      )
+                  })
+                  root.put("folders", JSONArray().also { a ->
+                      for (f in folders) a.put(JSONObject().put("name", f.name).put("visible", f.visible))
+                  })
+                  root.put("graphics", JSONArray().also { a ->
+                      for (g in graphics) {
+                          val pts = JSONArray()
+                          for (v in g.points) pts.put(JSONArray().put(v.lat).put(v.lon))
+                          a.put(
+                              JSONObject()
+                                  .put("id", g.id).put("name", g.name).put("type", g.type)
+                                  .put("points", pts).put("folder", g.folder)
+                                  .put("affiliation", g.affiliation).put("createdAt", g.createdAt)
+                                  .put("echelon", g.echelon).put("visible", g.visible)
+                          )
+                      }
+                  })
+                  root.put("settings", JSONObject()
+                      .put("nightMode", settings.nightMode)
+                      .put("keepScreenOn", settings.keepScreenOn)
+                      .put("mgrsDigits", settings.mgrsDigits)
+                      .put("latLonFormat", settings.latLonFormat)
+                      .put("units", settings.units)
+                      .put("angleUnit", settings.angleUnit)
+                      .put("northRef", settings.northRef)
+                      .put("pacePer100m", settings.pacePer100m)
+                      .put("face", settings.face)
+                      .put("orientation", settings.orientation)
+                      .put("declinationOverride", settings.declinationOverride?.toDouble() ?: JSONObject.NULL)
+                      .put("disclaimerAccepted", settings.disclaimerAccepted)
+                  )
+                  root.put("tracks", JSONArray().also { a ->
+                      for (t in tracks) a.put(
+                          JSONObject()
+                              .put("id", t.id).put("name", t.name)
+                              .put("startedAt", t.startedAt).put("endedAt", t.endedAt)
+                              .put("distanceM", t.distanceM).put("pointCount", t.pointCount)
+                              .put("folder", t.folder).put("visible", t.visible)
+                      )
+                  })
+                  root.put("courseHistory", JSONArray().also { a ->
+                      for (r in courseHistory) a.put(
+                          JSONObject()
+                              .put("name", r.name).put("points", r.points)
+                              .put("started", r.startedAt).put("total", r.totalMillis)
+                              .put("splits", JSONArray(r.splitsMillis))
+                      )
+                  })
+
+                  val zip = ZipOutputStream(out)
+                  zip.putNextEntry(ZipEntry("gridfix-backup.json"))
+                  zip.write(root.toString(2).toByteArray())
+                  zip.closeEntry()
+                  for (t in tracks) {
+                      val pts = TrackRepository.readPoints(context, t.id)
+                      if (pts.isEmpty()) continue
+                      zip.putNextEntry(ZipEntry("tracks/${t.id}.txt"))
+                      zip.write(
+                          pts.joinToString("") {
+                              String.format(Locale.US, "%.7f %.7f %d %.1f\n", it.lat, it.lon, it.time, it.alt)
+                          }.toByteArray()
+                      )
+                      zip.closeEntry()
+                  }
+                  zip.finish()
+              }
+
+              data class RestoreResult(
+                  val waypoints: Int,
+                  val graphics: Int,
+                  val tracks: Int,
+                  val course: Int,
+                  val settingsApplied: Boolean,
+              ) {
+                  fun summary(): String {
+                      val parts = mutableListOf<String>()
+                      if (waypoints > 0) parts.add("$waypoints waypoints")
+                      if (graphics > 0) parts.add("$graphics graphics")
+                      if (tracks > 0) parts.add("$tracks tracks")
+                      if (course > 0) parts.add("$course course results")
+                      if (settingsApplied) parts.add("settings")
+                      return if (parts.isEmpty()) "Nothing new to restore — everything was already here"
+                      else "Restored " + parts.joinToString(", ")
+                  }
+              }
+
+              suspend fun restore(
+                  input: InputStream,
+                  waypointRepo: WaypointRepository,
+                  graphicsRepo: GraphicsRepository,
+                  trackRepo: TrackRepository,
+                  settingsRepo: SettingsRepository,
+                  courseRepo: CourseRepository,
+              ): RestoreResult = withContext(Dispatchers.IO) {
+                  val entries = HashMap<String, ByteArray>()
+                  val zin = ZipInputStream(input)
+                  var e: ZipEntry? = zin.nextEntry
+                  while (e != null) {
+                      val wanted = e.name == "gridfix-backup.json" || e.name.startsWith("tracks/")
+                      if (!e.isDirectory && wanted) {
+                          val out = java.io.ByteArrayOutputStream()
+                          val buf = ByteArray(16 * 1024)
+                          var total = 0L
+                          var tooBig = false
+                          while (true) {
+                              val n = zin.read(buf)
+                              if (n < 0) break
+                              total += n
+                              if (total > 64L * 1024 * 1024) { tooBig = true; break }
+                              out.write(buf, 0, n)
+                          }
+                          if (!tooBig) entries[e.name] = out.toByteArray()
+                      }
+                      zin.closeEntry()
+                      e = zin.nextEntry
+                  }
+                  val rootBytes = entries["gridfix-backup.json"]
+                      ?: throw IllegalArgumentException("not an MGRS GPS backup")
+                  val root = JSONObject(String(rootBytes))
+
+                  val wps = ArrayList<Waypoint>()
+                  root.optJSONArray("waypoints")?.let { a ->
+                      for (i in 0 until a.length()) {
+                          val o = a.getJSONObject(i)
+                          wps.add(
+                              Waypoint(
+                                  id = o.getString("id"), name = o.getString("name"),
+                                  lat = o.getDouble("lat"), lon = o.getDouble("lon"),
+                                  createdAt = o.optLong("createdAt"),
+                                  folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
+                                  symbol = o.optString("symbol", DEFAULT_SYMBOL),
+                                  affiliation = o.optString("affiliation", "none"),
+                                  echelon = o.optString("echelon", ""),
+                                  designation = o.optString("designation", ""),
+                                  kind = o.optString("kind", KIND_WP),
+                                  rotation = o.optDouble("rotation", 0.0).toFloat(),
+                                  visible = o.optBoolean("visible", true),
+                              )
+                          )
+                      }
+                  }
+                  val folderInfos = ArrayList<FolderInfo>()
+                  root.optJSONArray("folders")?.let { a ->
+                      for (i in 0 until a.length()) {
+                          val o = a.getJSONObject(i)
+                          folderInfos.add(FolderInfo(canonicalFolder(o.getString("name")), o.optBoolean("visible", true)))
+                      }
+                  }
+                  val addedWp = waypointRepo.restore(wps, folderInfos)
+
+                  val gfx = ArrayList<TacGraphic>()
+                  root.optJSONArray("graphics")?.let { a ->
+                      for (i in 0 until a.length()) {
+                          val o = a.getJSONObject(i)
+                          val ptsArr = o.getJSONArray("points")
+                          val pts = ArrayList<GeoVertex>()
+                          for (j in 0 until ptsArr.length()) {
+                              val v = ptsArr.getJSONArray(j)
+                              pts.add(GeoVertex(v.getDouble(0), v.getDouble(1)))
+                          }
+                          gfx.add(
+                              TacGraphic(
+                                  id = o.getString("id"), name = o.getString("name"),
+                                  type = o.getString("type"), points = pts,
+                                  folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
+                                  affiliation = o.optString("affiliation", "none"),
+                                  createdAt = o.optLong("createdAt"),
+                                  echelon = o.optString("echelon", ""),
+                                  visible = o.optBoolean("visible", true),
+                              )
+                          )
+                      }
+                  }
+                  val addedG = graphicsRepo.restore(gfx)
+
+                  var addedT = 0
+                  root.optJSONArray("tracks")?.let { a ->
+                      for (i in 0 until a.length()) {
+                          val o = a.getJSONObject(i)
+                          val info = TrackInfo(
+                              id = o.getString("id"), name = o.getString("name"),
+                              startedAt = o.optLong("startedAt"), endedAt = o.optLong("endedAt"),
+                              distanceM = o.optDouble("distanceM", 0.0),
+                              pointCount = o.optInt("pointCount", 0),
+                              folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
+                              visible = o.optBoolean("visible", true),
+                          )
+                          val ptBytes = entries["tracks/${info.id}.txt"] ?: continue
+                          val pts = String(ptBytes).lines().mapNotNull { line ->
+                              val parts = line.trim().split(" ")
+                              if (parts.size < 3) return@mapNotNull null
+                              runCatching {
+                                  TrackPoint(
+                                      lat = parts[0].toDouble(), lon = parts[1].toDouble(),
+                                      time = parts[2].toLong(),
+                                      alt = parts.getOrNull(3)?.toDouble() ?: NO_ALTITUDE,
+                                  )
+                              }.getOrNull()
+                          }
+                          if (trackRepo.restore(info, pts)) addedT++
+                      }
+                  }
+
+                  var settingsApplied = false
+                  root.optJSONObject("settings")?.let { s ->
+                      settingsRepo.applyAll(
+                          AppSettings(
+                              nightMode = s.optBoolean("nightMode", false),
+                              keepScreenOn = s.optBoolean("keepScreenOn", true),
+                              mgrsDigits = s.optInt("mgrsDigits", 10),
+                              latLonFormat = s.optInt("latLonFormat", 1),
+                              units = s.optInt("units", 0),
+                              angleUnit = s.optInt("angleUnit", 0),
+                              northRef = s.optInt("northRef", 0),
+                              pacePer100m = s.optInt("pacePer100m", 65),
+                              face = s.optInt("face", 1),
+                              orientation = s.optInt("orientation", 0),
+                              declinationOverride = if (s.isNull("declinationOverride")) null else s.optDouble("declinationOverride").toFloat(),
+                              disclaimerAccepted = s.optBoolean("disclaimerAccepted", false),
+                          )
+                      )
+                      settingsApplied = true
+                  }
+
+                  val results = ArrayList<CourseResult>()
+                  root.optJSONArray("courseHistory")?.let { a ->
+                      for (i in 0 until a.length()) {
+                          val o = a.getJSONObject(i)
+                          val splits = o.getJSONArray("splits")
+                          results.add(
+                              CourseResult(
+                                  name = o.getString("name"), points = o.getInt("points"),
+                                  startedAt = o.getLong("started"), totalMillis = o.getLong("total"),
+                                  splitsMillis = buildList {
+                                      for (j in 0 until splits.length()) add(splits.getLong(j))
+                                  },
+                              )
+                          )
+                      }
+                  }
+                  val addedC = courseRepo.restoreHistory(results)
+
+                  RestoreResult(addedWp, addedG, addedT, addedC, settingsApplied)
+              }
+          }
+          EOF_GRIDFIX
+          cat > 'app/src/main/java/app/gridfix/android/data/GraphicsRepository.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android.data
+
+          import android.content.Context
+          import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
+          import androidx.datastore.preferences.core.edit
+          import androidx.datastore.preferences.core.emptyPreferences
+          import androidx.datastore.preferences.core.stringPreferencesKey
+          import androidx.datastore.preferences.preferencesDataStore
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.coroutines.flow.map
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.util.UUID
+
+          private val Context.graphicsStore by preferencesDataStore(
+              name = "graphics",
+              corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+          )
+
+          /** A simple lat/lon vertex for tactical graphics. */
+          data class GeoVertex(val lat: Double, val lon: Double)
+
+          /**
+           * A tactical control-measure graphic drawn on the map.
+           * Types: phase_line, boundary, axis, doa, objective, aa, route.
+           * Area types (objective, aa) are closed automatically when rendered.
+           */
+          data class TacGraphic(
+              val id: String,
+              val name: String,
+              val type: String,
+              val points: List<GeoVertex>,
+              val folder: String = DEFAULT_FOLDER,
+              val affiliation: String = "none",
+              val createdAt: Long = 0L,
+              val echelon: String = "",   // boundary lines carry the echelon mark on the line
+              /** Drawn on the map, or held but hidden. See [Waypoint.visible]. */
+              val visible: Boolean = true,
+          )
+
+          object GraphicTypes {
+              /** type key -> (label, minimum vertices, isArea) */
+              val all = listOf(
+                  Triple("phase_line", "Phase line", 2),
+                  Triple("boundary", "Boundary", 2),
+                  Triple("axis", "Axis of advance", 2),
+                  Triple("doa", "Direction of attack", 2),
+                  Triple("objective", "Objective", 3),
+                  Triple("aa", "Assembly area", 3),
+                  Triple("route", "Route", 2),
+                  Triple("lz", "Landing zone", 3),
+                  Triple("pz", "Pickup zone", 3),
+                  Triple("bp", "Battle position", 3),
+                  Triple("ea", "Engagement area", 3),
+                  Triple("nai", "NAI", 3),
+                  Triple("tai", "TAI", 3),
+                  Triple("area", "Area (sketch)", 3),
+                  Triple("screen_l", "Screen line", 2),
+                  Triple("guard_l", "Guard line", 2),
+                  Triple("cover_l", "Cover line", 2),
+                  Triple("flot", "FLOT", 2),
+                  Triple("obstacle_line", "Obstacle line", 2),
+                  Triple("wire", "Wire obstacle", 2),
+                  Triple("lane", "Lane", 2),
+                  Triple("minefield", "Minefield", 3),
+                  Triple("strongpoint", "Strongpoint", 3),
+                  Triple("roadblock", "Roadblock", 1),
+                  Triple("ring", "Range ring", 2),
+                  Triple("sector", "Sector of fire", 3),
+                  Triple("trp", "Target ref point", 1),
+                  Triple("checkpoint", "Checkpoint", 1),
+                  Triple("dp", "Decision point", 1),
+                  Triple("text", "Text label", 1),
+              )
+
+              fun label(type: String): String = all.firstOrNull { it.first == type }?.second ?: type
+
+              fun minPoints(type: String): Int = all.firstOrNull { it.first == type }?.third ?: 2
+
+              fun isArea(type: String): Boolean = type in setOf(
+                  "objective", "aa", "lz", "pz", "area", "bp", "ea", "nai", "tai",
+                  "minefield", "strongpoint",
+              )
+
+              /** Security line graphics: letter box mid-line, arrows outward both ends. */
+              fun securityLetter(type: String): String? = when (type) {
+                  "screen_l" -> "S"
+                  "guard_l" -> "G"
+                  "cover_l" -> "C"
+                  else -> null
+              }
+
+              /**
+               * Types placed with a fixed number of taps finish themselves — no Done press.
+               * Ring: center then range edge. Sector: apex, left limit, right limit.
+               */
+              fun fixedPoints(type: String): Int? = when (type) {
+                  "ring" -> 2
+                  "sector" -> 3
+                  "trp", "checkpoint", "dp", "text", "roadblock" -> 1
+                  else -> null
+              }
+
+              /** Placement hint shown when the type is picked. */
+              fun placeHint(type: String): String? = when (type) {
+                  "ring" -> "Tap the center, then the range edge"
+                  "sector" -> "Tap the apex, then left limit, then right limit"
+                  "trp", "checkpoint", "dp", "roadblock" -> "Tap the map to place it"
+                  "text" -> "Tap the map where the text goes"
+                  "screen_l", "guard_l", "cover_l" -> "Tap along the security line, then Done"
+                  "flot" -> "Trace your forward line — the scallops face left of your drawing direction (toward the enemy)"
+                  "lane" -> "Trace the cleared lane's centerline"
+                  "obstacle_line", "wire" -> "Trace along the obstacle"
+                  else -> null
+              }
+
+              /** Display prefix used in the on-map label, per doctrine shorthand. */
+              fun labelPrefix(type: String): String = when (type) {
+                  "phase_line" -> "PL "
+                  "objective" -> "OBJ "
+                  "aa" -> "AA "
+                  "lz" -> "LZ "
+                  "pz" -> "PZ "
+                  "bp" -> "BP "
+                  "ea" -> "EA "
+                  "nai" -> "NAI "
+                  "tai" -> "TAI "
+                  "trp" -> "TRP "
+                  "checkpoint" -> "CP "
+                  "dp" -> "DP "
+                  else -> ""
+              }
+          }
+
+          class GraphicsRepository(private val context: Context) {
+
+              private val listKey = stringPreferencesKey("list")
+
+              val graphics: Flow<List<TacGraphic>> = context.graphicsStore.data.map { p ->
+                  decode(p[listKey] ?: "[]")
+              }
+
+              suspend fun add(
+                  name: String,
+                  type: String,
+                  points: List<GeoVertex>,
+                  folder: String,
+                  affiliation: String,
+                  nowMillis: Long,
+                  echelon: String = "",
+              ): String {
+                  val g = TacGraphic(
+                      id = UUID.randomUUID().toString(),
+                      name = name.trim(),
+                      type = type,
+                      points = points,
+                      folder = canonicalFolder(folder),
+                      affiliation = affiliation,
+                      createdAt = nowMillis,
+                      echelon = echelon,
+                  )
+                  context.graphicsStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]") + g)
+                  }
+                  return g.id
+              }
+
+              suspend fun rename(
+                  id: String,
+                  name: String,
+                  folder: String,
+                  affiliation: String,
+                  echelon: String = "",
+              ) {
+                  context.graphicsStore.edit { p ->
+                      p[listKey] = encode(
+                          decode(p[listKey] ?: "[]").map {
+                              if (it.id == id) it.copy(
+                                  name = name.trim(),
+                                  folder = canonicalFolder(folder),
+                                  affiliation = affiliation,
+                                  echelon = echelon,
+                              ) else it
+                          }
+                      )
+                  }
+              }
+
+              /** Merge a backup by id — already-present graphics are skipped. Returns added count. */
+              suspend fun restore(imported: List<TacGraphic>): Int {
+                  var added = 0
+                  context.graphicsStore.edit { p ->
+                      val current = decode(p[listKey] ?: "[]")
+                      val ids = current.map { it.id }.toSet()
+                      val fresh = imported.filter { it.id !in ids }
+                      added = fresh.size
+                      p[listKey] = encode(current + fresh)
+                  }
+                  return added
+              }
+
+              /** Replace a graphic's vertices — the map's edit-points mode saves through this. */
+              suspend fun updatePoints(id: String, points: List<GeoVertex>) {
+                  context.graphicsStore.edit { p ->
+                      p[listKey] = encode(
+                          decode(p[listKey] ?: "[]").map {
+                              if (it.id == id) it.copy(points = points) else it
+                          }
+                      )
+                  }
+              }
+
+              suspend fun delete(id: String) {
+                  context.graphicsStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id == id })
+                  }
+              }
+
+              /**
+               * Show or hide one graphic on the map without deleting it, independently of its
+               * folder's eye. The list still shows it, marked hidden.
+               */
+              suspend fun setVisible(id: String, visible: Boolean) {
+                  context.graphicsStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.id == id) it.copy(visible = visible) else it })
+                  }
+              }
+
+              /** Move every graphic in [from] to [to] (folder rename, or emptying a folder into Base). */
+              suspend fun renameFolder(from: String, to: String) {
+                  val target = canonicalFolder(to)
+                  if (from == target) return
+                  context.graphicsStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.folder == from) it.copy(folder = target) else it })
+                  }
+              }
+
+              /** Remove every graphic in [folder] — "clear the sketch" in one go. */
+              suspend fun deleteFolder(folder: String) {
+                  context.graphicsStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.folder == folder })
+                  }
+              }
+
+              // One damaged record must not take the whole list with it: skip it, keep the rest.
+              private fun decode(json: String): List<TacGraphic> {
+                  val arr = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
+                  return buildList {
+                      for (i in 0 until arr.length()) {
+                          runCatching {
+                              val o = arr.getJSONObject(i)
+                              val pts = o.getJSONArray("points")
+                              val vertices = buildList {
+                                  for (j in 0 until pts.length()) {
+                                      val v = pts.getJSONArray(j)
+                                      add(GeoVertex(v.getDouble(0), v.getDouble(1)))
+                                  }
+                              }
+                              TacGraphic(
+                                  id = o.getString("id"),
+                                  name = o.getString("name"),
+                                  type = o.getString("type"),
+                                  points = vertices,
+                                  folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
+                                  affiliation = o.optString("affiliation", "none"),
+                                  createdAt = o.optLong("createdAt"),
+                                  echelon = o.optString("echelon", ""),
+                                  visible = o.optBoolean("visible", true),
+                              )
+                          }.getOrNull()?.let { add(it) }
+                      }
+                  }
+              }
+
+              private fun encode(list: List<TacGraphic>): String {
+                  val arr = JSONArray()
+                  for (g in list) {
+                      val pts = JSONArray()
+                      for (v in g.points) {
+                          pts.put(JSONArray().put(v.lat).put(v.lon))
+                      }
+                      arr.put(
+                          JSONObject()
+                              .put("id", g.id)
+                              .put("name", g.name)
+                              .put("type", g.type)
+                              .put("points", pts)
+                              .put("folder", g.folder)
+                              .put("affiliation", g.affiliation)
+                              .put("createdAt", g.createdAt)
+                              .put("echelon", g.echelon)
+                              .put("visible", g.visible)
+                      )
+                  }
+                  return arr.toString()
+              }
+          }
+          EOF_GRIDFIX
+          cat > 'app/src/main/java/app/gridfix/android/data/TrackRepository.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android.data
+
+          import android.content.Context
+          import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
+          import androidx.datastore.preferences.core.edit
+          import androidx.datastore.preferences.core.emptyPreferences
+          import androidx.datastore.preferences.core.stringPreferencesKey
+          import androidx.datastore.preferences.preferencesDataStore
+          import app.gridfix.android.coords.Geodesy
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.coroutines.flow.first
+          import kotlinx.coroutines.flow.map
+          import kotlinx.coroutines.withContext
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.TimeZone
+          import java.util.UUID
+
+          private val Context.trackStore by preferencesDataStore(
+              name = "tracks",
+              corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+          )
+
+          /** Track metadata; the point log lives in files/tracks/<id>.txt (one point per line). */
+          data class TrackInfo(
+              val id: String,
+              val name: String,
+              val startedAt: Long,
+              val endedAt: Long,        // 0 while recording
+              val distanceM: Double,
+              val pointCount: Int,
+              val folder: String = DEFAULT_FOLDER,   // overlay folder, shares the eye switch with waypoints and graphics
+              /** Drawn on the map, or held but hidden. See [Waypoint.visible]. */
+              val visible: Boolean = true,
+          )
+
+          /**
+           * A logged fix. [alt] is metres above mean sea level, or [NO_ALTITUDE] when the
+           * receiver gave no height: writing a real number there would put the leg at sea
+           * level on every profile that reads it.
+           */
+          data class TrackPoint(val lat: Double, val lon: Double, val time: Long, val alt: Double)
+
+          /** "this fix had no altitude" — omitted from GPX rather than written as a height. */
+          const val NO_ALTITUDE = -32768.0
+
+          fun Double.hasAltitude(): Boolean = this > NO_ALTITUDE + 1.0
+
+          class TrackRepository(private val context: Context) {
+
+              private val listKey = stringPreferencesKey("list")
+
+              val tracks: Flow<List<TrackInfo>> = context.trackStore.data.map { p ->
+                  decode(p[listKey] ?: "[]").sortedByDescending { it.startedAt }
+              }
+
+              suspend fun startTrack(nowMillis: Long): String {
+                  val id = UUID.randomUUID().toString()
+                  val info = TrackInfo(
+                      id = id,
+                      name = "Track " + dtgShort(nowMillis),
+                      startedAt = nowMillis,
+                      endedAt = 0L,
+                      distanceM = 0.0,
+                      pointCount = 0,
+                  )
+                  withContext(Dispatchers.IO) { pointsFile(context, id).parentFile?.mkdirs() }
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]") + info)
+                  }
+                  return id
+              }
+
+              /** Close out a finished recording: compute stats from the point log. */
+              suspend fun finishTrack(id: String, name: String?, nowMillis: Long) {
+                  val pts = readPoints(context, id)
+                  var dist = 0.0
+                  for (i in 1 until pts.size) {
+                      dist += Geodesy.distanceAndBearing(
+                          pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon
+                      )[0]
+                  }
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(
+                          decode(p[listKey] ?: "[]").map {
+                              if (it.id == id) it.copy(
+                                  name = name?.trim()?.ifBlank { it.name } ?: it.name,
+                                  endedAt = nowMillis,
+                                  distanceM = dist,
+                                  pointCount = pts.size,
+                              ) else it
+                          }
+                      )
+                  }
+              }
+
+              /** Create a finished track from imported points (GPX trk import). */
+              suspend fun importTrack(name: String, points: List<TrackPoint>, nowMillis: Long): String {
+                  val id = UUID.randomUUID().toString()
+                  withContext(Dispatchers.IO) {
+                      val f = pointsFile(context, id)
+                      f.parentFile?.mkdirs()
+                      f.bufferedWriter().use { out ->
+                          for (p in points) {
+                              out.write(
+                                  String.format(Locale.US, "%.7f %.7f %d %.1f\n", p.lat, p.lon, p.time, p.alt)
+                              )
+                          }
+                      }
+                  }
+                  var dist = 0.0
+                  for (i in 1 until points.size) {
+                      dist += Geodesy.distanceAndBearing(
+                          points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon
+                      )[0]
+                  }
+                  val start = points.firstOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
+                  val end = points.lastOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
+                  val info = TrackInfo(
+                      id = id,
+                      name = name.trim().ifBlank { "Imported track" },
+                      startedAt = start,
+                      endedAt = end,
+                      distanceM = dist,
+                      pointCount = points.size,
+                  )
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]") + info)
+                  }
+                  return id
+              }
+
+              /** Restore one track from a backup, keeping its id; skipped when already present. */
+              suspend fun restore(info: TrackInfo, points: List<TrackPoint>): Boolean {
+                  var added = false
+                  context.trackStore.edit { p ->
+                      val current = decode(p[listKey] ?: "[]")
+                      if (current.none { it.id == info.id }) {
+                          val f = pointsFile(context, info.id)
+                          f.parentFile?.mkdirs()
+                          f.writeText(
+                              points.joinToString("") {
+                                  String.format(Locale.US, "%.7f %.7f %d %.1f\n", it.lat, it.lon, it.time, it.alt)
+                              }
+                          )
+                          p[listKey] = encode(current + info)
+                          added = true
+                      }
+                  }
+                  return added
+              }
+
+              suspend fun rename(id: String, name: String) {
+                  if (name.isBlank()) return
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(
+                          decode(p[listKey] ?: "[]").map {
+                              if (it.id == id) it.copy(name = name.trim()) else it
+                          }
+                      )
+                  }
+              }
+
+              suspend fun setFolder(id: String, folder: String) {
+                  val clean = canonicalFolder(folder)
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(
+                          decode(p[listKey] ?: "[]").map {
+                              if (it.id == id) it.copy(folder = clean) else it
+                          }
+                      )
+                  }
+              }
+
+              suspend fun delete(id: String) {
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id == id })
+                  }
+                  withContext(Dispatchers.IO) { pointsFile(context, id).delete() }
+              }
+
+              /**
+               * Show or hide one track on the map without deleting it, independently of its
+               * folder's eye. The list still shows it, marked hidden.
+               */
+              suspend fun setVisible(id: String, visible: Boolean) {
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.id == id) it.copy(visible = visible) else it })
+                  }
+              }
+
+              /** Move every track in [from] to [to] (folder rename, or emptying a folder into Base). */
+              suspend fun renameFolder(from: String, to: String) {
+                  val target = canonicalFolder(to)
+                  if (from == target) return
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.folder == from) it.copy(folder = target) else it })
+                  }
+              }
+
+              /** Delete every track in [folder], point logs included. */
+              suspend fun deleteFolder(folder: String) {
+                  val doomed = decode(context.trackStore.data.first()[listKey] ?: "[]").filter { it.folder == folder }
+                  for (t in doomed) delete(t.id)
+              }
+
+              /** Remove a recording that was discarded before saving. */
+              suspend fun discard(id: String) = delete(id)
+
+              /**
+               * Heal recordings the OS killed mid-way: any track still open (endedAt == 0)
+               * that is not the one currently recording is closed out from its point log
+               * (the points are on disk — only the summary was lost), or removed when it
+               * never logged a point.
+               */
+              suspend fun finalizeOrphans(activeId: String?) {
+                  val open = decode(context.trackStore.data.first()[listKey] ?: "[]")
+                      .filter { it.endedAt == 0L && it.id != activeId }
+                  for (t in open) {
+                      val pts = readPoints(context, t.id)
+                      if (pts.isEmpty()) {
+                          delete(t.id)
+                      } else {
+                          val last = pts.last().time
+                          finishTrack(t.id, null, if (last > t.startedAt) last else System.currentTimeMillis())
+                      }
+                  }
+              }
+
+              // One damaged record must not take the whole list with it: skip it, keep the rest.
+              private fun decode(json: String): List<TrackInfo> {
+                  val arr = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
+                  return buildList {
+                      for (i in 0 until arr.length()) {
+                          runCatching {
+                              val o = arr.getJSONObject(i)
+                              TrackInfo(
+                                  id = o.getString("id"),
+                                  name = o.getString("name"),
+                                  startedAt = o.optLong("startedAt"),
+                                  endedAt = o.optLong("endedAt"),
+                                  distanceM = o.optDouble("distanceM", 0.0),
+                                  pointCount = o.optInt("pointCount", 0),
+                                  folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
+                                  visible = o.optBoolean("visible", true),
+                              )
+                          }.getOrNull()?.let { add(it) }
+                      }
+                  }
+              }
+
+              private fun encode(list: List<TrackInfo>): String {
+                  val arr = JSONArray()
+                  for (t in list) {
+                      arr.put(
+                          JSONObject()
+                              .put("id", t.id)
+                              .put("name", t.name)
+                              .put("startedAt", t.startedAt)
+                              .put("endedAt", t.endedAt)
+                              .put("distanceM", t.distanceM)
+                              .put("pointCount", t.pointCount)
+                              .put("folder", t.folder)
+                              .put("visible", t.visible)
+                      )
+                  }
+                  return arr.toString()
+              }
+
+              companion object {
+                  fun pointsFile(context: Context, id: String): File =
+                      File(File(context.filesDir, "tracks"), "$id.txt")
+
+                  /** Append one point; called from the recorder service's worker thread. */
+                  fun appendPoint(context: Context, id: String, lat: Double, lon: Double, time: Long, alt: Double) {
+                      runCatching {
+                          val f = pointsFile(context, id)
+                          f.parentFile?.mkdirs()
+                          f.appendText(
+                              String.format(Locale.US, "%.7f %.7f %d %.1f\n", lat, lon, time, alt)
+                          )
+                      }
+                  }
+
+                  suspend fun readPoints(context: Context, id: String): List<TrackPoint> =
+                      withContext(Dispatchers.IO) {
+                          val f = pointsFile(context, id)
+                          if (!f.exists()) return@withContext emptyList()
+                          f.readLines().mapNotNull { line ->
+                              val parts = line.trim().split(" ")
+                              if (parts.size < 3) return@mapNotNull null
+                              runCatching {
+                                  TrackPoint(
+                                      lat = parts[0].toDouble(),
+                                      lon = parts[1].toDouble(),
+                                      time = parts[2].toLong(),
+                                      alt = parts.getOrNull(3)?.toDouble() ?: NO_ALTITUDE,
+                                  )
+                              }.getOrNull()
+                          }
+                      }
+
+                  /** Minimal GPX 1.1 document for one track. */
+                  fun buildGpx(name: String, points: List<TrackPoint>): String {
+                      val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+                      sdf.timeZone = TimeZone.getTimeZone("UTC")
+                      val sb = StringBuilder()
+                      sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+                      sb.append("<gpx version=\"1.1\" creator=\"MGRS GPS\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n")
+                      sb.append("  <trk>\n    <name>").append(escapeXml(name)).append("</name>\n    <trkseg>\n")
+                      for (p in points) {
+                          val ele = if (p.alt.hasAltitude()) String.format(Locale.US, "<ele>%.1f</ele>", p.alt) else ""
+                          sb.append(
+                              String.format(
+                                  Locale.US,
+                                  "      <trkpt lat=\"%.7f\" lon=\"%.7f\">%s<time>%s</time></trkpt>\n",
+                                  p.lat, p.lon, ele, sdf.format(Date(p.time)),
+                              )
+                          )
+                      }
+                      sb.append("    </trkseg>\n  </trk>\n</gpx>\n")
+                      return sb.toString()
+                  }
+
+                  private fun escapeXml(s: String): String = s
+                      .replace("&", "&amp;")
+                      .replace("<", "&lt;")
+                      .replace(">", "&gt;")
+                      .replace("\"", "&quot;")
+
+                  private fun dtgShort(timeMillis: Long): String {
+                      val sdf = SimpleDateFormat("ddHHmm'Z'", Locale.US)
+                      sdf.timeZone = TimeZone.getTimeZone("UTC")
+                      return sdf.format(Date(timeMillis))
+                  }
+              }
+          }
+          EOF_GRIDFIX
+          cat > 'app/src/main/java/app/gridfix/android/data/WaypointRepository.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android.data
+
+          import android.content.Context
+          import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
+          import androidx.datastore.preferences.core.edit
+          import androidx.datastore.preferences.core.emptyPreferences
+          import androidx.datastore.preferences.core.stringPreferencesKey
+          import androidx.datastore.preferences.preferencesDataStore
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.coroutines.flow.first
+          import kotlinx.coroutines.flow.map
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.util.Locale
+          import java.util.UUID
+
+          private val Context.wpStore by preferencesDataStore(
+              name = "waypoints",
+              corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+          )
+
+          const val DEFAULT_FOLDER = "Base"
+
+          /**
+           * Folder names as stored. Before 0.9.9 waypoints defaulted to "Waypoints" and drawn
+           * graphics to "Graphics"; both collapse into the one base folder that now holds
+           * waypoints, graphics and tracks together, so one eye switch clears the map.
+           */
+          fun canonicalFolder(raw: String?): String = when (raw?.trim().orEmpty()) {
+              "", "Waypoints", "Graphics" -> DEFAULT_FOLDER
+              else -> raw!!.trim()
+          }
+
+          /** A one-line warning for folder name fields when the typed name will not be kept as typed. */
+          fun reservedFolderHint(raw: String): String? {
+              val t = raw.trim()
+              if (t.isEmpty() || t == DEFAULT_FOLDER) return null
+              return if (canonicalFolder(t) == DEFAULT_FOLDER) "\"$t\" is a reserved name — this goes into $DEFAULT_FOLDER" else null
+          }
+
+          /**
+           * The stored spelling of a folder: "recon" and "Recon" are one folder. [known] is
+           * every folder name currently in use; the first case-insensitive match wins.
+           */
+          fun matchFolder(known: Iterable<String>, raw: String?): String {
+              val clean = canonicalFolder(raw)
+              return known.firstOrNull { it.equals(clean, ignoreCase = true) } ?: clean
+          }
+          const val DEFAULT_SYMBOL = "flag"
+
+          data class Waypoint(
+              val id: String,
+              val name: String,
+              val lat: Double,
+              val lon: Double,
+              val createdAt: Long,
+              val folder: String = DEFAULT_FOLDER,
+              val symbol: String = DEFAULT_SYMBOL,
+              val affiliation: String = "none",
+              val echelon: String = "",       // "", tm, sqd, sec, plt, co, bn, rgt, bde
+              val designation: String = "",   // free-text unit designation amplifier
+              val kind: String = KIND_WP,     // KIND_WP (navigation point) or KIND_UNIT (plotted unit)
+              val rotation: Float = 0f,       // degrees clockwise from north; direction of fire for task symbols
+              /**
+               * Drawn on the map, or held but hidden. Independent of the folder's eye: a
+               * hidden folder hides everything in it, and this hides one item inside a folder
+               * that is otherwise shown. Defaults true, so every existing record and every
+               * backup written before 0.9.26 reads back visible.
+               */
+              val visible: Boolean = true,
+          )
+
+          const val KIND_WP = "wp"
+          const val KIND_UNIT = "unit"
+
+          /** Everything needed to create or update a waypoint. */
+          data class WaypointDraft(
+              val name: String,
+              val lat: Double,
+              val lon: Double,
+              val folder: String,
+              val symbol: String,
+              val affiliation: String,
+              val echelon: String = "",
+              val designation: String = "",
+              val kind: String = KIND_WP,
+              val rotation: Float = 0f,
+          )
+
+          /** A waypoint folder ("overlay"): can exist empty, and can be toggled visible/hidden. */
+          data class FolderInfo(val name: String, val visible: Boolean = true)
+
+          class WaypointRepository(private val context: Context) {
+
+              private val listKey = stringPreferencesKey("list")
+              private val selectedKey = stringPreferencesKey("selected")
+              private val foldersKey = stringPreferencesKey("folders")
+
+              val waypoints: Flow<List<Waypoint>> = context.wpStore.data.map { p ->
+                  decode(p[listKey] ?: "[]")
+              }
+
+              val selectedId: Flow<String?> = context.wpStore.data.map { p -> p[selectedKey] }
+
+              /** Stored folders unioned with any folder referenced by a waypoint: Base first, then by name. */
+              val folders: Flow<List<FolderInfo>> = context.wpStore.data.map { p ->
+                  val stored = decodeFolders(p[foldersKey] ?: "[]")
+                  val referenced = decode(p[listKey] ?: "[]").map { it.folder }
+                  val names = (stored.map { it.name } + referenced + DEFAULT_FOLDER).distinct()
+                  names.map { n -> stored.firstOrNull { it.name == n } ?: FolderInfo(n) }
+                      .sortedWith(compareBy({ it.name != DEFAULT_FOLDER }, { it.name.lowercase(Locale.US) }))
+              }
+
+              /** Every folder name in use right now (stored entries and waypoint references). */
+              private fun knownNames(p: androidx.datastore.preferences.core.Preferences): List<String> =
+                  (decodeFolders(p[foldersKey] ?: "[]").map { it.name } + decode(p[listKey] ?: "[]").map { it.folder } + DEFAULT_FOLDER).distinct()
+
+              /** The spelling this name will be stored under (case-insensitive match against existing folders). */
+              suspend fun resolveFolder(raw: String): String =
+                  matchFolder(knownNames(context.wpStore.data.first()), raw)
+
+              /** Create a folder (or match an existing one, ignoring case). Returns the stored name. */
+              suspend fun addFolder(name: String): String {
+                  if (name.isBlank()) return DEFAULT_FOLDER
+                  var stored = canonicalFolder(name)
+                  context.wpStore.edit { p ->
+                      stored = matchFolder(knownNames(p), name)
+                      p[foldersKey] = encodeFolders(
+                          upsertFolder(decodeFolders(p[foldersKey] ?: "[]"), stored, null)
+                      )
+                  }
+                  return stored
+              }
+
+              suspend fun setFolderVisible(name: String, visible: Boolean) {
+                  context.wpStore.edit { p ->
+                      p[foldersKey] = encodeFolders(
+                          upsertFolder(decodeFolders(p[foldersKey] ?: "[]"), name, visible)
+                      )
+                  }
+              }
+
+              /**
+               * Rename a folder, moving its waypoints. Renaming onto an existing folder (any
+               * case) merges into it. Base cannot be renamed. Returns the name now in use.
+               */
+              suspend fun renameFolder(from: String, to: String): String {
+                  if (from == DEFAULT_FOLDER || to.isBlank()) return from
+                  var target = canonicalFolder(to)
+                  context.wpStore.edit { p ->
+                      val stored = decodeFolders(p[foldersKey] ?: "[]")
+                      target = matchFolder(knownNames(p).filter { it != from }, to)
+                      if (target == from) return@edit
+                      val src = stored.firstOrNull { it.name == from }
+                      val merged = stored.filterNot { it.name == from }.toMutableList()
+                      mergeFolder(merged, FolderInfo(target, src?.visible ?: true))
+                      p[foldersKey] = encodeFolders(merged)
+                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.folder == from) it.copy(folder = target) else it })
+                  }
+                  return target
+              }
+
+              /**
+               * Remove a folder: its waypoints are deleted with it, or moved to Base when
+               * [deleteContents] is false. Base cannot be deleted.
+               */
+              suspend fun deleteFolder(name: String, deleteContents: Boolean) {
+                  if (name == DEFAULT_FOLDER) return
+                  context.wpStore.edit { p ->
+                      val current = decode(p[listKey] ?: "[]")
+                      val kept = if (deleteContents) current.filterNot { it.folder == name }
+                      else current.map { if (it.folder == name) it.copy(folder = DEFAULT_FOLDER) else it }
+                      p[listKey] = encode(kept)
+                      p[foldersKey] = encodeFolders(decodeFolders(p[foldersKey] ?: "[]").filterNot { it.name == name })
+                      val sel = p[selectedKey]
+                      if (sel != null && kept.none { it.id == sel }) p.remove(selectedKey)
+                  }
+              }
+
+              suspend fun add(draft: WaypointDraft, nowMillis: Long): String {
+                  val newId = UUID.randomUUID().toString()
+                  context.wpStore.edit { p ->
+                      val current = decode(p[listKey] ?: "[]")
+                      val wp = Waypoint(
+                          id = newId,
+                          name = draft.name,
+                          lat = draft.lat,
+                          lon = draft.lon,
+                          createdAt = nowMillis,
+                          folder = matchFolder(knownNames(p), draft.folder),
+                          symbol = draft.symbol.ifBlank { DEFAULT_SYMBOL },
+                          affiliation = draft.affiliation,
+                          echelon = draft.echelon,
+                          designation = draft.designation,
+                          kind = draft.kind,
+                          rotation = draft.rotation,
+                      )
+                      p[listKey] = encode(current + wp)
+                      p[foldersKey] = encodeFolders(
+                          upsertFolder(decodeFolders(p[foldersKey] ?: "[]"), wp.folder, null)
+                      )
+                      if (p[selectedKey] == null) {
+                          p[selectedKey] = wp.id
+                      }
+                  }
+                  return newId
+              }
+
+              /** Bulk add (imports): one datastore write however many points arrive. */
+              suspend fun addAll(drafts: List<WaypointDraft>, nowMillis: Long) {
+                  if (drafts.isEmpty()) return
+                  context.wpStore.edit { p ->
+                      val current = decode(p[listKey] ?: "[]")
+                      var folders = decodeFolders(p[foldersKey] ?: "[]")
+                      val known = knownNames(p).toMutableList()
+                      val added = drafts.map { draft ->
+                          val f = matchFolder(known, draft.folder)
+                          if (f !in known) known.add(f)
+                          folders = upsertFolder(folders, f, null)
+                          Waypoint(
+                              id = UUID.randomUUID().toString(),
+                              name = draft.name,
+                              lat = draft.lat,
+                              lon = draft.lon,
+                              createdAt = nowMillis,
+                              folder = f,
+                              symbol = draft.symbol.ifBlank { DEFAULT_SYMBOL },
+                              affiliation = draft.affiliation,
+                              echelon = draft.echelon,
+                              designation = draft.designation,
+                              kind = draft.kind,
+                              rotation = draft.rotation,
+                          )
+                      }
+                      p[listKey] = encode(current + added)
+                      p[foldersKey] = encodeFolders(folders)
+                  }
+              }
+
+              /**
+               * Merge a backup: waypoints keep their original ids and ids already on the
+               * device are skipped, so restoring twice never duplicates. Folder entries
+               * merge by name (existing visibility wins). Returns how many were added.
+               */
+              suspend fun restore(imported: List<Waypoint>, importedFolders: List<FolderInfo>): Int {
+                  var added = 0
+                  context.wpStore.edit { p ->
+                      val current = decode(p[listKey] ?: "[]")
+                      val ids = current.map { it.id }.toSet()
+                      val fresh = imported.filter { it.id !in ids }
+                      added = fresh.size
+                      p[listKey] = encode(current + fresh)
+                      val merged = decodeFolders(p[foldersKey] ?: "[]").toMutableList()
+                      val known = merged.map { it.name }.toSet()
+                      // folders new to this device come in with their backed-up visibility; existing ones keep theirs
+                      for (f in importedFolders.map { it.copy(name = canonicalFolder(it.name)) }) {
+                          if (f.name !in known) mergeFolder(merged, f)
+                      }
+                      var folders: List<FolderInfo> = merged
+                      for (w in fresh) folders = upsertFolder(folders, w.folder, null)
+                      p[foldersKey] = encodeFolders(folders)
+                  }
+                  return added
+              }
+
+              suspend fun update(id: String, draft: WaypointDraft) {
+                  context.wpStore.edit { p ->
+                      val current = decode(p[listKey] ?: "[]")
+                      val folder = matchFolder(knownNames(p), draft.folder)
+                      p[listKey] = encode(
+                          current.map {
+                              if (it.id == id) it.copy(
+                                  name = draft.name,
+                                  lat = draft.lat,
+                                  lon = draft.lon,
+                                  folder = folder,
+                                  symbol = draft.symbol.ifBlank { DEFAULT_SYMBOL },
+                                  affiliation = draft.affiliation,
+                                  echelon = draft.echelon,
+                                  designation = draft.designation,
+                                  kind = draft.kind,
+                                  rotation = draft.rotation,
+                              ) else it
+                          }
+                      )
+                      p[foldersKey] = encodeFolders(
+                          upsertFolder(decodeFolders(p[foldersKey] ?: "[]"), folder, null)
+                      )
+                  }
+              }
+
+              suspend fun delete(id: String) {
+                  context.wpStore.edit { p ->
+                      val current = decode(p[listKey] ?: "[]")
+                      p[listKey] = encode(current.filterNot { it.id == id })
+                      if (p[selectedKey] == id) {
+                          p.remove(selectedKey)
+                      }
+                  }
+              }
+
+              /**
+               * Show or hide one waypoint on the map without deleting it, independently of its
+               * folder's eye. The list still shows it, marked hidden.
+               */
+              suspend fun setVisible(id: String, visible: Boolean) {
+                  context.wpStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.id == id) it.copy(visible = visible) else it })
+                  }
+              }
+
+              suspend fun select(id: String) {
+                  context.wpStore.edit { p -> p[selectedKey] = id }
+              }
+
+              // One damaged record must not take the whole list with it: skip it, keep the rest.
+              private fun decode(json: String): List<Waypoint> {
+                  val arr = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
+                  return buildList {
+                      for (i in 0 until arr.length()) {
+                          val o = runCatching { arr.getJSONObject(i) }.getOrNull() ?: continue
+                          runCatching {
+                              Waypoint(
+                                  id = o.getString("id"),
+                                  name = o.getString("name"),
+                                  lat = o.getDouble("lat"),
+                                  lon = o.getDouble("lon"),
+                                  createdAt = o.optLong("createdAt"),
+                                  folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
+                                  symbol = o.optString("symbol", DEFAULT_SYMBOL),
+                                  affiliation = o.optString("affiliation", "none"),
+                                  echelon = o.optString("echelon", ""),
+                                  designation = o.optString("designation", ""),
+                                  kind = o.optString(
+                                      "kind",
+                                      // migrate pre-0.5 data: NATO symbols were always units
+                                      if (o.optString("symbol", "").startsWith("nato_")) KIND_UNIT else KIND_WP,
+                                  ),
+                                  rotation = o.optDouble("rotation", 0.0).toFloat(),
+                                  visible = o.optBoolean("visible", true),
+                              )
+                          }.getOrNull()?.let { add(it) }
+                      }
+                  }
+              }
+
+              /** Add or update a folder entry; visible == null keeps the existing visibility. */
+              private fun upsertFolder(list: List<FolderInfo>, name: String, visible: Boolean?): List<FolderInfo> {
+                  val existing = list.firstOrNull { it.name == name }
+                  return when {
+                      existing == null -> list + FolderInfo(name, visible ?: true)
+                      visible == null -> list
+                      else -> list.map { if (it.name == name) it.copy(visible = visible) else it }
+                  }
+              }
+
+              private fun decodeFolders(json: String): List<FolderInfo> = runCatching {
+                  val arr = JSONArray(json)
+                  val out = ArrayList<FolderInfo>()
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      mergeFolder(out, FolderInfo(canonicalFolder(o.getString("name")), o.optBoolean("visible", true)))
+                  }
+                  out
+              }.getOrDefault(emptyList())
+
+              /**
+               * Add a folder entry, merging by canonical name. Legacy "Waypoints" and "Graphics"
+               * both map to Base: if either was visible, Base is visible - nothing a user could
+               * see before an upgrade disappears from the map because of the merge.
+               */
+              private fun mergeFolder(list: MutableList<FolderInfo>, f: FolderInfo) {
+                  val idx = list.indexOfFirst { it.name == f.name }
+                  if (idx < 0) list.add(f)
+                  else if (f.visible && !list[idx].visible) list[idx] = list[idx].copy(visible = true)
+              }
+
+              private fun encodeFolders(list: List<FolderInfo>): String {
+                  val arr = JSONArray()
+                  for (f in list) {
+                      arr.put(JSONObject().put("name", f.name).put("visible", f.visible))
+                  }
+                  return arr.toString()
+              }
+
+              private fun encode(list: List<Waypoint>): String {
+                  val arr = JSONArray()
+                  for (w in list) {
+                      arr.put(
+                          JSONObject()
+                              .put("id", w.id)
+                              .put("name", w.name)
+                              .put("lat", w.lat)
+                              .put("lon", w.lon)
+                              .put("createdAt", w.createdAt)
+                              .put("folder", w.folder)
+                              .put("symbol", w.symbol)
+                              .put("affiliation", w.affiliation)
+                              .put("echelon", w.echelon)
+                              .put("designation", w.designation)
+                              .put("kind", w.kind)
+                              .put("rotation", w.rotation.toDouble())
+                              .put("visible", w.visible)
+                      )
+                  }
+                  return arr.toString()
+              }
+          }
+          EOF_GRIDFIX
+          mkdir -p 'app/src/main/java/app/gridfix/android/ui'
+          base64 -d <<'EOF_GRIDFIX_GZ' | gunzip > 'app/src/main/java/app/gridfix/android/ui/GridFixApp.kt'
+          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
+          AA==
+          EOF_GRIDFIX_GZ
           mkdir -p 'app/src/main/java/app/gridfix/android/ui/screens'
           base64 -d <<'EOF_GRIDFIX_GZ' | gunzip > 'app/src/main/java/app/gridfix/android/ui/screens/MapScreen.kt'
-          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
+          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
           EOF_GRIDFIX_GZ
-          echo "v0.9.25-3cb37ff982bd" > .github/last-payload
+          base64 -d <<'EOF_GRIDFIX_GZ' | gunzip > 'app/src/main/java/app/gridfix/android/ui/screens/WaypointsScreen.kt'
+          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
+          EOF_GRIDFIX_GZ
+          echo "v0.9.26-6e96cc0cbbfd" > .github/last-payload
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
-            git -c user.name='GridFix CI' -c user.email='ci@gridfix.local' commit -qm 'Sync v0.9.25 (map tool rail - smaller primary action and clearance off the screen edge) source from bootstrap workflow'
+            git -c user.name='GridFix CI' -c user.email='ci@gridfix.local' commit -qm 'Sync v0.9.26 (per-item visibility and swipe actions on every list row) source from bootstrap workflow'
             git push origin HEAD:main
           fi
           fi
