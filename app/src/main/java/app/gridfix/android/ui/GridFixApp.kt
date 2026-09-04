@@ -15,13 +15,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.outlined.Check
@@ -137,6 +137,21 @@ private val RAIL_ITEM_LABELLED = 58.dp
 private val RAIL_ITEM_COMPACT = 46.dp
 private val ACTION_BUTTON = 48.dp
 private val RAIL_DIVIDER = 13.dp   // 6 dp padding either side of a 1 dp line
+
+/**
+ * The group separator in the rail, at a stated width.
+ *
+ * This has to be explicit. `NavigationRail` sets no width of its own - its Column wraps
+ * its widest child, the destination items - and `HorizontalDivider` defaults to
+ * `fillMaxWidth`. With nothing bounding it the divider took the entire row's width and
+ * dragged the rail across the screen with it, squeezing the map to a sliver in every
+ * landscape orientation. That was 0.9.23.
+ *
+ * Deliberately narrower than the rail rather than equal to it: the rail's own width is
+ * whatever the "WAYPOINTS" label needs at the current font scale, which is not a number
+ * to hard-code. A short centred rule reads as a group separator anyway.
+ */
+private val RAIL_DIVIDER_WIDTH = 48.dp
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -581,7 +596,9 @@ fun GridFixApp() {
                             )
                         }
                         HorizontalDivider(
-                            modifier = Modifier.padding(vertical = 6.dp),
+                            modifier = Modifier
+                                .width(RAIL_DIVIDER_WIDTH)
+                                .padding(vertical = 6.dp),
                             color = MaterialTheme.colorScheme.outline,
                         )
                         // The same three actions the portrait app bar carries, stacked instead
