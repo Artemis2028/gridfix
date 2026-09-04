@@ -15,10 +15,10 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Write source files (v0.9.19 (portable slices, Vincenty, shared golden vectors) delta, plain text, auditable below)
+      - name: Write source files (v0.9.20 (graphics GeoJSON, notification permission, recording failures visible) delta, plain text, auditable below)
         run: |
-          if [ "$(cat .github/last-payload 2>/dev/null)" = "v0.9.19-e77ff18d578b" ]; then
-            echo "payload v0.9.19-e77ff18d578b already applied - skipping (edit the files in git, not here)"
+          if [ "$(cat .github/last-payload 2>/dev/null)" = "v0.9.20-2d782b8acb0f" ]; then
+            echo "payload v0.9.20-2d782b8acb0f already applied - skipping (edit the files in git, not here)"
           else
           mkdir -p 'app'
           cat > 'app/build.gradle.kts' <<'EOF_GRIDFIX'
@@ -36,8 +36,8 @@ jobs:
                   applicationId = "app.gridfix.android"
                   minSdk = 26
                   targetSdk = 36
-                  versionCode = 47
-                  versionName = "0.9.19"
+                  versionCode = 48
+                  versionName = "0.9.20"
                   // MapTiler API key from the CI secret; empty in builds without it (community-tile fallback)
                   buildConfigField("String", "MAPTILER_KEY", "\"" + (System.getenv("MAPTILER_KEY") ?: "") + "\"")
               }
@@ -119,1519 +119,1286 @@ jobs:
               // Field math (MGRS, UTM, zone exceptions, ray fixes, sun/moon) is plain JVM code
               // and is the part that must never silently drift. See app/src/test.
               testImplementation("junit:junit:4.13.2")
+              // org.json ships in android.jar as a stub that returns defaults under
+              // isReturnDefaultValues, so a JVM test cannot parse its own output
+              // without the real artifact on the test classpath ahead of it.
+              testImplementation("org.json:json:20240303")
           }
           EOF_GRIDFIX
-          mkdir -p 'app/src/main/java/app/gridfix/android/coords'
-          cat > 'app/src/main/java/app/gridfix/android/coords/Coordinates.kt' <<'EOF_GRIDFIX'
-          package app.gridfix.android.coords
+          mkdir -p 'app/src/main/java/app/gridfix/android/map'
+          cat > 'app/src/main/java/app/gridfix/android/map/UserMaps.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android.map
 
-          import mil.nga.grid.features.Point
-          import mil.nga.mgrs.MGRS
-          import mil.nga.mgrs.grid.GridType
-          import java.text.SimpleDateFormat
-          import java.util.Date
+          import kotlinx.coroutines.flow.StateFlow
+
+          /**
+           * User-map repository shape (roadmap A photo-map, roadmap C GeoTIFF) -
+           * interface and models only, no storage wired yet.
+           *
+           * A user map is a calibrated image: four control points (grid-line
+           * intersections = cell corners, see `Coordinates.parseMgrsCorner`) locate the
+           * image pixels as an [ImageQuad]; both engines render it the same way
+           * (osmdroid: perspective `drawBitmap(matrix)`; MapLibre: an image source over
+           * the quad). Source files live in `filesDir/usermaps/<id>.bin` as opaque bytes
+           * - never re-encoded, so a GeoTIFF's georeferencing survives - and the
+           * downsampled render copy (2048 px, RGB_565) is derived at draw time.
+           *
+           * [ImageQuad] is in this package today and moves to `:core` with the rest of
+           * the portable models; the import here follows it then, not before.
+           */
+          data class UserMap(
+              val id: String,
+              val name: String,
+              /** File name under filesDir/usermaps/. Opaque source bytes. */
+              val fileName: String,
+              val quad: ImageQuad,
+          )
+
+          interface UserMapStore {
+              val maps: StateFlow<List<UserMap>>
+              suspend fun add(map: UserMap)
+              suspend fun setVisible(id: String, visible: Boolean)
+              suspend fun setOpacity(id: String, opacity: Float)
+              suspend fun delete(id: String)
+          }
+          EOF_GRIDFIX
+          mkdir -p 'app/src/main/java/app/gridfix/android/platform'
+          cat > 'app/src/main/java/app/gridfix/android/platform/GraphicGeoJson.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android.platform
+
+          import app.gridfix.android.data.GraphicTypes
+          import app.gridfix.android.data.TacGraphic
           import java.util.Locale
-          import java.util.TimeZone
-          import kotlin.math.abs
-          import kotlin.math.atan
-          import kotlin.math.cos
-          import kotlin.math.floor
-          import kotlin.math.pow
-          import kotlin.math.roundToLong
-          import kotlin.math.sin
-          import kotlin.math.sqrt
-          import kotlin.math.tan
 
-          object Coordinates {
+          /**
+           * Portable GeoJSON for tactical graphics - pure Kotlin, no Android imports.
+           *
+           * This is the interchange shape MapLibre consumes on both platforms (a GeoJSON
+           * source plus line/fill/symbol layers) and the shape a future "import overlay"
+           * feature would read. The geometry rule mirrors `InterchangeFiles.buildKml`
+           * exactly, and GoldenVectors.graphicGeometry holds the same table for the Swift
+           * port, so the two cannot answer differently for the same graphic.
+           *
+           * Moves to `:core` verbatim once [TacGraphic] does.
+           */
 
-              data class MgrsParts(
-                  val gzd: String,
-                  val square: String,
-                  val easting: String,
-                  val northing: String,
-                  val full: String,
+          /**
+           * Point / LineString / Polygon for this graphic's vertices, or null when there
+           * is nothing to draw.
+           *
+           * Null matters. A graphic with no vertices has no valid GeoJSON geometry at
+           * all; emitting a Point with an empty coordinate array produces a document that
+           * fails to parse, and one bad feature takes the whole layer down with it.
+           */
+          fun graphicGeometryKind(type: String, vertexCount: Int): String? = when {
+              vertexCount <= 0 -> null
+              vertexCount == 1 -> "Point"
+              GraphicTypes.isArea(type) && vertexCount >= 3 -> "Polygon"
+              else -> "LineString"
+          }
+
+          private fun lonLat(lat: Double, lon: Double): String =
+              String.format(Locale.US, "[%.7f,%.7f]", lon, lat)
+
+          /**
+           * One GeoJSON Feature for this graphic, or null when it has no geometry.
+           * Properties carry the metadata the style layers filter on.
+           */
+          fun TacGraphic.toGeoJsonFeature(): String? {
+              val kind = graphicGeometryKind(type, points.size) ?: return null
+              val geometry = when (kind) {
+                  "Point" -> {
+                      val p = points.first()
+                      "{\"type\":\"Point\",\"coordinates\":${lonLat(p.lat, p.lon)}}"
+                  }
+                  "Polygon" -> {
+                      // A GeoJSON ring must close: repeat the first vertex last.
+                      val ring = points + points.first()
+                      val coords = ring.joinToString(",") { lonLat(it.lat, it.lon) }
+                      "{\"type\":\"Polygon\",\"coordinates\":[[$coords]]}"
+                  }
+                  else -> {
+                      val coords = points.joinToString(",") { lonLat(it.lat, it.lon) }
+                      "{\"type\":\"LineString\",\"coordinates\":[$coords]}"
+                  }
+              }
+              return "{\"type\":\"Feature\",\"geometry\":$geometry,\"properties\":{" +
+                  "\"id\":${jsonStr(id)}," +
+                  "\"name\":${jsonStr(name)}," +
+                  "\"tacType\":${jsonStr(type)}," +
+                  "\"folder\":${jsonStr(folder)}," +
+                  "\"affiliation\":${jsonStr(affiliation)}," +
+                  "\"echelon\":${jsonStr(echelon)}}}"
+          }
+
+          /** A whole overlay as one FeatureCollection. Graphics with no geometry drop out. */
+          fun List<TacGraphic>.toGeoJson(): String =
+              "{\"type\":\"FeatureCollection\",\"features\":[" +
+                  mapNotNull { it.toGeoJsonFeature() }.joinToString(",") +
+                  "]}"
+
+          /**
+           * JSON string escaping. Every control character has to go: a raw tab or newline
+           * inside a JSON string is invalid, and a user is perfectly capable of pasting
+           * one into a graphic name.
+           */
+          internal fun jsonStr(s: String): String = buildString(s.length + 2) {
+              append('"')
+              for (c in s) {
+                  when (c) {
+                      '\\' -> append("\\\\")
+                      '"' -> append("\\\"")
+                      '\n' -> append("\\n")
+                      '\r' -> append("\\r")
+                      '\t' -> append("\\t")
+                      '\b' -> append("\\b")
+                      '\u000C' -> append("\\f")
+                      else -> if (c < ' ') append(String.format(Locale.US, "\\u%04x", c.code)) else append(c)
+                  }
+              }
+              append('"')
+          }
+          EOF_GRIDFIX
+          mkdir -p 'app/src/main/java/app/gridfix/android/ui'
+          cat > 'app/src/main/java/app/gridfix/android/ui/GridFixApp.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android.ui
+
+          import android.Manifest
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.WindowInsets
+          import androidx.compose.foundation.layout.fillMaxHeight
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.safeDrawingPadding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.WindowInsetsSides
+          import androidx.compose.foundation.layout.displayCutout
+          import androidx.compose.foundation.layout.only
+          import androidx.compose.foundation.layout.safeDrawing
+          import androidx.compose.foundation.layout.union
+          import androidx.compose.foundation.layout.windowInsetsPadding
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material.icons.outlined.Check
+          import androidx.compose.material.icons.outlined.DarkMode
+          import androidx.compose.material.icons.outlined.Explore
+          import androidx.compose.material.icons.outlined.Flag
+          import androidx.compose.material.icons.outlined.LightMode
+          import androidx.compose.material.icons.outlined.Map
+          import androidx.compose.material.icons.outlined.MyLocation
+          import androidx.compose.material.icons.outlined.ScreenLockRotation
+          import androidx.compose.material.icons.outlined.ScreenRotation
+          import androidx.compose.material.icons.outlined.Settings
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.CenterAlignedTopAppBar
+          import androidx.compose.material3.CircularProgressIndicator
+          import androidx.compose.material3.DropdownMenu
+          import androidx.compose.material3.DropdownMenuItem
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.NavigationBar
+          import androidx.compose.material3.NavigationBarItem
+          import androidx.compose.material3.NavigationBarItemDefaults
+          import androidx.compose.material3.NavigationRail
+          import androidx.compose.material3.NavigationRailItem
+          import androidx.compose.material3.NavigationRailItemDefaults
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.SnackbarHost
+          import androidx.compose.material3.SnackbarHostState
+          import androidx.compose.material3.ScaffoldDefaults
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TopAppBarDefaults
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.DisposableEffect
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.drawBehind
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalLifecycleOwner
+          import androidx.compose.ui.platform.LocalView
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import androidx.lifecycle.Lifecycle
+          import androidx.lifecycle.LifecycleEventObserver
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import androidx.navigation.compose.NavHost
+          import androidx.navigation.compose.composable
+          import androidx.navigation.compose.currentBackStackEntryAsState
+          import androidx.navigation.compose.rememberNavController
+          import androidx.core.content.FileProvider
+          import app.gridfix.android.coords.Coordinates
+          import app.gridfix.android.BuildConfig
+          import app.gridfix.android.billing.BillingManager
+          import app.gridfix.android.data.AppSettings
+          import app.gridfix.android.data.Backup
+          import app.gridfix.android.data.CourseRepository
+          import app.gridfix.android.data.CourseResult
+          import app.gridfix.android.data.DataPackage
+          import app.gridfix.android.data.DEFAULT_FOLDER
+          import app.gridfix.android.data.GeoVertex
+          import app.gridfix.android.data.GraphicsRepository
+          import app.gridfix.android.data.simplifyTrack
+          import app.gridfix.android.data.InterchangeFiles
+          import app.gridfix.android.data.KIND_UNIT
+          import app.gridfix.android.data.SettingsRepository
+          import app.gridfix.android.data.TrackRepository
+          import app.gridfix.android.data.WaypointDraft
+          import app.gridfix.android.data.WaypointRepository
+          import app.gridfix.android.location.Declination
+          import app.gridfix.android.location.TrackRecorderService
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.flow.first
+          import kotlinx.coroutines.withContext
+          import org.osmdroid.util.GeoPoint
+          import kotlin.random.Random
+          import java.io.File
+          import app.gridfix.android.location.LocationTracker
+          import app.gridfix.android.ui.screens.MapScreen
+          import app.gridfix.android.ui.screens.NavigateScreen
+          import app.gridfix.android.ui.screens.PositionScreen
+          import app.gridfix.android.ui.screens.ReferenceScreen
+          import app.gridfix.android.ui.screens.SettingsScreen
+          import app.gridfix.android.ui.screens.WaypointsScreen
+          import app.gridfix.android.ui.theme.GridFixTheme
+          import app.gridfix.android.ui.theme.LabelFamily
+          import kotlinx.coroutines.launch
+
+          private data class NavItem(val route: String, val label: String, val icon: ImageVector)
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun GridFixApp() {
+              val context = LocalContext.current
+              val repo = remember { SettingsRepository(context.applicationContext) }
+              val settings by repo.settings.collectAsStateWithLifecycle(initialValue = AppSettings())
+              val billing = remember { BillingManager(context.applicationContext) }
+              val entitlement by billing.state.collectAsStateWithLifecycle()
+              var paywallPreview by remember { mutableStateOf(false) }
+              val lifecycleOwner = LocalLifecycleOwner.current
+              DisposableEffect(lifecycleOwner) {
+                  billing.start()
+                  // Re-check on every return to the foreground: purchases made in the Play
+                  // Store app, pending purchases completing, and lapsed subscriptions.
+                  val observer = LifecycleEventObserver { _, event ->
+                      if (event == Lifecycle.Event.ON_RESUME) billing.refresh()
+                  }
+                  lifecycleOwner.lifecycle.addObserver(observer)
+                  onDispose {
+                      lifecycleOwner.lifecycle.removeObserver(observer)
+                      billing.close()
+                  }
+              }
+              val waypointRepo = remember { WaypointRepository(context.applicationContext) }
+              val waypoints by waypointRepo.waypoints.collectAsStateWithLifecycle(initialValue = emptyList())
+              val selectedId by waypointRepo.selectedId.collectAsStateWithLifecycle(initialValue = null)
+              val folders by waypointRepo.folders.collectAsStateWithLifecycle(initialValue = emptyList())
+              val graphicsRepo = remember { GraphicsRepository(context.applicationContext) }
+              val graphics by graphicsRepo.graphics.collectAsStateWithLifecycle(initialValue = emptyList())
+              val trackRepo = remember { TrackRepository(context.applicationContext) }
+              val tracks by trackRepo.tracks.collectAsStateWithLifecycle(initialValue = emptyList())
+              var viewedTrackId by remember { mutableStateOf<String?>(null) }
+              var mapFocus by remember { mutableStateOf<Pair<Double, Double>?>(null) }
+              val courseRepo = remember { CourseRepository(context.applicationContext) }
+              val activeCourse by courseRepo.active.collectAsStateWithLifecycle(initialValue = null)
+              val courseHistory by courseRepo.history.collectAsStateWithLifecycle(initialValue = emptyList())
+              var courseOpen by remember { mutableStateOf(false) }
+              var courseSummary by remember { mutableStateOf<CourseResult?>(null) }
+              var summaryPending by remember { mutableStateOf(false) }
+
+              // Automatic names: "Armor Brigade 1" for units, "Support by fire 1" for task symbols
+              val unitNameFor: (String, String) -> String = { symbol, echelon ->
+                  if (WaypointSymbols.isTask(symbol)) {
+                      val base = WaypointSymbols.taskLabel(symbol)
+                      "$base ${waypoints.count { it.name.startsWith(base) } + 1}"
+                  } else {
+                      val func = NatoSymbols.functionLabel(symbol)
+                      val ech = if (echelon.isEmpty()) "" else " " + Echelons.label(echelon)
+                      val base = (func + ech).trim()
+                      val n = waypoints.count { it.kind == KIND_UNIT && it.name.startsWith(base) } + 1
+                      "$base $n"
+                  }
+              }
+
+              // Waypoints in visible ("active") overlays are the ones offered for navigation
+              val navigableWaypoints = if (folders.isEmpty()) waypoints else {
+                  val visibleNames = folders.filter { it.visible }.map { it.name }.toSet()
+                  waypoints.filter { it.folder in visibleNames }
+              }
+              val scope = rememberCoroutineScope()
+              val recordGate = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+
+              // The app had no way to tell the operator that anything had failed. A
+              // recording that silently does not start is the worst version of that:
+              // the button responds, nothing records, and the patrol is not on the map.
+              val snackbarHostState = remember { SnackbarHostState() }
+
+              /**
+               * Start recording, and say so when it does not work.
+               *
+               * [silentNotifications] is true when POST_NOTIFICATIONS was refused. The
+               * service still runs — the permission only controls whether its
+               * notification is visible — but an operator who cannot see the recording
+               * in the shade also cannot stop it from there, and should be told rather
+               * than left to discover it.
+               */
+              val startRecording: (Boolean) -> Unit = { silentNotifications ->
+                  if (recordGate.compareAndSet(false, true)) {
+                      scope.launch {
+                          val id = trackRepo.startTrack(System.currentTimeMillis())
+                          val started = runCatching {
+                              TrackRecorderService.start(context.applicationContext, id)
+                          }.isSuccess
+                          recordGate.set(false)
+                          if (!started) {
+                              // Android 12+ refuses a foreground service started from the
+                              // background. The track row is thrown away so the list does
+                              // not fill with empty recordings.
+                              trackRepo.discard(id)
+                              snackbarHostState.showSnackbar(
+                                  "Could not start recording. Open MGRS GPS and try again."
+                              )
+                          } else if (silentNotifications) {
+                              snackbarHostState.showSnackbar(
+                                  "Recording. Notifications are off, so it will not show " +
+                                      "in the shade and cannot be stopped from there."
+                              )
+                          }
+                      }
+                  }
+              }
+
+              val notificationLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { granted -> startRecording(!granted) }
+
+              // Ask before starting, not after: on Android 13+ a foreground service
+              // whose notification is suppressed is a recording with no visible sign
+              // that it is running.
+              val beginRecording = {
+                  val needsNotifications = Build.VERSION.SDK_INT >= 33 &&
+                      ContextCompat.checkSelfPermission(
+                          context, Manifest.permission.POST_NOTIFICATIONS,
+                      ) != PackageManager.PERMISSION_GRANTED
+                  if (needsNotifications) {
+                      notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                  } else {
+                      startRecording(false)
+                  }
+              }
+
+              // Location permission + shared tracker, hoisted so every screen can use the fix
+              var hasPermission by remember {
+                  mutableStateOf(
+                      ContextCompat.checkSelfPermission(
+                          context, Manifest.permission.ACCESS_FINE_LOCATION
+                      ) == PackageManager.PERMISSION_GRANTED
+                  )
+              }
+              // "Approximate" (coarse-only) is not enough for a GPS grid readout: the GPS
+              // provider refuses it. Only a precise grant counts; coarse-only gets a hint.
+              var approximateOnly by remember { mutableStateOf(false) }
+              val permissionLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.RequestMultiplePermissions()
+              ) { result ->
+                  hasPermission = result[Manifest.permission.ACCESS_FINE_LOCATION] == true
+                  approximateOnly = !hasPermission &&
+                      result[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+              }
+              val requestPermission = {
+                  permissionLauncher.launch(
+                      arrayOf(
+                          Manifest.permission.ACCESS_FINE_LOCATION,
+                          Manifest.permission.ACCESS_COARSE_LOCATION,
+                      )
+                  )
+              }
+              val tracker = remember { LocationTracker(context.applicationContext) }
+              LaunchedEffect(Unit) {
+                  runCatching { trackRepo.finalizeOrphans(TrackRecorderService.active.value?.trackId) }
+              }
+              DisposableEffect(hasPermission) {
+                  if (hasPermission) tracker.start()
+                  onDispose { tracker.stop() }
+              }
+              val fix by tracker.fix.collectAsStateWithLifecycle()
+
+              val navController = rememberNavController()
+              val backStackEntry by navController.currentBackStackEntryAsState()
+              val currentRoute = backStackEntry?.destination?.route
+
+              val view = LocalView.current
+              DisposableEffect(settings.keepScreenOn) {
+                  view.keepScreenOn = settings.keepScreenOn
+                  onDispose { view.keepScreenOn = false }
+              }
+
+              // Orientation lock: a phone worn sideways on armour stays sideways whatever
+              // the phone's own auto-rotate says. The activity handles the config change
+              // itself (manifest configChanges), so nothing is recreated.
+              LaunchedEffect(settings.orientation) {
+                  context.hostActivity()?.requestedOrientation = ScreenOrientation.toActivityInfo(settings.orientation)
+              }
+              val landscape = isLandscape()
+
+              // A viewed track in a hidden folder would draw nothing: gate the id once, for
+              // the map and the list alike, and un-hide the folder when a track is viewed.
+              val shownTrackId = viewedTrackId?.takeIf { id ->
+                  val f = tracks.firstOrNull { it.id == id }?.folder
+                  f == null || folders.firstOrNull { it.name == f }?.visible != false
+              }
+
+              val items = listOf(
+                  NavItem("position", "Position", Icons.Outlined.MyLocation),
+                  NavItem("navigate", "Navigate", Icons.Outlined.Explore),
+                  NavItem("map", "Map", Icons.Outlined.Map),
+                  NavItem("waypoints", "Waypoints", Icons.Outlined.Flag),
               )
 
-              /** Lat/lon (WGS84) to MGRS at the requested precision (4/6/8/10 digits). */
-              fun mgrs(lat: Double, lon: Double, digits: Int): MgrsParts? = runCatching {
-                  val mgrs = MGRS.from(Point.point(lon, lat))
-                  val gridType = when (digits) {
-                      4 -> GridType.KILOMETER
-                      6 -> GridType.HUNDRED_METER
-                      8 -> GridType.TEN_METER
-                      else -> GridType.METER
-                  }
-                  // The library formats with the device locale; Arabic/Persian/Bengali phones
-                  // would get native digits, which nothing downstream can read. Force ASCII.
-                  val full = asciiDigits(mgrs.coordinate(gridType)).uppercase(Locale.US)
-                  val match = Regex("^([0-9]{1,2}[A-Z])([A-Z]{2})([0-9]*)$").find(full)
-                  if (match != null) {
-                      val (gzd, square, num) = match.destructured
-                      val half = num.length / 2
-                      val e = num.substring(0, half)
-                      val n = num.substring(half)
-                      // Canonical written form keeps the group breaks: "18T VP 3808 9755"
-                      val spaced = if (num.isEmpty()) "$gzd $square" else "$gzd $square $e $n"
-                      MgrsParts(gzd, square, e, n, spaced)
-                  } else {
-                      // Polar regions (no zone number) or unexpected shape: show as-is
-                      MgrsParts(full, "", "", "", full)
-                  }
-              }.getOrNull()
-
-              private fun asciiDigits(s: String): String = buildString(s.length) {
-                  for (c in s) {
-                      val d = Character.digit(c, 10)
-                      append(if (d in 0..9) '0' + d else c)
+              fun goTo(route: String) {
+                  navController.navigate(route) {
+                      popUpTo(navController.graph.startDestinationId) { saveState = true }
+                      launchSingleTop = true
+                      restoreState = true
                   }
               }
 
-              data class UtmCoord(val zone: Int, val hemisphere: Char, val easting: Long, val northing: Long)
-
-              /** Lat/lon (WGS84) to standard UTM. Valid for lat -80..84. */
-              fun utm(lat: Double, lon: Double): UtmCoord? {
-                  if (lat < -80.0 || lat > 84.0) return null
-
-                  val zone = utmZone(lat, lon)
-
-                  val a = 6378137.0
-                  val f = 1.0 / 298.257223563
-                  val k0 = 0.9996
-                  val e2 = f * (2.0 - f)
-                  val ep2 = e2 / (1.0 - e2)
-
-                  val latRad = Math.toRadians(lat)
-                  val lonOrigin = Math.toRadians(((zone - 1) * 6 - 180 + 3).toDouble())
-                  val lonRad = Math.toRadians(lon)
-
-                  val n = a / sqrt(1.0 - e2 * sin(latRad).pow(2))
-                  val t = tan(latRad).pow(2)
-                  val c = ep2 * cos(latRad).pow(2)
-                  val bigA = cos(latRad) * (lonRad - lonOrigin)
-
-                  val m = a * (
-                      (1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0) * latRad -
-                          (3.0 * e2 / 8.0 + 3.0 * e2 * e2 / 32.0 + 45.0 * e2 * e2 * e2 / 1024.0) * sin(2.0 * latRad) +
-                          (15.0 * e2 * e2 / 256.0 + 45.0 * e2 * e2 * e2 / 1024.0) * sin(4.0 * latRad) -
-                          (35.0 * e2 * e2 * e2 / 3072.0) * sin(6.0 * latRad)
-                      )
-
-                  val easting = k0 * n * (
-                      bigA + (1.0 - t + c) * bigA.pow(3) / 6.0 +
-                          (5.0 - 18.0 * t + t * t + 72.0 * c - 58.0 * ep2) * bigA.pow(5) / 120.0
-                      ) + 500000.0
-
-                  var northing = k0 * (
-                      m + n * tan(latRad) * (
-                          bigA.pow(2) / 2.0 +
-                              (5.0 - t + 9.0 * c + 4.0 * c * c) * bigA.pow(4) / 24.0 +
-                              (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * ep2) * bigA.pow(6) / 720.0
-                          )
-                      )
-                  if (lat < 0) northing += 10000000.0
-
-                  return UtmCoord(
-                      zone = zone,
-                      hemisphere = if (lat >= 0) 'N' else 'S',
-                      easting = easting.roundToLong(),
-                      northing = northing.roundToLong(),
-                  )
+              // Wait for the stored settings before deciding anything from them, so an
+              // existing user never sees the first-run screen flash past on launch.
+              var settingsLoaded by remember { mutableStateOf(false) }
+              LaunchedEffect(Unit) {
+                  runCatching { repo.settings.first() }
+                  settingsLoaded = true
               }
 
-              fun formatUtm(u: UtmCoord?): String =
-                  if (u == null) "—" else "${u.zone}${u.hemisphere} ${u.easting}E ${u.northing}N"
-
-              /** Lat/lon in the chosen format: 0 = DD, 1 = DDM, 2 = DMS. */
-              fun formatLatLon(lat: Double, lon: Double, format: Int): String {
-                  fun one(value: Double, positive: Char, negative: Char): String {
-                      val hemi = if (value >= 0) positive else negative
-                      val v = abs(value)
-                      return when (format) {
-                          0 -> String.format(Locale.US, "%.5f° %c", v, hemi)
-                          2 -> {
-                              // work in tenths of arc-seconds so carries propagate cleanly
-                              val tenths = (v * 36000.0).roundToLong()
-                              val d = tenths / 36000
-                              val mm = (tenths % 36000) / 600
-                              val s = (tenths % 600) / 10.0
-                              String.format(Locale.US, "%d° %02d' %04.1f\" %c", d, mm, s, hemi)
-                          }
-                          else -> {
-                              // work in thousandths of minutes
-                              val milli = (v * 60000.0).roundToLong()
-                              val d = milli / 60000
-                              val mFull = (milli % 60000) / 1000.0
-                              String.format(Locale.US, "%d° %06.3f' %c", d, mFull, hemi)
-                          }
-                      }
-                  }
-                  return one(lat, 'N', 'S') + "   " + one(lon, 'E', 'W')
-              }
-
-              /** Military date-time group in Zulu, e.g. 241435Z AUG 26 */
-              fun dtg(timeMillis: Long): String {
-                  val sdf = SimpleDateFormat("ddHHmm'Z' MMM yy", Locale.US)
-                  sdf.timeZone = TimeZone.getTimeZone("UTC")
-                  return sdf.format(Date(timeMillis)).uppercase(Locale.US)
-              }
-
-              fun formatAltitude(meters: Double, units: Int): String = when (units) {
-                  1 -> "${(meters * 3.28084).roundToLong()} ft"
-                  else -> "${meters.roundToLong()} m"
-              }
-
-              fun formatAccuracy(meters: Float, units: Int): String = when (units) {
-                  1 -> "±${(meters * 3.28084).roundToLong()} ft"
-                  else -> "±${meters.roundToLong()} m"
-              }
-
-              fun formatSpeed(metersPerSecond: Float, units: Int): String = when (units) {
-                  1 -> String.format(Locale.US, "%.1f mph", metersPerSecond * 2.23694)
-                  2 -> String.format(Locale.US, "%.1f kn", metersPerSecond * 1.94384)
-                  else -> String.format(Locale.US, "%.1f km/h", metersPerSecond * 3.6)
-              }
-
-              private fun utmZone(lat: Double, lon: Double): Int {
-                  var zone = (floor((lon + 180.0) / 6.0) + 1.0).toInt().coerceIn(1, 60)
-                  // Norway exception
-                  if (lat in 56.0..64.0 && lon in 3.0..12.0) zone = 32
-                  // Svalbard exceptions
-                  if (lat in 72.0..84.0) {
-                      zone = when {
-                          lon in 0.0..9.0 -> 31
-                          lon in 9.0..21.0 -> 33
-                          lon in 21.0..33.0 -> 35
-                          lon in 33.0..42.0 -> 37
-                          else -> zone
-                      }
-                  }
-                  return zone
-              }
-
-              /** Grid convergence angle (degrees): grid north minus true north for this UTM zone. */
-              fun gridConvergence(lat: Double, lon: Double): Double {
-                  val zone = utmZone(lat, lon)
-                  val lonOrigin = ((zone - 1) * 6 - 180 + 3).toDouble()
-                  return Math.toDegrees(
-                      atan(tan(Math.toRadians(lon - lonOrigin)) * sin(Math.toRadians(lat)))
-                  )
-              }
-
-              private fun gridConvergenceForZone(lat: Double, lon: Double, zone: Int): Double {
-                  val lonOrigin = ((zone - 1) * 6 - 180 + 3).toDouble()
-                  return Math.toDegrees(
-                      atan(tan(Math.toRadians(lon - lonOrigin)) * sin(Math.toRadians(lat)))
-                  )
-              }
-
-              /** Result of a two-ray fix: the intersection plus the range from each observer. */
-              data class RayFix(val lat: Double, val lon: Double, val dist1: Double, val dist2: Double)
-
-              /**
-               * Intersection of two rays given in TRUE bearings, solved in the UTM plane of
-               * the first point's zone (grid bearings via per-point convergence). Null when
-               * the rays are near-parallel, diverge, or the fix lands beyond 100 km — the
-               * cases a map-reading instructor would also reject.
-               */
-              fun rayIntersection(
-                  lat1: Double, lon1: Double, bearing1True: Double,
-                  lat2: Double, lon2: Double, bearing2True: Double,
-              ): RayFix? {
-                  val zone = utmZone(lat1, lon1)
-                  val north = lat1 >= 0
-                  val p1 = utmForZone(lat1, lon1, zone, north)
-                  val p2 = utmForZone(lat2, lon2, zone, north)
-                  val g1 = Math.toRadians(bearing1True - gridConvergenceForZone(lat1, lon1, zone))
-                  val g2 = Math.toRadians(bearing2True - gridConvergenceForZone(lat2, lon2, zone))
-                  val d1x = sin(g1)
-                  val d1y = cos(g1)
-                  val d2x = sin(g2)
-                  val d2y = cos(g2)
-                  val cross = d1x * d2y - d1y * d2x
-                  if (abs(cross) < 1e-6) return null
-                  val dx = p2[0] - p1[0]
-                  val dy = p2[1] - p1[1]
-                  val t = (dx * d2y - dy * d2x) / cross
-                  val s = (dx * d1y - dy * d1x) / cross
-                  if (t <= 0.0 || s <= 0.0 || t > 100_000.0 || s > 100_000.0) return null
-                  val ll = utmInverse(p1[0] + t * d1x, p1[1] + t * d1y, zone, north)
-                  return RayFix(ll[0], ll[1], t, s)
-              }
-
-              data class NavInfo(val distanceMeters: Float, val bearingTrue: Float)
-
-              /**
-               * Geodesic distance and initial true bearing between two points.
-               *
-               * Was `android.location.Location.distanceBetween`. That is Vincenty on
-               * WGS84 and so is [Geodesy], to well under a millimetre — GoldenTest holds
-               * both to the same vectors. The reason for the swap is that the framework
-               * call is stubbed out in JVM unit tests, so every distance the app shows
-               * was untestable in CI; and the iOS port needs the identical numbers.
-               */
-              fun navInfo(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double): NavInfo {
-                  val d = Geodesy.distanceAndBearing(fromLat, fromLon, toLat, toLon)
-                  return NavInfo(d[0].toFloat(), (((d[1] % 360.0) + 360.0) % 360.0).toFloat())
-              }
-
-              fun formatDistance(meters: Float, units: Int): String = when (units) {
-                  1 -> {
-                      val feet = meters * 3.28084f
-                      if (feet < 1000f) String.format(Locale.US, "%.0f ft", feet)
-                      else String.format(Locale.US, "%.2f mi", meters / 1609.344f)
-                  }
-                  2 -> {
-                      if (meters < 1852f) String.format(Locale.US, "%.0f m", meters)
-                      else String.format(Locale.US, "%.2f NM", meters / 1852f)
-                  }
-                  else -> {
-                      if (meters < 1000f) String.format(Locale.US, "%.0f m", meters)
-                      else if (meters < 10000f) String.format(Locale.US, "%.2f km", meters / 1000f)
-                      else String.format(Locale.US, "%.1f km", meters / 1000f)
-                  }
-              }
-
-              /** Format an angle in degrees (0..360) as degrees or NATO mils per the angle-unit setting. */
-              fun formatAngle(degrees: Float, angleUnit: Int): String = when (angleUnit) {
-                  1 -> {
-                      val mils = Math.round(degrees * 6400.0 / 360.0)
-                      String.format(Locale.US, "%d mils", ((mils % 6400) + 6400) % 6400)
-                  }
-                  else -> {
-                      val deg = Math.round(degrees.toDouble())
-                      String.format(Locale.US, "%03d°", ((deg % 360) + 360) % 360)
-                  }
-              }
-
-              /** Parse an MGRS string (spaces allowed, case-insensitive) to lat/lon. Null if invalid. */
-              fun parseMgrs(text: String): Pair<Double, Double>? = runCatching {
-                  val cleaned = asciiDigits(text.trim()).uppercase(Locale.US).replace(" ", "")
-                  if (cleaned.isEmpty()) return null
-                  val mgrs = MGRS.parse(cleaned)
-                  // The library lands on the SW corner of the designated cell. Aim at the
-                  // centre instead: a 6-digit grid means "somewhere in this 100 m square",
-                  // and re-formatting a corner point can fall into the neighbouring cell.
-                  val digits = cleaned.dropWhile { it.isDigit() }.drop(1).drop(2).count { it.isDigit() }
-                  val cell = if (digits == 0) 100000.0 else 10.0.pow(5 - digits / 2)
-                  val utm = mgrs.toUTM()
-                  val north = utm.hemisphere.toString().uppercase(Locale.US).startsWith("N")
-                  val ll = utmInverse(utm.easting + cell / 2.0, utm.northing + cell / 2.0, utm.zone, north)
-                  ll[0] to ll[1]
-              }.getOrNull()
-
-              /**
-               * Parse an MGRS string to the SW corner of its cell (no centre offset).
-               * Roadmap A (photo-map calibration): control points are grid LINE
-               * intersections = cell corners. Never use [parseMgrs] here — it aims at
-               * the cell centre and would bake a half-cell error into the homography.
-               */
-              fun parseMgrsCorner(text: String): Pair<Double, Double>? = runCatching {
-                  val cleaned = asciiDigits(text.trim()).uppercase(Locale.US).replace(" ", "")
-                  if (cleaned.isEmpty()) return null
-                  val mgrs = MGRS.parse(cleaned)
-                  val utm = mgrs.toUTM()
-                  val north = utm.hemisphere.toString().uppercase(Locale.US).startsWith("N")
-                  val ll = utmInverse(utm.easting, utm.northing, utm.zone, north)
-                  ll[0] to ll[1]
-              }.getOrNull()
-
-              /**
-               * Scale a typed grid line number to 5 digits ("45" -> 45000).
-               * Control-point entry takes 2-5 digits per roadmap A; null otherwise.
-               * Pure — shared with iOS calibration screen verbatim.
-               */
-              fun scaleGridLineNumber(raw: String): Double? {
-                  val digits = raw.filter { it.isDigit() }
-                  if (digits.length !in 2..5 || digits.length != raw.trim().length) return null
-                  return (digits + "0".repeat(5 - digits.length)).toDoubleOrNull()
-              }
-
-              // ---- Grid-overlay math: forced-zone UTM forward and the Snyder-series inverse ----
-              // Validated by roundtrip against the forward formulas above: < 1 mm error worldwide,
-              // < 7 mm out to 4.5 degrees from the central meridian (grid lines never go further).
-
-              /** UTM easting/northing of a point projected in a SPECIFIC zone (for grid drawing). */
-              fun utmForZone(lat: Double, lon: Double, zone: Int, north: Boolean): DoubleArray {
-                  val latRad = Math.toRadians(lat)
-                  val lonOrigin = Math.toRadians(((zone - 1) * 6 - 180 + 3).toDouble())
-                  val lonRad = Math.toRadians(lon)
-                  val a = 6378137.0
-                  val f = 1.0 / 298.257223563
-                  val k0 = 0.9996
-                  val e2 = f * (2.0 - f)
-                  val ep2 = e2 / (1.0 - e2)
-                  val n = a / sqrt(1.0 - e2 * sin(latRad).pow(2))
-                  val t = tan(latRad).pow(2)
-                  val c = ep2 * cos(latRad).pow(2)
-                  val bigA = cos(latRad) * (lonRad - lonOrigin)
-                  val m = a * (
-                      (1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0) * latRad -
-                          (3.0 * e2 / 8.0 + 3.0 * e2 * e2 / 32.0 + 45.0 * e2 * e2 * e2 / 1024.0) * sin(2.0 * latRad) +
-                          (15.0 * e2 * e2 / 256.0 + 45.0 * e2 * e2 * e2 / 1024.0) * sin(4.0 * latRad) -
-                          (35.0 * e2 * e2 * e2 / 3072.0) * sin(6.0 * latRad)
-                      )
-                  val easting = k0 * n * (
-                      bigA + (1.0 - t + c) * bigA.pow(3) / 6.0 +
-                          (5.0 - 18.0 * t + t * t + 72.0 * c - 58.0 * ep2) * bigA.pow(5) / 120.0
-                      ) + 500000.0
-                  var northing = k0 * (
-                      m + n * tan(latRad) * (
-                          bigA.pow(2) / 2.0 +
-                              (5.0 - t + 9.0 * c + 4.0 * c * c) * bigA.pow(4) / 24.0 +
-                              (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * ep2) * bigA.pow(6) / 720.0
-                          )
-                      )
-                  if (!north) northing += 10000000.0
-                  return doubleArrayOf(easting, northing)
-              }
-
-              /** UTM easting/northing back to lat/lon (WGS84). Returns [lat, lon]. */
-              fun utmInverse(easting: Double, northing: Double, zone: Int, north: Boolean): DoubleArray {
-                  val a = 6378137.0
-                  val f = 1.0 / 298.257223563
-                  val k0 = 0.9996
-                  val e2 = f * (2.0 - f)
-                  val ep2 = e2 / (1.0 - e2)
-                  val x = easting - 500000.0
-                  val y = if (north) northing else northing - 10000000.0
-                  val m = y / k0
-                  val mu = m / (a * (1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0))
-                  val e1 = (1.0 - sqrt(1.0 - e2)) / (1.0 + sqrt(1.0 - e2))
-                  val phi1 = mu +
-                      (3.0 * e1 / 2.0 - 27.0 * e1 * e1 * e1 / 32.0) * sin(2.0 * mu) +
-                      (21.0 * e1 * e1 / 16.0 - 55.0 * e1.pow(4) / 32.0) * sin(4.0 * mu) +
-                      (151.0 * e1 * e1 * e1 / 96.0) * sin(6.0 * mu) +
-                      (1097.0 * e1.pow(4) / 512.0) * sin(8.0 * mu)
-                  val sin1 = sin(phi1)
-                  val cos1 = cos(phi1)
-                  val tan1 = tan(phi1)
-                  val c1 = ep2 * cos1 * cos1
-                  val t1 = tan1 * tan1
-                  val n1 = a / sqrt(1.0 - e2 * sin1 * sin1)
-                  val r1 = a * (1.0 - e2) / (1.0 - e2 * sin1 * sin1).pow(1.5)
-                  val d = x / (n1 * k0)
-                  val lat = phi1 - (n1 * tan1 / r1) * (
-                      d * d / 2.0 -
-                          (5.0 + 3.0 * t1 + 10.0 * c1 - 4.0 * c1 * c1 - 9.0 * ep2) * d.pow(4) / 24.0 +
-                          (61.0 + 90.0 * t1 + 298.0 * c1 + 45.0 * t1 * t1 - 252.0 * ep2 - 3.0 * c1 * c1) * d.pow(6) / 720.0
-                      )
-                  val lonOrigin = Math.toRadians(((zone - 1) * 6 - 180 + 3).toDouble())
-                  val lon = lonOrigin + (
-                      d -
-                          (1.0 + 2.0 * t1 + c1) * d.pow(3) / 6.0 +
-                          (5.0 - 2.0 * c1 + 28.0 * t1 - 3.0 * c1 * c1 + 8.0 * ep2 + 24.0 * t1 * t1) * d.pow(5) / 120.0
-                      ) / cos1
-                  return doubleArrayOf(Math.toDegrees(lat), Math.toDegrees(lon))
-              }
-
-              /** MGRS latitude band letter for a latitude in -80..84, e.g. 'R' for Dubai. */
-              fun bandLetter(lat: Double): Char {
-                  val letters = "CDEFGHJKLMNPQRSTUVWX"
-                  val idx = floor((lat + 80.0) / 8.0).toInt().coerceIn(0, 19)
-                  return letters[idx]
-              }
-          }
-          EOF_GRIDFIX
-          mkdir -p 'app/src/main/java/app/gridfix/android/coords'
-          cat > 'app/src/main/java/app/gridfix/android/coords/Geodesy.kt' <<'EOF_GRIDFIX'
-          package app.gridfix.android.coords
-
-          import kotlin.math.PI
-          import kotlin.math.abs
-          import kotlin.math.atan
-          import kotlin.math.atan2
-          import kotlin.math.cos
-          import kotlin.math.sin
-          import kotlin.math.sqrt
-          import kotlin.math.tan
-
-          /**
-           * Distance and bearing on the WGS84 ellipsoid — Vincenty's inverse formula.
-           *
-           * This is the same algorithm `android.location.Location.distanceBetween` runs,
-           * so replacing that call with this one moves no number the app displays: the
-           * two agree to well under a millimetre, which [GoldenTest] proves against
-           * vectors that also ship to the iOS port.
-           *
-           * Two reasons it is written out here rather than called from the framework:
-           *
-           *  - `Location.distanceBetween` is stubbed to a no-op in JVM unit tests, so
-           *    every distance the app computes — course scoring, the arrival alert,
-           *    route-card legs, pace counts, strip maps — was untestable in CI.
-           *  - iOS needs the identical numbers. Two phones in one patrol reporting
-           *    different ranges to the same point is the failure this prevents.
-           *
-           * A great-circle shortcut would be 0.3 to 0.5 % off — centimetres at the 25 m
-           * course ring, but tens of metres on a long leg — so it is used only as the
-           * fallback for the near-antipodal case that never converges, and which land
-           * navigation never reaches.
-           *
-           * Pure Kotlin, no Android imports: this file moves to `:core` verbatim.
-           */
-          object Geodesy {
-
-              private const val A = 6378137.0
-              private const val F = 1.0 / 298.257223563
-              private const val B = A * (1.0 - F)
-              private const val MEAN_RADIUS = 6371008.8
-
-              /**
-               * Geodesic distance in metres and initial bearing in degrees from true
-               * north, returned as [distance, bearing]. The bearing is NOT normalised —
-               * [Coordinates.navInfo] wraps it into 0..<360 on the way to the readout.
-               */
-              fun distanceAndBearing(
-                  fromLat: Double, fromLon: Double, toLat: Double, toLon: Double,
-              ): DoubleArray {
-                  if (fromLat == toLat && fromLon == toLon) return doubleArrayOf(0.0, 0.0)
-
-                  val l = (toLon - fromLon) * PI / 180.0
-                  val u1 = atan((1.0 - F) * tan(fromLat * PI / 180.0))
-                  val u2 = atan((1.0 - F) * tan(toLat * PI / 180.0))
-                  val sinU1 = sin(u1); val cosU1 = cos(u1)
-                  val sinU2 = sin(u2); val cosU2 = cos(u2)
-
-                  var lambda = l
-                  var sinSigma = 0.0
-                  var cosSigma = 0.0
-                  var sigma = 0.0
-                  var cosSqAlpha = 0.0
-                  var cos2SigmaM = 0.0
-                  var converged = false
-
-                  for (iteration in 0 until 200) {
-                      val sinLambda = sin(lambda)
-                      val cosLambda = cos(lambda)
-                      val p = cosU2 * sinLambda
-                      val q = cosU1 * sinU2 - sinU1 * cosU2 * cosLambda
-                      sinSigma = sqrt(p * p + q * q)
-                      if (sinSigma == 0.0) return doubleArrayOf(0.0, 0.0)
-                      cosSigma = sinU1 * sinU2 + cosU1 * cosU2 * cosLambda
-                      sigma = atan2(sinSigma, cosSigma)
-                      val sinAlpha = cosU1 * cosU2 * sinLambda / sinSigma
-                      cosSqAlpha = 1.0 - sinAlpha * sinAlpha
-                      cos2SigmaM =
-                          if (cosSqAlpha == 0.0) 0.0 else cosSigma - 2.0 * sinU1 * sinU2 / cosSqAlpha
-                      val c = F / 16.0 * cosSqAlpha * (4.0 + F * (4.0 - 3.0 * cosSqAlpha))
-                      val previous = lambda
-                      lambda = l + (1.0 - c) * F * sinAlpha *
-                          (sigma + c * sinSigma *
-                              (cos2SigmaM + c * cosSigma * (-1.0 + 2.0 * cos2SigmaM * cos2SigmaM)))
-                      if (abs(lambda - previous) < 1e-12) {
-                          converged = true
-                          break
-                      }
+              GridFixTheme(nightMode = settings.nightMode) {
+                  // What a phone GPS is and is not, once, before anything else.
+                  if (settingsLoaded && !settings.disclaimerAccepted) {
+                      DisclaimerScreen(onAccept = { scope.launch { repo.setDisclaimerAccepted(true) } })
+                      return@GridFixTheme
                   }
 
-                  if (!converged) {
-                      return doubleArrayOf(
-                          greatCircleMeters(fromLat, fromLon, toLat, toLon),
-                          greatCircleBearing(fromLat, fromLon, toLat, toLon),
-                      )
+                  // Subscription gate. Debug builds (sideloaded field-test APKs) always
+                  // run unlocked; the Play release build requires GridFix Pro.
+                  if (paywallPreview) {
+                      PaywallScreen(billing, onClose = { paywallPreview = false })
+                      return@GridFixTheme
                   }
-
-                  val uSq = cosSqAlpha * (A * A - B * B) / (B * B)
-                  val bigA = 1.0 + uSq / 16384.0 * (4096.0 + uSq * (-768.0 + uSq * (320.0 - 175.0 * uSq)))
-                  val bigB = uSq / 1024.0 * (256.0 + uSq * (-128.0 + uSq * (74.0 - 47.0 * uSq)))
-                  val deltaSigma = bigB * sinSigma * (
-                      cos2SigmaM + bigB / 4.0 * (
-                          cosSigma * (-1.0 + 2.0 * cos2SigmaM * cos2SigmaM) -
-                              bigB / 6.0 * cos2SigmaM * (-3.0 + 4.0 * sinSigma * sinSigma) *
-                              (-3.0 + 4.0 * cos2SigmaM * cos2SigmaM)
-                          )
-                      )
-                  val s = B * bigA * (sigma - deltaSigma)
-
-                  val sinLambda = sin(lambda)
-                  val cosLambda = cos(lambda)
-                  val alpha1 = atan2(cosU2 * sinLambda, cosU1 * sinU2 - sinU1 * cosU2 * cosLambda)
-                  return doubleArrayOf(s, alpha1 * 180.0 / PI)
-              }
-
-              /**
-               * Great-circle distance on a sphere of the WGS84 mean radius. Half a percent
-               * off the ellipsoid, so it is only for the non-convergent fallback and for
-               * cheap proximity sorting where that does not matter.
-               */
-              fun greatCircleMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-                  val p1 = lat1 * PI / 180.0
-                  val p2 = lat2 * PI / 180.0
-                  val dp = p2 - p1
-                  val dl = (lon2 - lon1) * PI / 180.0
-                  val h = sin(dp / 2) * sin(dp / 2) + cos(p1) * cos(p2) * sin(dl / 2) * sin(dl / 2)
-                  return 2.0 * MEAN_RADIUS * atan2(sqrt(h), sqrt((1.0 - h).coerceAtLeast(0.0)))
-              }
-
-              fun greatCircleBearing(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-                  val p1 = lat1 * PI / 180.0
-                  val p2 = lat2 * PI / 180.0
-                  val dl = (lon2 - lon1) * PI / 180.0
-                  val y = sin(dl) * cos(p2)
-                  val x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl)
-                  return (atan2(y, x) * 180.0 / PI + 360.0) % 360.0
-              }
-          }
-          EOF_GRIDFIX
-          mkdir -p 'app/src/main/java/app/gridfix/android/data'
-          cat > 'app/src/main/java/app/gridfix/android/data/TrackRepository.kt' <<'EOF_GRIDFIX'
-          package app.gridfix.android.data
-
-          import android.content.Context
-          import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
-          import androidx.datastore.preferences.core.edit
-          import androidx.datastore.preferences.core.emptyPreferences
-          import androidx.datastore.preferences.core.stringPreferencesKey
-          import androidx.datastore.preferences.preferencesDataStore
-          import app.gridfix.android.coords.Geodesy
-          import kotlinx.coroutines.Dispatchers
-          import kotlinx.coroutines.flow.Flow
-          import kotlinx.coroutines.flow.first
-          import kotlinx.coroutines.flow.map
-          import kotlinx.coroutines.withContext
-          import org.json.JSONArray
-          import org.json.JSONObject
-          import java.io.File
-          import java.text.SimpleDateFormat
-          import java.util.Date
-          import java.util.Locale
-          import java.util.TimeZone
-          import java.util.UUID
-
-          private val Context.trackStore by preferencesDataStore(
-              name = "tracks",
-              corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
-          )
-
-          /** Track metadata; the point log lives in files/tracks/<id>.txt (one point per line). */
-          data class TrackInfo(
-              val id: String,
-              val name: String,
-              val startedAt: Long,
-              val endedAt: Long,        // 0 while recording
-              val distanceM: Double,
-              val pointCount: Int,
-              val folder: String = DEFAULT_FOLDER,   // overlay folder, shares the eye switch with waypoints and graphics
-          )
-
-          /**
-           * A logged fix. [alt] is metres above mean sea level, or [NO_ALTITUDE] when the
-           * receiver gave no height: writing a real number there would put the leg at sea
-           * level on every profile that reads it.
-           */
-          data class TrackPoint(val lat: Double, val lon: Double, val time: Long, val alt: Double)
-
-          /** "this fix had no altitude" — omitted from GPX rather than written as a height. */
-          const val NO_ALTITUDE = -32768.0
-
-          fun Double.hasAltitude(): Boolean = this > NO_ALTITUDE + 1.0
-
-          class TrackRepository(private val context: Context) {
-
-              private val listKey = stringPreferencesKey("list")
-
-              val tracks: Flow<List<TrackInfo>> = context.trackStore.data.map { p ->
-                  decode(p[listKey] ?: "[]").sortedByDescending { it.startedAt }
-              }
-
-              suspend fun startTrack(nowMillis: Long): String {
-                  val id = UUID.randomUUID().toString()
-                  val info = TrackInfo(
-                      id = id,
-                      name = "Track " + dtgShort(nowMillis),
-                      startedAt = nowMillis,
-                      endedAt = 0L,
-                      distanceM = 0.0,
-                      pointCount = 0,
-                  )
-                  withContext(Dispatchers.IO) { pointsFile(context, id).parentFile?.mkdirs() }
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]") + info)
-                  }
-                  return id
-              }
-
-              /** Close out a finished recording: compute stats from the point log. */
-              suspend fun finishTrack(id: String, name: String?, nowMillis: Long) {
-                  val pts = readPoints(context, id)
-                  var dist = 0.0
-                  for (i in 1 until pts.size) {
-                      dist += Geodesy.distanceAndBearing(
-                          pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon
-                      )[0]
-                  }
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(
-                          decode(p[listKey] ?: "[]").map {
-                              if (it.id == id) it.copy(
-                                  name = name?.trim()?.ifBlank { it.name } ?: it.name,
-                                  endedAt = nowMillis,
-                                  distanceM = dist,
-                                  pointCount = pts.size,
-                              ) else it
-                          }
-                      )
-                  }
-              }
-
-              /** Create a finished track from imported points (GPX trk import). */
-              suspend fun importTrack(name: String, points: List<TrackPoint>, nowMillis: Long): String {
-                  val id = UUID.randomUUID().toString()
-                  withContext(Dispatchers.IO) {
-                      val f = pointsFile(context, id)
-                      f.parentFile?.mkdirs()
-                      f.bufferedWriter().use { out ->
-                          for (p in points) {
-                              out.write(
-                                  String.format(Locale.US, "%.7f %.7f %d %.1f\n", p.lat, p.lon, p.time, p.alt)
-                              )
-                          }
-                      }
-                  }
-                  var dist = 0.0
-                  for (i in 1 until points.size) {
-                      dist += Geodesy.distanceAndBearing(
-                          points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon
-                      )[0]
-                  }
-                  val start = points.firstOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
-                  val end = points.lastOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
-                  val info = TrackInfo(
-                      id = id,
-                      name = name.trim().ifBlank { "Imported track" },
-                      startedAt = start,
-                      endedAt = end,
-                      distanceM = dist,
-                      pointCount = points.size,
-                  )
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]") + info)
-                  }
-                  return id
-              }
-
-              /** Restore one track from a backup, keeping its id; skipped when already present. */
-              suspend fun restore(info: TrackInfo, points: List<TrackPoint>): Boolean {
-                  var added = false
-                  context.trackStore.edit { p ->
-                      val current = decode(p[listKey] ?: "[]")
-                      if (current.none { it.id == info.id }) {
-                          val f = pointsFile(context, info.id)
-                          f.parentFile?.mkdirs()
-                          f.writeText(
-                              points.joinToString("") {
-                                  String.format(Locale.US, "%.7f %.7f %d %.1f\n", it.lat, it.lon, it.time, it.alt)
+                  if (!BuildConfig.DEBUG) {
+                      when (entitlement) {
+                          BillingManager.State.CHECKING -> {
+                              Box(
+                                  Modifier.fillMaxSize().safeDrawingPadding(),
+                                  contentAlignment = Alignment.Center,
+                              ) {
+                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                      CircularProgressIndicator()
+                                      Spacer(Modifier.height(12.dp))
+                                      Text(
+                                          "Checking your subscription…",
+                                          style = MaterialTheme.typography.bodySmall,
+                                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                      )
+                                  }
                               }
+                              return@GridFixTheme
+                          }
+                          BillingManager.State.LOCKED -> {
+                              PaywallScreen(billing)
+                              return@GridFixTheme
+                          }
+                          BillingManager.State.ENTITLED -> Unit
+                      }
+                  }
+                  val onSubScreen = currentRoute == "settings" || currentRoute == "reference"
+                  val barActions: @Composable () -> Unit = {
+                      OrientationLockButton(settings.orientation) { value -> scope.launch { repo.setOrientation(value) } }
+                      IconButton(onClick = { scope.launch { repo.setNightMode(!settings.nightMode) } }) {
+                          Icon(
+                              if (settings.nightMode) Icons.Outlined.LightMode else Icons.Outlined.DarkMode,
+                              contentDescription = "Toggle night mode",
                           )
-                          p[listKey] = encode(current + info)
-                          added = true
+                      }
+                      if (!onSubScreen) {
+                          IconButton(onClick = {
+                              navController.navigate("settings") { launchSingleTop = true }
+                          }) {
+                              Icon(Icons.Outlined.Settings, contentDescription = "Settings")
+                          }
                       }
                   }
-                  return added
-              }
-
-              suspend fun rename(id: String, name: String) {
-                  if (name.isBlank()) return
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(
-                          decode(p[listKey] ?: "[]").map {
-                              if (it.id == id) it.copy(name = name.trim()) else it
-                          }
+                  val barTitle: @Composable () -> Unit = {
+                      Text(
+                          "MGRS GPS",
+                          fontFamily = LabelFamily,
+                          fontWeight = FontWeight.SemiBold,
+                          fontSize = 16.sp,
+                          letterSpacing = 4.sp,
+                          maxLines = 1,
                       )
                   }
-              }
-
-              suspend fun setFolder(id: String, folder: String) {
-                  val clean = canonicalFolder(folder)
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(
-                          decode(p[listKey] ?: "[]").map {
-                              if (it.id == id) it.copy(folder = clean) else it
+                  val backButton: @Composable () -> Unit = {
+                      if (onSubScreen) {
+                          IconButton(onClick = { navController.popBackStack() }) {
+                              Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                           }
-                      )
-                  }
-              }
-
-              suspend fun delete(id: String) {
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id == id })
-                  }
-                  withContext(Dispatchers.IO) { pointsFile(context, id).delete() }
-              }
-
-              /** Move every track in [from] to [to] (folder rename, or emptying a folder into Base). */
-              suspend fun renameFolder(from: String, to: String) {
-                  val target = canonicalFolder(to)
-                  if (from == target) return
-                  context.trackStore.edit { p ->
-                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.folder == from) it.copy(folder = target) else it })
-                  }
-              }
-
-              /** Delete every track in [folder], point logs included. */
-              suspend fun deleteFolder(folder: String) {
-                  val doomed = decode(context.trackStore.data.first()[listKey] ?: "[]").filter { it.folder == folder }
-                  for (t in doomed) delete(t.id)
-              }
-
-              /** Remove a recording that was discarded before saving. */
-              suspend fun discard(id: String) = delete(id)
-
-              /**
-               * Heal recordings the OS killed mid-way: any track still open (endedAt == 0)
-               * that is not the one currently recording is closed out from its point log
-               * (the points are on disk — only the summary was lost), or removed when it
-               * never logged a point.
-               */
-              suspend fun finalizeOrphans(activeId: String?) {
-                  val open = decode(context.trackStore.data.first()[listKey] ?: "[]")
-                      .filter { it.endedAt == 0L && it.id != activeId }
-                  for (t in open) {
-                      val pts = readPoints(context, t.id)
-                      if (pts.isEmpty()) {
-                          delete(t.id)
-                      } else {
-                          val last = pts.last().time
-                          finishTrack(t.id, null, if (last > t.startedAt) last else System.currentTimeMillis())
                       }
                   }
-              }
-
-              // One damaged record must not take the whole list with it: skip it, keep the rest.
-              private fun decode(json: String): List<TrackInfo> {
-                  val arr = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
-                  return buildList {
-                      for (i in 0 until arr.length()) {
-                          runCatching {
-                              val o = arr.getJSONObject(i)
-                              TrackInfo(
-                                  id = o.getString("id"),
-                                  name = o.getString("name"),
-                                  startedAt = o.optLong("startedAt"),
-                                  endedAt = o.optLong("endedAt"),
-                                  distanceM = o.optDouble("distanceM", 0.0),
-                                  pointCount = o.optInt("pointCount", 0),
-                                  folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
+                  Scaffold(
+                      containerColor = MaterialTheme.colorScheme.background,
+                      snackbarHost = { SnackbarHost(snackbarHostState) },
+                      // Sideways, a camera cutout sits on a long edge: keep the rail and the deck clear of it
+                      contentWindowInsets = ScaffoldDefaults.contentWindowInsets.union(WindowInsets.displayCutout),
+                      topBar = {
+                          if (landscape) {
+                              // Sideways there is no vertical room to spare: a 48 dp bar
+                              CompactTopBar(title = barTitle, navigationIcon = backButton, actions = barActions)
+                          } else {
+                              CenterAlignedTopAppBar(
+                                  title = barTitle,
+                                  navigationIcon = backButton,
+                                  actions = { barActions() },
+                                  colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+                                      containerColor = MaterialTheme.colorScheme.background,
+                                      titleContentColor = MaterialTheme.colorScheme.onBackground,
+                                      actionIconContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                      navigationIconContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                  ),
                               )
-                          }.getOrNull()?.let { add(it) }
-                      }
-                  }
-              }
-
-              private fun encode(list: List<TrackInfo>): String {
-                  val arr = JSONArray()
-                  for (t in list) {
-                      arr.put(
-                          JSONObject()
-                              .put("id", t.id)
-                              .put("name", t.name)
-                              .put("startedAt", t.startedAt)
-                              .put("endedAt", t.endedAt)
-                              .put("distanceM", t.distanceM)
-                              .put("pointCount", t.pointCount)
-                              .put("folder", t.folder)
-                      )
-                  }
-                  return arr.toString()
-              }
-
-              companion object {
-                  fun pointsFile(context: Context, id: String): File =
-                      File(File(context.filesDir, "tracks"), "$id.txt")
-
-                  /** Append one point; called from the recorder service's worker thread. */
-                  fun appendPoint(context: Context, id: String, lat: Double, lon: Double, time: Long, alt: Double) {
-                      runCatching {
-                          val f = pointsFile(context, id)
-                          f.parentFile?.mkdirs()
-                          f.appendText(
-                              String.format(Locale.US, "%.7f %.7f %d %.1f\n", lat, lon, time, alt)
-                          )
-                      }
-                  }
-
-                  suspend fun readPoints(context: Context, id: String): List<TrackPoint> =
-                      withContext(Dispatchers.IO) {
-                          val f = pointsFile(context, id)
-                          if (!f.exists()) return@withContext emptyList()
-                          f.readLines().mapNotNull { line ->
-                              val parts = line.trim().split(" ")
-                              if (parts.size < 3) return@mapNotNull null
-                              runCatching {
-                                  TrackPoint(
-                                      lat = parts[0].toDouble(),
-                                      lon = parts[1].toDouble(),
-                                      time = parts[2].toLong(),
-                                      alt = parts.getOrNull(3)?.toDouble() ?: NO_ALTITUDE,
+                          }
+                      },
+                      bottomBar = {
+                          // Blackout bar: black, a hairline on top, amber for the active tab,
+                          // condensed capitals - no indicator pill. Sideways it becomes a rail.
+                          if (!landscape) {
+                              val rule = MaterialTheme.colorScheme.outline
+                              NavigationBar(
+                                  containerColor = MaterialTheme.colorScheme.background,
+                                  modifier = Modifier.drawBehind {
+                                      drawLine(rule, Offset(0f, 0f), Offset(size.width, 0f), 1.dp.toPx())
+                                  },
+                              ) {
+                                  items.forEach { item ->
+                                      NavigationBarItem(
+                                          selected = currentRoute == item.route,
+                                          onClick = { goTo(item.route) },
+                                          icon = { Icon(item.icon, contentDescription = item.label) },
+                                          label = {
+                                              Text(
+                                                  item.label.uppercase(),
+                                                  fontFamily = LabelFamily,
+                                                  fontSize = 11.sp,
+                                                  fontWeight = FontWeight.Medium,
+                                                  letterSpacing = 1.6.sp,
+                                                  maxLines = 1,
+                                              )
+                                          },
+                                          colors = NavigationBarItemDefaults.colors(
+                                              selectedIconColor = MaterialTheme.colorScheme.primary,
+                                              selectedTextColor = MaterialTheme.colorScheme.primary,
+                                              unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                              unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                              indicatorColor = Color.Transparent,
+                                          ),
+                                      )
+                                  }
+                              }
+                          }
+                      },
+                  ) { innerPadding ->
+                      Row(Modifier.fillMaxSize().padding(innerPadding)) {
+                      if (landscape) {
+                          val rule = MaterialTheme.colorScheme.outline
+                          NavigationRail(
+                              containerColor = MaterialTheme.colorScheme.background,
+                              windowInsets = WindowInsets(0, 0, 0, 0),
+                              modifier = Modifier
+                                  .fillMaxHeight()
+                                  .drawBehind {
+                                      drawLine(rule, Offset(size.width, 0f), Offset(size.width, size.height), 1.dp.toPx())
+                                  },
+                          ) {
+                              Spacer(Modifier.weight(1f))
+                              items.forEach { item ->
+                                  NavigationRailItem(
+                                      selected = currentRoute == item.route,
+                                      onClick = { goTo(item.route) },
+                                      icon = { Icon(item.icon, contentDescription = item.label) },
+                                      label = {
+                                          Text(
+                                              item.label.uppercase(),
+                                              fontFamily = LabelFamily,
+                                              fontSize = 9.sp,
+                                              fontWeight = FontWeight.Medium,
+                                              letterSpacing = 1.sp,
+                                              maxLines = 1,
+                                              softWrap = false,
+                                          )
+                                      },
+                                      colors = NavigationRailItemDefaults.colors(
+                                          selectedIconColor = MaterialTheme.colorScheme.primary,
+                                          selectedTextColor = MaterialTheme.colorScheme.primary,
+                                          unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                          unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                          indicatorColor = Color.Transparent,
+                                      ),
                                   )
-                              }.getOrNull()
+                              }
+                              Spacer(Modifier.weight(1f))
                           }
                       }
-
-                  /** Minimal GPX 1.1 document for one track. */
-                  fun buildGpx(name: String, points: List<TrackPoint>): String {
-                      val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
-                      sdf.timeZone = TimeZone.getTimeZone("UTC")
-                      val sb = StringBuilder()
-                      sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-                      sb.append("<gpx version=\"1.1\" creator=\"MGRS GPS\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n")
-                      sb.append("  <trk>\n    <name>").append(escapeXml(name)).append("</name>\n    <trkseg>\n")
-                      for (p in points) {
-                          val ele = if (p.alt.hasAltitude()) String.format(Locale.US, "<ele>%.1f</ele>", p.alt) else ""
-                          sb.append(
-                              String.format(
-                                  Locale.US,
-                                  "      <trkpt lat=\"%.7f\" lon=\"%.7f\">%s<time>%s</time></trkpt>\n",
-                                  p.lat, p.lon, ele, sdf.format(Date(p.time)),
+                      NavHost(
+                          navController = navController,
+                          startDestination = "position",
+                          modifier = Modifier.weight(1f).fillMaxHeight(),
+                      ) {
+                          composable("position") {
+                              if (!hasPermission) PermissionGate(requestPermission, approximateOnly)
+                              else PositionScreen(
+                                  fix = fix,
+                                  settings = settings,
+                                  repo = repo,
+                                  onMark = {
+                                      fix.location?.let { loc ->
+                                          scope.launch {
+                                              val id = waypointRepo.add(
+                                                  WaypointDraft(
+                                                      name = "MARK " + Coordinates.dtg(System.currentTimeMillis()).take(7),
+                                                      lat = loc.latitude,
+                                                      lon = loc.longitude,
+                                                      folder = DEFAULT_FOLDER,
+                                                      symbol = "target",
+                                                      affiliation = "none",
+                                                  ),
+                                                  System.currentTimeMillis(),
+                                              )
+                                              waypointRepo.select(id)
+                                          }
+                                      }
+                                  },
                               )
+                          }
+                          composable("navigate") {
+                              if (!hasPermission) PermissionGate(requestPermission, approximateOnly)
+                              else NavigateScreen(
+                                  fix = fix,
+                                  settings = settings,
+                                  waypoints = navigableWaypoints,
+                                  selectedId = selectedId,
+                                  onSelect = { id -> scope.launch { waypointRepo.select(id) } },
+                              )
+                          }
+                          composable("map") {
+                              MapScreen(
+                                  fix = fix,
+                                  settings = settings,
+                                  waypoints = waypoints,
+                                  folders = folders,
+                                  hasPermission = hasPermission,
+                                  onRequestPermission = requestPermission,
+                                  onAdd = { draft ->
+                                      scope.launch { waypointRepo.add(draft, System.currentTimeMillis()) }
+                                  },
+                                  onUpdate = { id, draft ->
+                                      scope.launch { waypointRepo.update(id, draft) }
+                                  },
+                                  onNavigateTo = { id ->
+                                      scope.launch { waypointRepo.select(id) }
+                                      goTo("navigate")
+                                  },
+                                  graphics = graphics,
+                                  onAddGraphic = { name, type, points, folder, affiliation, echelon ->
+                                      scope.launch {
+                                          // addFolder returns the stored spelling (case-insensitive match) and
+                                          // makes sure the overlay eye toggle exists
+                                          val f = waypointRepo.addFolder(folder)
+                                          graphicsRepo.add(name, type, points, f, affiliation, System.currentTimeMillis(), echelon)
+                                      }
+                                  },
+                                  onUpdateGraphic = { id, name, folder, affiliation, echelon ->
+                                      scope.launch {
+                                          val f = waypointRepo.addFolder(folder)
+                                          graphicsRepo.rename(id, name, f, affiliation, echelon)
+                                      }
+                                  },
+                                  onUpdateGraphicPoints = { id, points ->
+                                      scope.launch { graphicsRepo.updatePoints(id, points) }
+                                  },
+                                  onDeleteGraphic = { id -> scope.launch { graphicsRepo.delete(id) } },
+                                  onSaveRouteWps = { base, pts, folder ->
+                                      scope.launch {
+                                          val f = waypointRepo.addFolder(folder)
+                                          val prefix = "$base WP "
+                                          waypoints.filter { it.name.startsWith(prefix) }.forEach {
+                                              waypointRepo.delete(it.id)
+                                          }
+                                          waypointRepo.addAll(
+                                              pts.mapIndexed { i, v ->
+                                                  WaypointDraft(
+                                                      name = prefix + (i + 1),
+                                                      lat = v.lat,
+                                                      lon = v.lon,
+                                                      folder = f,
+                                                      symbol = "",
+                                                      affiliation = "none",
+                                                  )
+                                              },
+                                              System.currentTimeMillis(),
+                                          )
+                                      }
+                                  },
+                                  viewedTrackId = shownTrackId,
+                                  onRecordStart = beginRecording,
+                                  onRecordStop = { name, discard ->
+                                      val id = TrackRecorderService.active.value?.trackId
+                                      TrackRecorderService.stop(context.applicationContext)
+                                      if (id != null) {
+                                          scope.launch {
+                                              kotlinx.coroutines.delay(400)
+                                              if (discard) {
+                                                  trackRepo.discard(id)
+                                              } else {
+                                                  trackRepo.finishTrack(id, name, System.currentTimeMillis())
+                                              }
+                                          }
+                                      }
+                                  },
+                                  focusAt = mapFocus,
+                                  onFocusConsumed = { mapFocus = null },
+                                  unitNameFor = unitNameFor,
+                                  courseStatus = activeCourse?.takeIf { !it.done }?.let { c ->
+                                      "CP ${c.nextIndex + 1}/${c.waypointIds.size} — course running"
+                                  },
+                                  onOpenCourse = { courseOpen = true },
+                              )
+                          }
+                          composable("waypoints") {
+                              WaypointsScreen(
+                                  fix = fix,
+                                  settings = settings,
+                                  waypoints = waypoints,
+                                  folders = folders,
+                                  onAdd = { draft ->
+                                      scope.launch { waypointRepo.add(draft, System.currentTimeMillis()) }
+                                  },
+                                  onUpdate = { id, draft ->
+                                      scope.launch { waypointRepo.update(id, draft) }
+                                  },
+                                  onDelete = { id -> scope.launch { waypointRepo.delete(id) } },
+                                  onAddFolder = { name -> scope.launch { waypointRepo.addFolder(name) } },
+                                  onSetFolderVisible = { name, visible ->
+                                      scope.launch { waypointRepo.setFolderVisible(name, visible) }
+                                  },
+                                  onRenameFolder = { from, to ->
+                                      scope.launch {
+                                          val target = waypointRepo.renameFolder(from, to)
+                                          if (target != from) {
+                                              graphicsRepo.renameFolder(from, target)
+                                              trackRepo.renameFolder(from, target)
+                                          }
+                                      }
+                                  },
+                                  onDeleteFolder = { name, deleteContents ->
+                                      scope.launch {
+                                          if (deleteContents) {
+                                              if (tracks.any { it.id == viewedTrackId && it.folder == name }) viewedTrackId = null
+                                              waypointRepo.deleteFolder(name, true)
+                                              graphicsRepo.deleteFolder(name)
+                                              trackRepo.deleteFolder(name)
+                                          } else {
+                                              waypointRepo.deleteFolder(name, false)
+                                              graphicsRepo.renameFolder(name, DEFAULT_FOLDER)
+                                              trackRepo.renameFolder(name, DEFAULT_FOLDER)
+                                          }
+                                      }
+                                  },
+                                  onNavigateTo = { id ->
+                                      scope.launch { waypointRepo.select(id) }
+                                      goTo("navigate")
+                                  },
+                                  graphics = graphics,
+                                  onDeleteGraphic = { id -> scope.launch { graphicsRepo.delete(id) } },
+                                  onClearGraphics = { folder -> scope.launch { graphicsRepo.deleteFolder(folder) } },
+                                  tracks = tracks,
+                                  viewedTrackId = shownTrackId,
+                                  onViewTrack = { id ->
+                                      viewedTrackId = id
+                                      if (id != null) {
+                                          // Viewing a track in a hidden folder shows the folder again
+                                          val f = tracks.firstOrNull { it.id == id }?.folder
+                                          if (f != null && folders.firstOrNull { it.name == f }?.visible == false) {
+                                              scope.launch { waypointRepo.setFolderVisible(f, true) }
+                                          }
+                                          goTo("map")
+                                      }
+                                  },
+                                  onDeleteTrack = { id ->
+                                      if (viewedTrackId == id) viewedTrackId = null
+                                      scope.launch { trackRepo.delete(id) }
+                                  },
+                                  onMoveTrack = { id, folder ->
+                                      scope.launch {
+                                          trackRepo.setFolder(id, waypointRepo.addFolder(folder))
+                                      }
+                                  },
+                                  onBacktrackTrack = { t ->
+                                      scope.launch {
+                                          val pts = TrackRepository.readPoints(context, t.id)
+                                          if (pts.size >= 2) {
+                                              val reversed = pts.reversed()
+                                              // Keep the shape, not every twentieth fix: a uniform
+                                              // stride cuts the corner off every switchback and
+                                              // ridgeline, which is exactly what you are following
+                                              // back. Douglas-Peucker at 20 m keeps the turns and
+                                              // drops the straights, then cap at the vertex limit.
+                                              val dec = ArrayList(
+                                                  simplifyTrack(reversed.map { GeoVertex(it.lat, it.lon) }, 20.0)
+                                              )
+                                              val last = reversed.last()
+                                              if (dec.last().lat != last.lat || dec.last().lon != last.lon) {
+                                                  dec.add(GeoVertex(last.lat, last.lon))
+                                              }
+                                              waypointRepo.addFolder(t.folder)
+                                              graphicsRepo.add(
+                                                  ("Back " + t.name).take(20), "route",
+                                                  dec.take(64), t.folder, "none",
+                                                  System.currentTimeMillis(),
+                                              )
+                                              mapFocus = dec.first().lat to dec.first().lon
+                                              goTo("map")
+                                          }
+                                      }
+                                  },
+                                  onShowOnMap = { w ->
+                                      mapFocus = w.lat to w.lon
+                                      goTo("map")
+                                  },
+                                  onShowGraphicOnMap = { g ->
+                                      if (g.points.isNotEmpty()) {
+                                          mapFocus = g.points.map { it.lat }.average() to
+                                              g.points.map { it.lon }.average()
+                                          goTo("map")
+                                      }
+                                  },
+                                  unitNameFor = unitNameFor,
+                                  onImport = { data, onDone ->
+                                      scope.launch {
+                                          runCatching {
+                                              val now = System.currentTimeMillis()
+                                              waypointRepo.addAll(data.waypoints, now)
+                                              for (l in data.lines) {
+                                                  val f = waypointRepo.addFolder(l.folder)
+                                                  graphicsRepo.add(l.name, "route", l.points, f, "none", now)
+                                              }
+                                              for (a in data.areas) {
+                                                  val f = waypointRepo.addFolder(a.folder)
+                                                  graphicsRepo.add(a.name, "aa", a.points, f, "none", now)
+                                              }
+                                              for (t in data.tracks) {
+                                                  trackRepo.importTrack(t.name, t.points, now)
+                                              }
+                                              onDone(data.summary())
+                                          }.getOrElse {
+                                              onDone("Import failed — " + (it.message ?: "the file has bad data"))
+                                          }
+                                      }
+                                  },
+                                  onExport = { format, onDone ->
+                                      scope.launch {
+                                          runCatching {
+                                              val trackData = tracks.map {
+                                                  it to TrackRepository.readPoints(context, it.id)
+                                              }
+                                              val fname = when (format) {
+                                                  "atak" -> "gridfix-datapackage.zip"
+                                                  else -> "gridfix-export.$format"
+                                              }
+                                              val file = withContext(Dispatchers.IO) {
+                                                  val dir = File(context.cacheDir, "share").apply { mkdirs() }
+                                                  File(dir, fname).apply {
+                                                      when (format) {
+                                                          "atak" -> outputStream().use { os ->
+                                                              DataPackage.build(
+                                                                  os,
+                                                                  waypoints,
+                                                                  graphics.filter { it.type == "route" },
+                                                                  System.currentTimeMillis(),
+                                                              )
+                                                          }
+                                                          "gpx" -> writeText(
+                                                              InterchangeFiles.buildGpx(
+                                                                  waypoints,
+                                                                  graphics.filter { it.type == "route" },
+                                                                  trackData,
+                                                              )
+                                                          )
+                                                          else -> writeText(
+                                                              InterchangeFiles.buildKml(waypoints, graphics, trackData)
+                                                          )
+                                                      }
+                                                  }
+                                              }
+                                              val uri = FileProvider.getUriForFile(
+                                                  context, "app.gridfix.android.fileprovider", file
+                                              )
+                                              val send = android.content.Intent(
+                                                  android.content.Intent.ACTION_SEND
+                                              ).apply {
+                                                  type = when (format) {
+                                                      "gpx" -> "application/gpx+xml"
+                                                      "atak" -> "application/zip"
+                                                      else -> "application/vnd.google-earth.kml+xml"
+                                                  }
+                                                  putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                                                  addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                              }
+                                              context.startActivity(
+                                                  android.content.Intent.createChooser(send, "Share export")
+                                              )
+                                              onDone(fname)
+                                          }.getOrElse { onDone(null) }
+                                      }
+                                  },
+                              )
+                          }
+                          composable("settings") {
+                              SettingsScreen(
+                                  repo,
+                                  settings,
+                                  modelDeclination = fix.location?.let { Declination.model(it.latitude, it.longitude) },
+                                  entitled = entitlement == BillingManager.State.ENTITLED,
+                                  onPreviewPaywall = { paywallPreview = true },
+                                  onOpenReference = {
+                                      navController.navigate("reference") { launchSingleTop = true }
+                                  },
+                                  onBackup = { uri, onDone ->
+                                      scope.launch {
+                                          runCatching {
+                                              context.contentResolver.openOutputStream(uri)?.use { os ->
+                                                  Backup.export(
+                                                      context, os,
+                                                      waypoints, folders, graphics, settings,
+                                                      tracks, courseHistory,
+                                                      System.currentTimeMillis(),
+                                                  )
+                                              }
+                                              onDone(
+                                                  "Backed up ${waypoints.size} waypoints, ${graphics.size} graphics, ${tracks.size} tracks"
+                                              )
+                                          }.getOrElse { onDone("Backup failed — ${it.message ?: "couldn't write the file"}") }
+                                      }
+                                  },
+                                  onRestore = { uri, onDone ->
+                                      scope.launch {
+                                          runCatching {
+                                              val result = context.contentResolver.openInputStream(uri)?.use { ins ->
+                                                  Backup.restore(
+                                                      ins,
+                                                      waypointRepo, graphicsRepo, trackRepo, repo, courseRepo,
+                                                  )
+                                              }
+                                              onDone(result?.summary() ?: "Couldn't open that file")
+                                          }.getOrElse { onDone("Restore failed — is this an MGRS GPS backup zip?") }
+                                      }
+                                  },
+                              )
+                          }
+                          composable("reference") { ReferenceScreen() }
+                      }
+                      }
+                  }
+
+                  if (courseOpen) {
+                      CourseDialog(
+                          active = activeCourse,
+                          waypoints = waypoints,
+                          folders = folders,
+                          history = courseHistory,
+                          hasFix = fix.location != null,
+                          onStartFolder = { f ->
+                              scope.launch {
+                                  val ids = waypoints.filter { it.folder == f }.map { it.id }
+                                  if (ids.size >= 2) {
+                                      courseRepo.start(f, ids, System.currentTimeMillis())
+                                      ids.firstOrNull()?.let { waypointRepo.select(it) }
+                                  }
+                              }
+                          },
+                          onStartRandom = { count, radiusM ->
+                              val loc = fix.location
+                              if (loc != null) {
+                                  scope.launch {
+                                      val folderName =
+                                          "Course " + Coordinates.dtg(System.currentTimeMillis()).take(7)
+                                      // The folder is created only once points exist: a tight radius
+                                      // can fail to place them, and an empty "Course DDHHMM" folder
+                                      // would be left behind on every failed attempt.
+                                      val pts = mutableListOf<Pair<Double, Double>>()
+                                      var attempts = 0
+                                      while (pts.size < count && attempts < 400) {
+                                          attempts++
+                                          val dist = 120.0 + Random.nextDouble() *
+                                              (radiusM - 120.0).coerceAtLeast(1.0)
+                                          val brg = Random.nextDouble() * 360.0
+                                          val p = GeoPoint(loc.latitude, loc.longitude)
+                                              .destinationPoint(dist, brg)
+                                          val separated = pts.all { (la, lo) ->
+                                              Coordinates.navInfo(la, lo, p.latitude, p.longitude)
+                                                  .distanceMeters > 120f
+                                          }
+                                          if (separated) pts.add(p.latitude to p.longitude)
+                                      }
+                                      if (pts.size < 2) return@launch
+                                      waypointRepo.addFolder(folderName)
+                                      val ids = mutableListOf<String>()
+                                      pts.forEachIndexed { i, (la, lo) ->
+                                          ids.add(
+                                              waypointRepo.add(
+                                                  WaypointDraft(
+                                                      name = "CP ${i + 1}",
+                                                      lat = la,
+                                                      lon = lo,
+                                                      folder = folderName,
+                                                      symbol = "target",
+                                                      affiliation = "none",
+                                                  ),
+                                                  System.currentTimeMillis(),
+                                              )
+                                          )
+                                      }
+                                      if (ids.size >= 2) {
+                                          courseRepo.start(folderName, ids, System.currentTimeMillis())
+                                          ids.firstOrNull()?.let { waypointRepo.select(it) }
+                                      }
+                                  }
+                              }
+                          },
+                          onAbandon = {
+                              scope.launch { courseRepo.abandon() }
+                              courseOpen = false
+                          },
+                          onDismiss = { courseOpen = false },
+                      )
+                  }
+                  courseSummary?.let { r ->
+                      CourseSummaryDialog(result = r) { courseSummary = null }
+                  }
+
+                  // Course engine: lock Navigate onto the current point; auto-advance and
+                  // buzz when the fix closes inside 25 m (accuracy permitting).
+                  LaunchedEffect(activeCourse?.nextIndex, activeCourse?.name) {
+                      val c = activeCourse ?: return@LaunchedEffect
+                      if (!c.done) {
+                          c.waypointIds.getOrNull(c.nextIndex)?.let { waypointRepo.select(it) }
+                      }
+                  }
+                  LaunchedEffect(
+                      fix.location?.latitude,
+                      fix.location?.longitude,
+                      activeCourse?.nextIndex,
+                      activeCourse?.name,
+                  ) {
+                      val c = activeCourse ?: return@LaunchedEffect
+                      val loc = fix.location ?: return@LaunchedEffect
+                      if (c.done) return@LaunchedEffect
+                      val target = waypoints.firstOrNull { it.id == c.waypointIds[c.nextIndex] }
+                          ?: return@LaunchedEffect
+                      val nav = Coordinates.navInfo(loc.latitude, loc.longitude, target.lat, target.lon)
+                      // "Inside 25 m" has to mean it: the fix's own error must fit inside the ring,
+                      // and a fix with no accuracy estimate at all cannot score a point.
+                      val acc = if (loc.hasAccuracy()) loc.accuracy else Float.POSITIVE_INFINITY
+                      if (nav.distanceMeters + acc < 25f) {
+                          courseRepo.markFound(System.currentTimeMillis())
+                          buzz(context)
+                          if (c.foundAt.size + 1 >= c.waypointIds.size) {
+                              courseRepo.finish()
+                              summaryPending = true
+                          }
+                      }
+                  }
+                  LaunchedEffect(courseHistory, summaryPending) {
+                      if (summaryPending && courseHistory.isNotEmpty()) {
+                          courseSummary = courseHistory.first()
+                          summaryPending = false
+                      }
+                  }
+              }
+          }
+
+          /** A 48 dp app bar for landscape: title centred, back on the left, actions on the right. */
+          @Composable
+          private fun CompactTopBar(
+              title: @Composable () -> Unit,
+              navigationIcon: @Composable () -> Unit,
+              actions: @Composable () -> Unit,
+          ) {
+              Box(
+                  Modifier
+                      .fillMaxWidth()
+                      .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Top))
+                      .height(48.dp),
+              ) {
+                  Row(
+                      Modifier
+                          .align(Alignment.CenterStart)
+                          .padding(start = 4.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                      androidx.compose.runtime.CompositionLocalProvider(
+                          androidx.compose.material3.LocalContentColor provides MaterialTheme.colorScheme.onSurfaceVariant,
+                      ) { navigationIcon() }
+                  }
+                  Box(Modifier.align(Alignment.Center)) {
+                      androidx.compose.runtime.CompositionLocalProvider(
+                          androidx.compose.material3.LocalContentColor provides MaterialTheme.colorScheme.onBackground,
+                      ) { title() }
+                  }
+                  Row(
+                      Modifier
+                          .align(Alignment.CenterEnd)
+                          .padding(end = 4.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                      androidx.compose.runtime.CompositionLocalProvider(
+                          androidx.compose.material3.LocalContentColor provides MaterialTheme.colorScheme.onSurfaceVariant,
+                      ) { actions() }
+                  }
+              }
+          }
+
+          /**
+           * The rotate-lock action: amber when the orientation is pinned. Tap for the menu:
+           * AUTO follows the phone; PORTRAIT / LANDSCAPE / LANDSCAPE FLIPPED pin it, for
+           * a phone mounted sideways on armour either way up.
+           */
+          @Composable
+          private fun OrientationLockButton(current: Int, onSelect: (Int) -> Unit) {
+              var open by remember { mutableStateOf(false) }
+              val locked = current != ScreenOrientation.AUTO
+              Box {
+                  IconButton(onClick = { open = true }) {
+                      Icon(
+                          if (locked) Icons.Outlined.ScreenLockRotation else Icons.Outlined.ScreenRotation,
+                          contentDescription = if (locked) "Orientation locked: ${ScreenOrientation.names[current]}" else "Orientation follows the phone",
+                          tint = if (locked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+                  DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                      ScreenOrientation.menuNames.forEachIndexed { index, label ->
+                          val sel = index == current
+                          DropdownMenuItem(
+                              text = {
+                                  Text(
+                                      label,
+                                      fontFamily = LabelFamily,
+                                      fontSize = 13.sp,
+                                      fontWeight = FontWeight.Medium,
+                                      letterSpacing = 1.4.sp,
+                                      color = if (sel) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                  )
+                              },
+                              trailingIcon = if (sel) {
+                                  { Icon(Icons.Outlined.Check, contentDescription = null, tint = MaterialTheme.colorScheme.primary) }
+                              } else null,
+                              onClick = {
+                                  onSelect(index)
+                                  open = false
+                              },
                           )
                       }
-                      sb.append("    </trkseg>\n  </trk>\n</gpx>\n")
-                      return sb.toString()
-                  }
-
-                  private fun escapeXml(s: String): String = s
-                      .replace("&", "&amp;")
-                      .replace("<", "&lt;")
-                      .replace(">", "&gt;")
-                      .replace("\"", "&quot;")
-
-                  private fun dtgShort(timeMillis: Long): String {
-                      val sdf = SimpleDateFormat("ddHHmm'Z'", Locale.US)
-                      sdf.timeZone = TimeZone.getTimeZone("UTC")
-                      return sdf.format(Date(timeMillis))
                   }
               }
           }
-          EOF_GRIDFIX
-          mkdir -p 'app/src/main/java/app/gridfix/android/map'
-          cat > 'app/src/main/java/app/gridfix/android/map/ElevationStore.kt' <<'EOF_GRIDFIX'
-          package app.gridfix.android.map
 
-          import java.io.File
-
-          /**
-           * Elevation storage seam — pure JVM, no Context, no Bitmap.
-           *
-           * [Elevation] currently hard-codes `File(context.filesDir, "dem")` with an
-           * in-memory cap of 12 bitmaps and no on-disk cap (P1: prefetch 400 tiles x
-           * N boxes fills the device; osmdroid trims at 500 MB, dem does not).
-           *
-           * This file adds the portable policy next to it without changing behavior:
-           * osmdroid keeps calling `Elevation` untouched. The MapLibre adapter and the
-           * iOS port implement [ElevationStore] with their own sandbox dir and call
-           * [trimOldest] after prefetch.
-           *
-           * KMP-ready: move verbatim to `:core` when it becomes `commonMain`.
-           */
-          interface ElevationStore {
-              val dir: File
-
-              fun fileFor(z: Int, x: Int, y: Int): File =
-                  File(dir, "${z}_${x}_$y.png")
-          }
-
-          /** Delete oldest PNGs beyond [maxFiles]. Returns files removed. */
-          fun ElevationStore.trimOldest(maxFiles: Int = 400): Int {
-              val pngs = dir.listFiles { f -> f.isFile && f.name.endsWith(".png") }
-                  ?.sortedBy { it.lastModified() } ?: return 0
-              if (pngs.size <= maxFiles) return 0
-              var removed = 0
-              for (f in pngs.take(pngs.size - maxFiles)) {
-                  if (runCatching { f.delete() }.getOrDefault(false)) removed++
-              }
-              return removed
-          }
-
-          /** Default on-disk cap shared by Android + iOS until tuned on device. */
-          const val ELEVATION_MAX_CACHED_TILES = 400
-          EOF_GRIDFIX
-          mkdir -p 'app/src/main/java/app/gridfix/android/map'
-          cat > 'app/src/main/java/app/gridfix/android/map/GridGeometry.kt' <<'EOF_GRIDFIX'
-          package app.gridfix.android.map
-
-          /**
-           * Portable grid geometry — no Canvas, no Projection, no osmdroid.
-           *
-           * Slice 3 of the MapLibre/iOS rebuild. [MgrsGridOverlay] (606 lines) currently
-           * computes interval + sampling + drawing in one `draw()` pass. New code —
-           * MapLibre line layers on Android + Swift — consumes this model instead:
-           *
-           *   bbox -> [chooseGridInterval] -> sample UTM lines via `Coordinates`
-           *   -> List<GridLine> / List<GridLabel> -> engine renders.
-           *
-           * The overlay keeps shipping untouched; the cutover moves sampling here
-           * function by function. KMP-ready: pure Kotlin, moves to `:core` verbatim.
-           */
-
-          /** One grid polyline in lat/lon — engine projects it. */
-          data class GridLine(
-              val points: List<Pair<Double, Double>>,
-              val heavy: Boolean = false,
-              /** GZD boundary vs 100 km square vs metre grid. */
-              val kind: Kind = Kind.METRE,
-          ) {
-              enum class Kind { GZD, SQUARE, METRE }
-          }
-
-          /** Edge label anchored at a lat/lon. */
-          data class GridLabel(
-              val text: String,
-              val lat: Double,
-              val lon: Double,
-          )
-
-          /** Interval chooser — mirrors MgrsGridOverlay.draw() spacing rule. */
-          fun chooseGridInterval(metersPerPixel: Double, density: Float): Int {
-              if (metersPerPixel <= 0.0 || density <= 0f) return 0
-              val minSpacing = 48f * density
-              return intArrayOf(10, 100, 1000, 10000, 100000)
-                  .firstOrNull { it / metersPerPixel >= minSpacing } ?: 0
-          }
-
-          fun gridIntervalLabel(interval: Int): String = when (interval) {
-              0 -> "GZD"
-              100000 -> "100 km"
-              10000 -> "10 km"
-              1000 -> "1 km"
-              100 -> "100 m"
-              else -> "10 m"
-          }
-          EOF_GRIDFIX
-          mkdir -p 'app/src/main/java/app/gridfix/android/map'
-          cat > 'app/src/main/java/app/gridfix/android/map/MapPortable.kt' <<'EOF_GRIDFIX'
-          package app.gridfix.android.map
-
-          /**
-           * Portable map descriptors — no osmdroid, no MapLibre, no Android imports.
-           *
-           * Slice 1 of the MapLibre/iOS rebuild: [MapSetup.BaseLayer] still owns the
-           * osmdroid `ITileSource` and keeps shipping. New code (photo-map quad from
-           * roadmap A, GeoTIFF import from roadmap C, offline packs from roadmap B)
-           * targets these descriptors so the same model feeds `map-osmdroid` now and
-           * `map-maplibre` (Android + Swift) next.
-           *
-           * KMP-ready by construction: pure Kotlin + java.io only. When `:core`
-           * becomes `commonMain`, this file moves verbatim.
-           */
-
-          /** Engine-agnostic base layer. Mirrors the fields MapScreen actually uses. */
-          data class BaseLayerDescriptor(
-              val key: String,
-              val label: String,
-              val attribution: String,
-              val maxDownloadZoom: Int,
-              val bulkDownload: Boolean = false,
-          )
-
-          /** Calibrated image quad: roadmap A (photo-map) and C (GeoTIFF) share this. */
-          data class ImageQuad(
-              val id: String,
-              val name: String,
-              /** 4 corners in order: TL, TR, BR, BL — lat/lon pairs. */
-              val corners: List<Pair<Double, Double>>,
-              val opacity: Float = 1f,
-              val visible: Boolean = true,
-          ) {
-              init {
-                  require(corners.size == 4) { "ImageQuad needs exactly 4 corners" }
-              }
-          }
-
-          /** Offline region request — replaces per-provider bulk-download flags. */
-          data class OfflinePack(
-              val layerKey: String,
-              val latNorth: Double,
-              val latSouth: Double,
-              val lonWest: Double,
-              val lonEast: Double,
-              val minZoom: Int,
-              val maxZoom: Int,
-          )
-
-          /** Minimal projection contract both engines satisfy. */
-          interface MapProjection {
-              fun toPixels(lat: Double, lon: Double): Pair<Float, Float>
-              fun fromPixels(x: Float, y: Float): Pair<Double, Double>
-          }
-
-          /** Portable copy of the current catalog — no tile sources attached. */
-          fun MapSetup.descriptors(): List<BaseLayerDescriptor> =
-              baseLayers.map {
-                  BaseLayerDescriptor(
-                      key = it.key,
-                      label = it.label,
-                      attribution = it.attribution,
-                      maxDownloadZoom = it.maxDownloadZoom,
-                      bulkDownload = it.bulkDownload,
+          private fun buzz(context: android.content.Context) {
+              runCatching {
+                  val vib = if (android.os.Build.VERSION.SDK_INT >= 31) {
+                      (context.getSystemService(android.content.Context.VIBRATOR_MANAGER_SERVICE)
+                          as android.os.VibratorManager).defaultVibrator
+                  } else {
+                      @Suppress("DEPRECATION")
+                      context.getSystemService(android.content.Context.VIBRATOR_SERVICE)
+                          as android.os.Vibrator
+                  }
+                  vib.vibrate(
+                      android.os.VibrationEffect.createWaveform(longArrayOf(0, 200, 120, 200), -1)
                   )
               }
-
-          fun MapSetup.descriptorFor(key: String): BaseLayerDescriptor =
-              descriptors().firstOrNull { it.key == key } ?: descriptors().first()
-          EOF_GRIDFIX
-          mkdir -p 'app/src/test/java/app/gridfix/android'
-          cat > 'app/src/test/java/app/gridfix/android/CoordinatesTest.kt' <<'EOF_GRIDFIX'
-          package app.gridfix.android
-
-          import app.gridfix.android.coords.Coordinates
-          import org.junit.Assert.assertEquals
-          import org.junit.Assert.assertNotNull
-          import org.junit.Assert.assertNull
-          import org.junit.Assert.assertTrue
-          import org.junit.Test
-
-          /**
-           * The field math is the part of this app that must never drift quietly: a wrong
-           * grid looks exactly like a right one. These run on the JVM in CI on every build.
-           */
-          class CoordinatesTest {
-
-              // ---- MGRS round trip -------------------------------------------------
-
-              @Test
-              fun `mgrs round trips at every precision`() {
-                  val places = listOf(
-                      24.4539 to 54.3773,      // Abu Dhabi
-                      36.1699 to -115.1398,    // Las Vegas
-                      -33.8688 to 151.2093,    // Sydney, southern hemisphere
-                      51.5074 to -0.1278,      // London, straddling the prime meridian
-                      -1.2921 to 36.8219,      // Nairobi, near the equator
-                  )
-                  for ((lat, lon) in places) {
-                      for (digits in listOf(4, 6, 8, 10)) {
-                          val first = Coordinates.mgrs(lat, lon, digits)
-                          assertNotNull("no MGRS for $lat,$lon at $digits", first)
-                          val parsed = Coordinates.parseMgrs(first!!.full)
-                          assertNotNull("could not parse ${first.full}", parsed)
-                          val again = Coordinates.mgrs(parsed!!.first, parsed.second, digits)
-                          assertEquals(
-                              "round trip changed the grid at $digits digits",
-                              first.full,
-                              again?.full,
-                          )
-                      }
-                  }
-              }
-
-              @Test
-              fun `single digit zones keep their leading zero handling`() {
-                  // Zone 1, western Aleutians: the GZD is "1" not "01", and must survive a round trip.
-                  val g = Coordinates.mgrs(52.0, -177.0, 8)
-                  assertNotNull(g)
-                  assertTrue("unexpected GZD ${g!!.gzd}", g.gzd.startsWith("1"))
-                  val parsed = Coordinates.parseMgrs(g.full)
-                  assertNotNull(parsed)
-                  assertEquals(g.full, Coordinates.mgrs(parsed!!.first, parsed.second, 8)?.full)
-              }
-
-              // ---- Zone exceptions -------------------------------------------------
-
-              @Test
-              fun `norway 32V exception`() {
-                  // South-west Norway: zone 32 is widened, so 59N 6E is 32V, not 31V.
-                  assertEquals("32V", Coordinates.mgrs(59.0, 6.0, 8)?.gzd)
-              }
-
-              @Test
-              fun `svalbard zone exceptions`() {
-                  assertEquals("31X", Coordinates.mgrs(78.0, 5.0, 8)?.gzd)
-                  assertEquals("33X", Coordinates.mgrs(78.0, 15.0, 8)?.gzd)
-                  assertEquals("35X", Coordinates.mgrs(78.0, 25.0, 8)?.gzd)
-                  assertEquals("37X", Coordinates.mgrs(78.0, 35.0, 8)?.gzd)
-              }
-
-              // ---- Cell centre, not the SW corner ----------------------------------
-
-              @Test
-              fun `parse lands on the cell centre`() {
-                  // A 4-digit grid is a 1 km square. Parsing must aim at the middle of it:
-                  // if someone "fixes" this back to the SW corner, re-formatting can fall
-                  // into the neighbouring cell, and this test is why it must not happen.
-                  //
-                  // Asserted with tolerance rather than an exact "500": the point makes a
-                  // round trip through our Snyder inverse and then NGA's own forward
-                  // projection, and the two agree to about a metre, not to the millimetre.
-                  // A corner would read 000 and a centre reads 499-501, so a metre of slack
-                  // costs nothing and keeps the test from failing for the wrong reason.
-                  val parsed = Coordinates.parseMgrs("33UXP0000")
-                  assertNotNull(parsed)
-                  val fine = Coordinates.mgrs(parsed!!.first, parsed.second, 10)
-                  assertNotNull(fine)
-                  val eastingInCell = fine!!.easting.takeLast(3).toInt()
-                  val northingInCell = fine.northing.takeLast(3).toInt()
-                  assertTrue(
-                      "easting ${fine.easting} is not a cell centre (got $eastingInCell m into the cell)",
-                      eastingInCell in 400..600,
-                  )
-                  assertTrue(
-                      "northing ${fine.northing} is not a cell centre (got $northingInCell m into the cell)",
-                      northingInCell in 400..600,
-                  )
-              }
-
-              @Test
-              fun `parse accepts spaces and lower case`() {
-                  val a = Coordinates.parseMgrs("33U XP 0000 0000")
-                  val b = Coordinates.parseMgrs("33uxp00000000")
-                  assertNotNull(a)
-                  assertNotNull(b)
-                  assertEquals(a!!.first, b!!.first, 1e-9)
-                  assertEquals(a.second, b.second, 1e-9)
-              }
-
-              @Test
-              fun `rubbish does not parse`() {
-                  assertNull(Coordinates.parseMgrs("not a grid"))
-                  assertNull(Coordinates.parseMgrs(""))
-              }
-
-              // ---- Angle formatting wrap -------------------------------------------
-
-              @Test
-              fun `angles wrap instead of showing 360`() {
-                  assertEquals("000°", Coordinates.formatAngle(359.5f, 0))
-                  assertEquals("000°", Coordinates.formatAngle(360f, 0))
-                  assertEquals("359°", Coordinates.formatAngle(359.4f, 0))
-                  assertEquals("045°", Coordinates.formatAngle(45f, 0))
-                  assertEquals("0 mils", Coordinates.formatAngle(360f, 1))
-                  assertEquals("800 mils", Coordinates.formatAngle(45f, 1))
-              }
-
-              @Test
-              fun `negative angles normalise`() {
-                  assertEquals("270°", Coordinates.formatAngle(-90f, 0))
-                  assertEquals("4800 mils", Coordinates.formatAngle(-90f, 1))
-              }
-
-              // ---- Ray intersection ------------------------------------------------
-
-              @Test
-              fun `converging rays give a fix ahead of both observers`() {
-                  val fix = Coordinates.rayIntersection(36.0, 45.0, 45.0, 36.0, 45.01, 315.0)
-                  assertNotNull("converging rays should intersect", fix)
-                  assertTrue("fix should be north of both observers", fix!!.lat > 36.0)
-                  assertTrue(fix.dist1 > 0.0 && fix.dist2 > 0.0)
-              }
-
-              @Test
-              fun `parallel rays give no fix`() {
-                  assertNull(Coordinates.rayIntersection(36.0, 45.0, 90.0, 36.01, 45.0, 90.0))
-              }
-
-              @Test
-              fun `a crossing behind the observers gives no fix`() {
-                  // Both rays point away from each other: they only "cross" behind.
-                  assertNull(Coordinates.rayIntersection(36.0, 45.0, 225.0, 36.0, 45.01, 135.0))
-              }
-
-              @Test
-              fun `a crossing beyond 100 km gives no fix`() {
-                  // Almost parallel: the crossing is far outside any believable compass shot.
-                  assertNull(Coordinates.rayIntersection(36.0, 45.0, 1.0, 36.0, 45.01, 0.5))
-              }
-
-              // ---- Grid convergence -------------------------------------------------
-
-              @Test
-              fun `convergence is zero on the central meridian and grows towards the edge`() {
-                  // Zone 38 runs 42E-48E, central meridian 45E.
-                  assertEquals(0.0, Coordinates.gridConvergence(36.0, 45.0), 1e-6)
-                  val east = Coordinates.gridConvergence(36.0, 47.5)
-                  val west = Coordinates.gridConvergence(36.0, 42.5)
-                  assertTrue("east of the CM should be positive, was $east", east > 0.5)
-                  assertTrue("west of the CM should be negative, was $west", west < -0.5)
-              }
-
-              // ---- Corner parse (roadmap A: photo-map control points) ----------------
-
-              @Test
-              fun `corner parse lands half a cell south-west of the centre parse`() {
-                  // A 4-digit grid is a 1 km cell, so the centre sits 500 m east and
-                  // 500 m north of the corner. Compared in UTM so no geodesic is needed.
-                  val corner = Coordinates.parseMgrsCorner("33UXP1234")
-                  val centre = Coordinates.parseMgrs("33UXP1234")
-                  assertNotNull(corner)
-                  assertNotNull(centre)
-                  val cu = Coordinates.utm(corner!!.first, corner.second)!!
-                  val mu = Coordinates.utm(centre!!.first, centre.second)!!
-                  assertEquals(cu.zone.toLong(), mu.zone.toLong())
-                  assertEquals(500.0, (mu.easting - cu.easting).toDouble(), 2.0)
-                  assertEquals(500.0, (mu.northing - cu.northing).toDouble(), 2.0)
-              }
-
-              @Test
-              fun `corner parse sits on the grid lines it names`() {
-                  // 33UXP1234 names easting line 12000 and northing line 34000 inside
-                  // the 100 km square. The round trip is good to about a metre.
-                  val corner = Coordinates.parseMgrsCorner("33U XP 12 34")
-                  assertNotNull(corner)
-                  val u = Coordinates.utm(corner!!.first, corner.second)!!
-                  assertEquals(12000.0, (u.easting % 100000L).toDouble(), 2.0)
-                  assertEquals(34000.0, (u.northing % 100000L).toDouble(), 2.0)
-              }
-
-              @Test
-              fun `corner parse rejects junk the same way the centre parse does`() {
-                  assertNull(Coordinates.parseMgrsCorner(""))
-                  assertNull(Coordinates.parseMgrsCorner("not a grid"))
-              }
-
-              // ---- Grid line number scaling ------------------------------------------
-
-              @Test
-              fun `grid line numbers scale to five digits`() {
-                  assertEquals(45000.0, Coordinates.scaleGridLineNumber("45")!!, 0.0)
-                  assertEquals(45600.0, Coordinates.scaleGridLineNumber("456")!!, 0.0)
-                  assertEquals(45670.0, Coordinates.scaleGridLineNumber("4567")!!, 0.0)
-                  assertEquals(45678.0, Coordinates.scaleGridLineNumber("45678")!!, 0.0)
-                  assertEquals(0.0, Coordinates.scaleGridLineNumber("00")!!, 0.0)
-                  assertEquals(45000.0, Coordinates.scaleGridLineNumber(" 45 ")!!, 0.0)
-              }
-
-              @Test
-              fun `grid line numbers reject the shapes a control point cannot use`() {
-                  assertNull(Coordinates.scaleGridLineNumber(""))
-                  assertNull(Coordinates.scaleGridLineNumber("4"))
-                  assertNull(Coordinates.scaleGridLineNumber("456789"))
-                  assertNull(Coordinates.scaleGridLineNumber("4a5"))
-                  assertNull(Coordinates.scaleGridLineNumber("45.6"))
-                  assertNull(Coordinates.scaleGridLineNumber("-45"))
-              }
           }
-          EOF_GRIDFIX
-          mkdir -p 'app/src/test/java/app/gridfix/android'
-          cat > 'app/src/test/java/app/gridfix/android/GoldenTest.kt' <<'EOF_GRIDFIX'
-          package app.gridfix.android
 
-          import app.gridfix.android.coords.Coordinates
-          import app.gridfix.android.coords.Geodesy
-          import org.junit.Assert.assertEquals
-          import org.junit.Assert.assertNotNull
-          import org.junit.Assert.assertTrue
-          import org.junit.Test
-          import kotlin.math.abs
-
-          /**
-           * The cross-platform contract.
-           *
-           * Every vector here also ships to the iOS port as `golden.json`, where
-           * GoldenTests.swift asserts the same things. One generator produced both, so
-           * if the two platforms ever compute a different grid or a different range for
-           * the same point, one of the two suites goes red instead of two soldiers
-           * reading different numbers off the same map.
-           *
-           * This suite is deliberately paranoid about the projection boundary: the MGRS
-           * strings come from NGA's library here and from our own Snyder series on iOS,
-           * which is two implementations of one standard, and the only honest way to
-           * hold two implementations together is to check them against each other.
-           */
-          class GoldenTest {
-
-              @Test
-              fun `the fixture actually loaded`() {
-                  assertTrue("no UTM vectors", GoldenVectors.utm.size > 20)
-                  assertTrue("no MGRS vectors", GoldenVectors.mgrsForward.size > 50)
-                  assertTrue("no parse vectors", GoldenVectors.mgrsParse.size > 50)
-                  assertTrue("no distance vectors", GoldenVectors.distance.size > 10)
-                  assertTrue("no convergence vectors", GoldenVectors.convergence.size > 50)
-              }
-
-              // ---- UTM ---------------------------------------------------------------
-
-              @Test
-              fun `utm forward matches the shared vectors`() {
-                  for (v in GoldenVectors.utm) {
-                      val p = Coordinates.utmForZone(v.lat, v.lon, v.zone, v.hemisphere == 'N')
-                      assertEquals("easting for ${v.name}", v.easting, p[0], GoldenVectors.TOL_UTM_METERS)
-                      assertEquals("northing for ${v.name}", v.northing, p[1], GoldenVectors.TOL_UTM_METERS)
+          @Composable
+          private fun PermissionGate(onRequest: () -> Unit, approximateOnly: Boolean = false) {
+              val context = LocalContext.current
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .padding(32.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally,
+                  verticalArrangement = Arrangement.Center,
+              ) {
+                  Icon(
+                      Icons.Outlined.MyLocation,
+                      contentDescription = null,
+                      modifier = Modifier.size(56.dp),
+                      tint = MaterialTheme.colorScheme.primary,
+                  )
+                  Spacer(Modifier.height(16.dp))
+                  Text(
+                      if (approximateOnly) "Precise location needed" else "Location access needed",
+                      style = MaterialTheme.typography.titleLarge,
+                  )
+                  Spacer(Modifier.height(8.dp))
+                  Text(
+                      if (approximateOnly) {
+                          "Only approximate location was allowed. A grid readout needs the GPS chip — " +
+                              "choose \"Precise\" when asked, or switch it on in the app's permission settings."
+                      } else {
+                          "MGRS GPS reads your position straight from the GPS chip. Everything stays on your phone — no account, no tracking, no internet needed."
+                      },
+                      style = MaterialTheme.typography.bodyMedium,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      textAlign = TextAlign.Center,
+                  )
+                  Spacer(Modifier.height(24.dp))
+                  Button(onClick = onRequest) {
+                      Text(if (approximateOnly) "Allow precise location" else "Grant location access")
                   }
-              }
-
-              @Test
-              fun `utm picks the same zone and band as the shared vectors`() {
-                  for (v in GoldenVectors.utm) {
-                      val u = Coordinates.utm(v.lat, v.lon)
-                      assertNotNull("no UTM for ${v.name}", u)
-                      assertEquals("zone for ${v.name}", v.zone.toLong(), u!!.zone.toLong())
-                      assertEquals("hemisphere for ${v.name}", v.hemisphere, u.hemisphere)
-                      assertEquals("band for ${v.name}", v.band, Coordinates.bandLetter(v.lat))
-                      assertEquals("easting for ${v.name}", v.easting, u.easting.toDouble(), 1.0)
-                      assertEquals("northing for ${v.name}", v.northing, u.northing.toDouble(), 1.0)
-                  }
-              }
-
-              @Test
-              fun `utm inverse returns the point it was given`() {
-                  for (v in GoldenVectors.utm) {
-                      val ll = Coordinates.utmInverse(v.easting, v.northing, v.zone, v.hemisphere == 'N')
-                      assertEquals("lat for ${v.name}", v.lat, ll[0], 1e-7)
-                      assertEquals("lon for ${v.name}", v.lon, ll[1], 1e-7)
-                  }
-              }
-
-              // ---- MGRS --------------------------------------------------------------
-
-              @Test
-              fun `mgrs forward matches the shared vectors exactly`() {
-                  // Only where the margin is overwhelming. Every vector sits at its own
-                  // cell centre, so a 1 km cell gives 500 m of clearance and a 100 m cell
-                  // gives 50 m — far more than any disagreement between two correct
-                  // projections. The 10 m cells are checked by position below instead,
-                  // because NGA's forward and our Snyder series are known to differ by
-                  // about a metre and that is only a 5 m margin.
-                  for (v in GoldenVectors.mgrsForward) {
-                      if (v.digits > 6) continue
-                      val parts = Coordinates.mgrs(v.lat, v.lon, v.digits)
-                      assertNotNull("no MGRS for ${v.name}", parts)
-                      val compact = parts!!.gzd + parts.square + parts.easting + parts.northing
-                      assertEquals("${v.name} at ${v.digits} digits", v.mgrs, compact)
-                  }
-              }
-
-              @Test
-              fun `mgrs forward agrees with the shared vectors to within a metre at ten metre cells`() {
-                  for (v in GoldenVectors.mgrsForward) {
-                      if (v.digits <= 6) continue
-                      val parts = Coordinates.mgrs(v.lat, v.lon, v.digits)!!
-                      val compact = parts.gzd + parts.square + parts.easting + parts.northing
-                      if (compact == v.mgrs) continue
-                      // Different string: allowed only if the two grids name points that
-                      // are within 3 m of each other, i.e. the last digit rolled over.
-                      val a = Coordinates.parseMgrs(compact)
-                      val b = Coordinates.parseMgrs(v.mgrs)
-                      assertNotNull("could not parse $compact", a)
-                      assertNotNull("could not parse ${v.mgrs}", b)
-                      val gap = Geodesy.distanceAndBearing(a!!.first, a.second, b!!.first, b.second)[0]
-                      assertTrue(
-                          "${v.name}: got $compact, shared vector says ${v.mgrs}, ${gap} m apart",
-                          gap < 3.0,
-                      )
-                  }
-              }
-
-              @Test
-              fun `mgrs parts split the way the readout expects`() {
-                  for (v in GoldenVectors.mgrsForward) {
-                      val p = Coordinates.mgrs(v.lat, v.lon, v.digits)!!
-                      assertEquals("easting digits for ${v.name}", (v.digits / 2).toLong(), p.easting.length.toLong())
-                      assertEquals("northing digits for ${v.name}", (v.digits / 2).toLong(), p.northing.length.toLong())
-                      assertEquals("square for ${v.name}", 2L, p.square.length.toLong())
-                      assertEquals("${p.gzd} ${p.square} ${p.easting} ${p.northing}", p.full)
-                  }
-              }
-
-              @Test
-              fun `mgrs parse hits the cell centre the shared vectors name`() {
-                  for (v in GoldenVectors.mgrsParse) {
-                      val p = Coordinates.parseMgrs(v.mgrs)
-                      assertNotNull("no parse for ${v.mgrs}", p)
-                      assertEquals("centre lat for ${v.mgrs}", v.centreLat, p!!.first, GoldenVectors.TOL_LATLON_DEGREES)
-                      assertEquals("centre lon for ${v.mgrs}", v.centreLon, p.second, GoldenVectors.TOL_LATLON_DEGREES)
-                  }
-              }
-
-              @Test
-              fun `mgrs corner parse hits the grid line intersection`() {
-                  for (v in GoldenVectors.mgrsParse) {
-                      val p = Coordinates.parseMgrsCorner(v.mgrs)
-                      assertNotNull("no corner for ${v.mgrs}", p)
-                      assertEquals("corner lat for ${v.mgrs}", v.cornerLat, p!!.first, GoldenVectors.TOL_LATLON_DEGREES)
-                      assertEquals("corner lon for ${v.mgrs}", v.cornerLon, p.second, GoldenVectors.TOL_LATLON_DEGREES)
-                  }
-              }
-
-              @Test
-              fun `every shared grid string round trips`() {
-                  for (v in GoldenVectors.mgrsForward) {
-                      val p = Coordinates.parseMgrs(v.mgrs)!!
-                      val again = Coordinates.mgrs(p.first, p.second, v.digits)!!
-                      assertEquals(
-                          "round trip for ${v.mgrs}",
-                          v.mgrs,
-                          again.gzd + again.square + again.easting + again.northing,
-                      )
-                  }
-              }
-
-              // ---- Geodesy -----------------------------------------------------------
-
-              @Test
-              fun `distance matches the shared vectors`() {
-                  // These came from Vincenty on WGS84, the same formula
-                  // android.location.Location.distanceBetween runs. Agreement here is
-                  // what proves the swap to a pure-Kotlin geodesic moved no number.
-                  for (v in GoldenVectors.distance) {
-                      val d = Geodesy.distanceAndBearing(v.fromLat, v.fromLon, v.toLat, v.toLon)
-                      assertEquals("distance for ${v.name}", v.meters, d[0], GoldenVectors.TOL_DISTANCE_METERS)
-                  }
-              }
-
-              @Test
-              fun `bearing matches the shared vectors`() {
-                  for (v in GoldenVectors.distance) {
-                      if (v.meters <= 1.0) continue
-                      val n = Coordinates.navInfo(v.fromLat, v.fromLon, v.toLat, v.toLon)
-                      var delta = abs(n.bearingTrue.toDouble() - v.bearing) % 360.0
-                      if (delta > 180.0) delta = 360.0 - delta
-                      assertTrue(
-                          "bearing for ${v.name}: got ${n.bearingTrue}, want ${v.bearing}",
-                          delta < GoldenVectors.TOL_BEARING_DEGREES,
-                      )
-                  }
-              }
-
-              @Test
-              fun `navInfo normalises the bearing into a compass circle`() {
-                  for (v in GoldenVectors.distance) {
-                      val n = Coordinates.navInfo(v.fromLat, v.fromLon, v.toLat, v.toLon)
-                      assertTrue("bearing ${n.bearingTrue} for ${v.name} is outside 0..360",
-                          n.bearingTrue >= 0f && n.bearingTrue < 360f)
-                      assertTrue("distance for ${v.name} is not a number", !n.distanceMeters.isNaN())
-                  }
-              }
-
-              @Test
-              fun `distance is the same in both directions`() {
-                  for (v in GoldenVectors.distance) {
-                      val there = Geodesy.distanceAndBearing(v.fromLat, v.fromLon, v.toLat, v.toLon)[0]
-                      val back = Geodesy.distanceAndBearing(v.toLat, v.toLon, v.fromLat, v.fromLon)[0]
-                      assertEquals("distance for ${v.name} is not symmetric", there, back, 0.001)
-                  }
-              }
-
-              @Test
-              fun `a zero length leg does not produce NaN`() {
-                  val n = Coordinates.navInfo(24.4539, 54.3773, 24.4539, 54.3773)
-                  assertEquals(0f, n.distanceMeters, 1e-6f)
-                  assertTrue(!n.bearingTrue.isNaN())
-              }
-
-              @Test
-              fun `the great circle shortcut is close but not close enough to use`() {
-                  // Documents the size of the error the app declines to accept: half a
-                  // percent, which is nothing on a course ring and metres on a long leg.
-                  var worst = 0.0
-                  for (v in GoldenVectors.distance) {
-                      if (v.meters <= 1000.0) continue
-                      val gc = Geodesy.greatCircleMeters(v.fromLat, v.fromLon, v.toLat, v.toLon)
-                      worst = maxOf(worst, abs(gc - v.meters) / v.meters)
-                  }
-                  assertTrue("great circle should differ from the ellipsoid at all", worst > 1e-4)
-                  assertTrue("great circle drifted further than expected: $worst", worst < 0.008)
-              }
-
-              @Test
-              fun `grid convergence matches the shared vectors`() {
-                  for (v in GoldenVectors.convergence) {
-                      val c = Coordinates.gridConvergence(v.lat, v.lon)
-                      // gridConvergence resolves the zone from the point; the vector
-                      // carries the zone it was generated in, so only compare where the
-                      // two agree — the special zones are covered by their own points.
-                      if (Coordinates.utm(v.lat, v.lon)?.zone != v.zone) continue
-                      assertEquals(
-                          "convergence at ${v.lat}, ${v.lon}",
-                          v.degrees, c, GoldenVectors.TOL_CONVERGENCE_DEGREES,
-                      )
+                  if (approximateOnly) {
+                      Spacer(Modifier.height(8.dp))
+                      TextButton(onClick = {
+                          runCatching {
+                              context.startActivity(
+                                  android.content.Intent(
+                                      android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                      android.net.Uri.fromParts("package", context.packageName, null),
+                                  )
+                              )
+                          }
+                      }) { Text("Open app settings") }
                   }
               }
           }
@@ -1691,6 +1458,11 @@ jobs:
                   val lat: Double, val lon: Double, val zone: Int, val degrees: Double,
               )
 
+              /** Expected GeoJSON geometry for a tactical graphic. "none" = emit nothing. */
+              data class GraphicGeometry(
+                  val type: String, val vertexCount: Int, val kind: String,
+              )
+
               private fun rows(csv: String): List<List<String>> =
                   csv.trim().lines().filter { it.isNotBlank() }.map { it.split(",") }
 
@@ -1724,6 +1496,12 @@ jobs:
               val convergence: List<Convergence> by lazy {
                   rows(CONVERGENCE_CSV).map {
                       Convergence(it[0].toDouble(), it[1].toDouble(), it[2].toInt(), it[3].toDouble())
+                  }
+              }
+
+              val graphicGeometry: List<GraphicGeometry> by lazy {
+                  rows(GRAPHIC_GEOMETRY_CSV).map {
+                      GraphicGeometry(it[0], it[1].toInt(), it[2])
                   }
               }
 
@@ -2075,171 +1853,400 @@ jobs:
           -45.0311,172.0,59,-0.707526374
           -45.0311,173.5,59,-1.769286963
           """
+
+              // type,vertexCount,kind
+              private const val GRAPHIC_GEOMETRY_CSV = """
+          phase_line,0,none
+          phase_line,1,Point
+          phase_line,2,LineString
+          phase_line,3,LineString
+          phase_line,4,LineString
+          phase_line,7,LineString
+          boundary,0,none
+          boundary,1,Point
+          boundary,2,LineString
+          boundary,3,LineString
+          boundary,4,LineString
+          boundary,7,LineString
+          axis,0,none
+          axis,1,Point
+          axis,2,LineString
+          axis,3,LineString
+          axis,4,LineString
+          axis,7,LineString
+          doa,0,none
+          doa,1,Point
+          doa,2,LineString
+          doa,3,LineString
+          doa,4,LineString
+          doa,7,LineString
+          objective,0,none
+          objective,1,Point
+          objective,2,LineString
+          objective,3,Polygon
+          objective,4,Polygon
+          objective,7,Polygon
+          aa,0,none
+          aa,1,Point
+          aa,2,LineString
+          aa,3,Polygon
+          aa,4,Polygon
+          aa,7,Polygon
+          route,0,none
+          route,1,Point
+          route,2,LineString
+          route,3,LineString
+          route,4,LineString
+          route,7,LineString
+          lz,0,none
+          lz,1,Point
+          lz,2,LineString
+          lz,3,Polygon
+          lz,4,Polygon
+          lz,7,Polygon
+          pz,0,none
+          pz,1,Point
+          pz,2,LineString
+          pz,3,Polygon
+          pz,4,Polygon
+          pz,7,Polygon
+          bp,0,none
+          bp,1,Point
+          bp,2,LineString
+          bp,3,Polygon
+          bp,4,Polygon
+          bp,7,Polygon
+          ea,0,none
+          ea,1,Point
+          ea,2,LineString
+          ea,3,Polygon
+          ea,4,Polygon
+          ea,7,Polygon
+          nai,0,none
+          nai,1,Point
+          nai,2,LineString
+          nai,3,Polygon
+          nai,4,Polygon
+          nai,7,Polygon
+          tai,0,none
+          tai,1,Point
+          tai,2,LineString
+          tai,3,Polygon
+          tai,4,Polygon
+          tai,7,Polygon
+          area,0,none
+          area,1,Point
+          area,2,LineString
+          area,3,Polygon
+          area,4,Polygon
+          area,7,Polygon
+          screen_l,0,none
+          screen_l,1,Point
+          screen_l,2,LineString
+          screen_l,3,LineString
+          screen_l,4,LineString
+          screen_l,7,LineString
+          guard_l,0,none
+          guard_l,1,Point
+          guard_l,2,LineString
+          guard_l,3,LineString
+          guard_l,4,LineString
+          guard_l,7,LineString
+          cover_l,0,none
+          cover_l,1,Point
+          cover_l,2,LineString
+          cover_l,3,LineString
+          cover_l,4,LineString
+          cover_l,7,LineString
+          flot,0,none
+          flot,1,Point
+          flot,2,LineString
+          flot,3,LineString
+          flot,4,LineString
+          flot,7,LineString
+          obstacle_line,0,none
+          obstacle_line,1,Point
+          obstacle_line,2,LineString
+          obstacle_line,3,LineString
+          obstacle_line,4,LineString
+          obstacle_line,7,LineString
+          wire,0,none
+          wire,1,Point
+          wire,2,LineString
+          wire,3,LineString
+          wire,4,LineString
+          wire,7,LineString
+          lane,0,none
+          lane,1,Point
+          lane,2,LineString
+          lane,3,LineString
+          lane,4,LineString
+          lane,7,LineString
+          minefield,0,none
+          minefield,1,Point
+          minefield,2,LineString
+          minefield,3,Polygon
+          minefield,4,Polygon
+          minefield,7,Polygon
+          strongpoint,0,none
+          strongpoint,1,Point
+          strongpoint,2,LineString
+          strongpoint,3,Polygon
+          strongpoint,4,Polygon
+          strongpoint,7,Polygon
+          roadblock,0,none
+          roadblock,1,Point
+          roadblock,2,LineString
+          roadblock,3,LineString
+          roadblock,4,LineString
+          roadblock,7,LineString
+          ring,0,none
+          ring,1,Point
+          ring,2,LineString
+          ring,3,LineString
+          ring,4,LineString
+          ring,7,LineString
+          sector,0,none
+          sector,1,Point
+          sector,2,LineString
+          sector,3,LineString
+          sector,4,LineString
+          sector,7,LineString
+          trp,0,none
+          trp,1,Point
+          trp,2,LineString
+          trp,3,LineString
+          trp,4,LineString
+          trp,7,LineString
+          checkpoint,0,none
+          checkpoint,1,Point
+          checkpoint,2,LineString
+          checkpoint,3,LineString
+          checkpoint,4,LineString
+          checkpoint,7,LineString
+          dp,0,none
+          dp,1,Point
+          dp,2,LineString
+          dp,3,LineString
+          dp,4,LineString
+          dp,7,LineString
+          text,0,none
+          text,1,Point
+          text,2,LineString
+          text,3,LineString
+          text,4,LineString
+          text,7,LineString
+          """
+
+              /** The graphic types that close into a polygon when they have 3+ vertices. */
+              val areaTypes: Set<String> = setOf("aa", "area", "bp", "ea", "lz", "minefield", "nai", "objective", "pz", "strongpoint", "tai")
           }
           EOF_GRIDFIX
           mkdir -p 'app/src/test/java/app/gridfix/android'
-          cat > 'app/src/test/java/app/gridfix/android/PortableModelTest.kt' <<'EOF_GRIDFIX'
+          cat > 'app/src/test/java/app/gridfix/android/GraphicGeoJsonTest.kt' <<'EOF_GRIDFIX'
           package app.gridfix.android
 
-          import app.gridfix.android.map.ELEVATION_MAX_CACHED_TILES
-          import app.gridfix.android.map.ElevationStore
-          import app.gridfix.android.map.GridLine
-          import app.gridfix.android.map.ImageQuad
-          import app.gridfix.android.map.chooseGridInterval
-          import app.gridfix.android.map.gridIntervalLabel
-          import app.gridfix.android.map.trimOldest
+          import app.gridfix.android.data.GeoVertex
+          import app.gridfix.android.data.GraphicTypes
+          import app.gridfix.android.data.TacGraphic
+          import app.gridfix.android.platform.graphicGeometryKind
+          import app.gridfix.android.platform.toGeoJson
+          import app.gridfix.android.platform.toGeoJsonFeature
+          import org.json.JSONArray
+          import org.json.JSONObject
           import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertNotNull
+          import org.junit.Assert.assertNull
           import org.junit.Assert.assertTrue
-          import org.junit.Rule
           import org.junit.Test
-          import org.junit.rules.TemporaryFolder
-          import java.io.File
 
           /**
-           * The engine-agnostic models the MapLibre and iOS ports build on. These have no
-           * Canvas and no osmdroid, so they are the first part of the map that CI can
-           * actually check — the overlay itself is only ever proven on a screen.
+           * Tactical graphics as GeoJSON — the shape MapLibre consumes on both platforms.
+           *
+           * The geometry rule has to match the KML export exactly, because the same
+           * graphic exported two ways and coming back as two different shapes is a data
+           * bug the user only discovers after a round trip through someone else's app.
+           * The same table drives the Swift port through [GoldenVectors.graphicGeometry].
            */
-          class PortableModelTest {
+          class GraphicGeoJsonTest {
 
-              @get:Rule
-              val temp = TemporaryFolder()
+              private fun g(
+                  type: String,
+                  n: Int,
+                  name: String = "OBJ FALCON",
+                  folder: String = "Base",
+              ) = TacGraphic(
+                  id = "g-$type-$n",
+                  name = name,
+                  type = type,
+                  points = (0 until n).map { GeoVertex(24.45 + it * 0.001, 54.37 + it * 0.001) },
+                  folder = folder,
+                  affiliation = "friend",
+                  echelon = "co",
+              )
 
-              // ---- Grid interval: must stay in step with MgrsGridOverlay.draw() ------
-
-              @Test
-              fun `interval is the finest grid that still clears the minimum spacing`() {
-                  // 48 dp of screen per line: at density 2 that is 96 px.
-                  assertEquals(10L, chooseGridInterval(metersPerPixel = 0.05, density = 2f).toLong())
-                  assertEquals(100L, chooseGridInterval(metersPerPixel = 1.0, density = 2f).toLong())
-                  assertEquals(1000L, chooseGridInterval(metersPerPixel = 10.0, density = 2f).toLong())
-                  assertEquals(10000L, chooseGridInterval(metersPerPixel = 100.0, density = 2f).toLong())
-                  assertEquals(100000L, chooseGridInterval(metersPerPixel = 1000.0, density = 2f).toLong())
-              }
-
-              @Test
-              fun `zoomed all the way out the metre grid gives way to GZD`() {
-                  assertEquals(0L, chooseGridInterval(metersPerPixel = 5000.0, density = 2f).toLong())
-              }
+              // ---- The rule, against the shared fixture ------------------------------
 
               @Test
-              fun `a denser screen asks for a coarser interval at the same zoom`() {
-                  val coarse = chooseGridInterval(metersPerPixel = 2.0, density = 1f)
-                  val dense = chooseGridInterval(metersPerPixel = 2.0, density = 4f)
-                  assertTrue("density should never make the grid finer", dense >= coarse)
-              }
-
-              @Test
-              fun `nonsense input does not crash the chooser`() {
-                  assertEquals(0L, chooseGridInterval(metersPerPixel = 0.0, density = 2f).toLong())
-                  assertEquals(0L, chooseGridInterval(metersPerPixel = -1.0, density = 2f).toLong())
-                  assertEquals(0L, chooseGridInterval(metersPerPixel = 1.0, density = 0f).toLong())
-              }
-
-              @Test
-              fun `every interval the chooser can return has a label`() {
-                  // Guards the two lists drifting apart: a new interval with no label
-                  // would silently render as "10 m" on the readout.
-                  val named = mapOf(
-                      0 to "GZD", 100000 to "100 km", 10000 to "10 km",
-                      1000 to "1 km", 100 to "100 m", 10 to "10 m",
-                  )
-                  val seen = mutableSetOf<Int>()
-                  var mpp = 0.01
-                  while (mpp < 100000.0) {
-                      seen += chooseGridInterval(mpp, 2f)
-                      mpp *= 1.2
+              fun `geometry kind matches the shared fixture for every type`() {
+                  for (v in GoldenVectors.graphicGeometry) {
+                      val expected = if (v.kind == "none") null else v.kind
+                      assertEquals(
+                          "${v.type} with ${v.vertexCount} vertices",
+                          expected,
+                          graphicGeometryKind(v.type, v.vertexCount),
+                      )
                   }
-                  for (i in seen) {
-                      assertEquals("interval $i", named.getValue(i), gridIntervalLabel(i))
-                  }
-                  assertTrue("chooser should exercise more than one interval", seen.size > 3)
               }
 
-              // ---- Calibrated image quad (roadmap A / C) -----------------------------
+              @Test
+              fun `the fixture agrees with GraphicTypes about which types are areas`() {
+                  // Two lists of area types that drift apart would close the wrong
+                  // graphics into polygons, silently.
+                  val fromApp = GraphicTypes.all.map { it.first }.filter { GraphicTypes.isArea(it) }.toSet()
+                  assertEquals(GoldenVectors.areaTypes, fromApp)
+              }
 
               @Test
-              fun `an image quad needs exactly four corners`() {
-                  val ok = ImageQuad(
-                      id = "a", name = "sketch",
-                      corners = listOf(1.0 to 1.0, 1.0 to 2.0, 2.0 to 2.0, 2.0 to 1.0),
-                  )
-                  assertEquals(4L, ok.corners.size.toLong())
-                  assertEquals(1f, ok.opacity, 0f)
-                  assertTrue(ok.visible)
-                  for (bad in listOf(0, 1, 3, 5)) {
-                      val corners = List(bad) { 0.0 to 0.0 }
-                      var threw = false
-                      try {
-                          ImageQuad(id = "b", name = "bad", corners = corners)
-                      } catch (e: IllegalArgumentException) {
-                          threw = true
+              fun `geometry kind matches the KML exporter exactly`() {
+                  // buildKml: one vertex is a Point, an area type with 3+ closes into a
+                  // Polygon, everything else is a LineString.
+                  for (t in GraphicTypes.all.map { it.first }) {
+                      for (n in 1..6) {
+                          val closed = GraphicTypes.isArea(t) && n >= 3
+                          val kml = when {
+                              n == 1 -> "Point"
+                              closed -> "Polygon"
+                              else -> "LineString"
+                          }
+                          assertEquals("$t/$n", kml, graphicGeometryKind(t, n))
                       }
-                      assertTrue("$bad corners should be rejected", threw)
                   }
               }
 
               @Test
-              fun `a grid line defaults to the metre grid and is not heavy`() {
-                  val line = GridLine(points = listOf(0.0 to 0.0, 0.0 to 1.0))
-                  assertEquals(GridLine.Kind.METRE, line.kind)
-                  assertTrue(!line.heavy)
+              fun `a graphic with no vertices produces no feature at all`() {
+                  // An empty coordinate array is not valid GeoJSON, and one bad feature
+                  // takes the whole layer down rather than just itself.
+                  assertNull(graphicGeometryKind("phase_line", 0))
+                  assertNull(g("phase_line", 0).toGeoJsonFeature())
+                  assertNull(g("objective", 0).toGeoJsonFeature())
               }
 
-              // ---- Elevation cache trim ---------------------------------------------
+              // ---- The documents themselves ------------------------------------------
 
-              private fun store(root: File) = object : ElevationStore {
-                  override val dir: File = root
+              @Test
+              fun `a point graphic is a GeoJSON Point in longitude latitude order`() {
+                  val f = JSONObject(g("trp", 1).toGeoJsonFeature()!!)
+                  val geom = f.getJSONObject("geometry")
+                  assertEquals("Point", geom.getString("type"))
+                  val c = geom.getJSONArray("coordinates")
+                  assertEquals(54.37, c.getDouble(0), 1e-6)
+                  assertEquals(24.45, c.getDouble(1), 1e-6)
               }
 
               @Test
-              fun `trim removes the oldest tiles beyond the cap`() {
-                  val dir = temp.newFolder("dem")
-                  val s = store(dir)
-                  for (i in 0 until 10) {
-                      val f = s.fileFor(12, i, 0)
-                      f.writeBytes(ByteArray(4))
-                      f.setLastModified(1_000_000_000L + i * 60_000L)
+              fun `a line graphic keeps its vertices in order`() {
+                  val f = JSONObject(g("phase_line", 4).toGeoJsonFeature()!!)
+                  val geom = f.getJSONObject("geometry")
+                  assertEquals("LineString", geom.getString("type"))
+                  val c = geom.getJSONArray("coordinates")
+                  assertEquals(4L, c.length().toLong())
+                  assertEquals(54.37, c.getJSONArray(0).getDouble(0), 1e-6)
+                  assertEquals(54.373, c.getJSONArray(3).getDouble(0), 1e-6)
+              }
+
+              @Test
+              fun `an area graphic closes its ring`() {
+                  // A GeoJSON polygon ring must repeat its first vertex last, and the
+                  // coordinates must be nested one level deeper than a line's.
+                  val f = JSONObject(g("objective", 4).toGeoJsonFeature()!!)
+                  val geom = f.getJSONObject("geometry")
+                  assertEquals("Polygon", geom.getString("type"))
+                  val rings = geom.getJSONArray("coordinates")
+                  assertEquals(1L, rings.length().toLong())
+                  val ring = rings.getJSONArray(0)
+                  assertEquals(5L, ring.length().toLong())
+                  assertEquals(ring.getJSONArray(0).getDouble(0), ring.getJSONArray(4).getDouble(0), 1e-9)
+                  assertEquals(ring.getJSONArray(0).getDouble(1), ring.getJSONArray(4).getDouble(1), 1e-9)
+              }
+
+              @Test
+              fun `an area type with only two vertices stays a line`() {
+                  val f = JSONObject(g("objective", 2).toGeoJsonFeature()!!)
+                  assertEquals("LineString", f.getJSONObject("geometry").getString("type"))
+              }
+
+              @Test
+              fun `properties carry what the style layers filter on`() {
+                  val f = JSONObject(g("boundary", 2).toGeoJsonFeature()!!)
+                  val p = f.getJSONObject("properties")
+                  assertEquals("g-boundary-2", p.getString("id"))
+                  assertEquals("OBJ FALCON", p.getString("name"))
+                  assertEquals("boundary", p.getString("tacType"))
+                  assertEquals("Base", p.getString("folder"))
+                  assertEquals("friend", p.getString("affiliation"))
+                  assertEquals("co", p.getString("echelon"))
+              }
+
+              // ---- Escaping ----------------------------------------------------------
+
+              @Test
+              fun `a name with quotes and control characters still parses`() {
+                  // A user can paste anything into a name field. A raw tab or newline
+                  // inside a JSON string is invalid and would break the whole overlay.
+                  val nasty = "OBJ \"FALCON\"\tone\ntwo\\three\r\u0001"
+                  val f = JSONObject(g("objective", 3, name = nasty).toGeoJsonFeature()!!)
+                  assertEquals(nasty, f.getJSONObject("properties").getString("name"))
+              }
+
+              @Test
+              fun `a folder name with a quote survives the round trip`() {
+                  val f = JSONObject(g("nai", 3, folder = "OBJ \"Falcon\"").toGeoJsonFeature()!!)
+                  assertEquals("OBJ \"Falcon\"", f.getJSONObject("properties").getString("folder"))
+              }
+
+              // ---- Collections --------------------------------------------------------
+
+              @Test
+              fun `a whole overlay is one FeatureCollection`() {
+                  val all = listOf(
+                      g("phase_line", 3), g("objective", 4), g("trp", 1),
+                      g("phase_line", 0),          // no geometry: must drop out entirely
+                  )
+                  val doc = JSONObject(all.toGeoJson())
+                  assertEquals("FeatureCollection", doc.getString("type"))
+                  val features: JSONArray = doc.getJSONArray("features")
+                  assertEquals(3L, features.length().toLong())
+                  val kinds = (0 until features.length()).map {
+                      features.getJSONObject(it).getJSONObject("geometry").getString("type")
                   }
-                  assertEquals(4L, s.trimOldest(maxFiles = 6).toLong())
-                  val left = dir.listFiles()!!.map { it.name }.sorted()
-                  assertEquals(6L, left.size.toLong())
-                  assertTrue("oldest should be gone", "12_0_0.png" !in left)
-                  assertTrue("newest should stay", "12_9_0.png" in left)
+                  assertEquals(listOf("LineString", "Polygon", "Point"), kinds)
               }
 
               @Test
-              fun `trim is a no-op under the cap and on a missing directory`() {
-                  val dir = temp.newFolder("dem2")
-                  val s = store(dir)
-                  assertEquals(0L, s.trimOldest(maxFiles = 400).toLong())
-                  s.fileFor(10, 1, 1).writeBytes(ByteArray(1))
-                  assertEquals(0L, s.trimOldest(maxFiles = 400).toLong())
-                  assertEquals(0L, store(File(dir, "nope")).trimOldest().toLong())
+              fun `an empty overlay is still a valid document`() {
+                  val doc = JSONObject(emptyList<TacGraphic>().toGeoJson())
+                  assertEquals("FeatureCollection", doc.getString("type"))
+                  assertEquals(0L, doc.getJSONArray("features").length().toLong())
               }
 
               @Test
-              fun `trim ignores files that are not tiles`() {
-                  val dir = temp.newFolder("dem3")
-                  val s = store(dir)
-                  for (i in 0 until 5) s.fileFor(9, i, 0).writeBytes(ByteArray(1))
-                  File(dir, "notes.txt").writeText("keep me")
-                  assertEquals(3L, s.trimOldest(maxFiles = 2).toLong())
-                  assertTrue(File(dir, "notes.txt").exists())
-              }
-
-              @Test
-              fun `tile paths are stable and the default cap is what the prefetch assumes`() {
-                  val dir = temp.newFolder("dem4")
-                  assertEquals("12_345_678.png", store(dir).fileFor(12, 345, 678).name)
-                  assertEquals(400L, ELEVATION_MAX_CACHED_TILES.toLong())
+              fun `every graphic type produces a document that parses`() {
+                  for (t in GraphicTypes.all.map { it.first }) {
+                      val min = GraphicTypes.minPoints(t)
+                      val feature = g(t, min).toGeoJsonFeature()
+                      assertNotNull("$t produced no feature at its minimum vertex count", feature)
+                      val f = JSONObject(feature!!)
+                      assertTrue(f.getJSONObject("geometry").has("coordinates"))
+                  }
               }
           }
           EOF_GRIDFIX
-          echo "v0.9.19-e77ff18d578b" > .github/last-payload
+          echo "v0.9.20-2d782b8acb0f" > .github/last-payload
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
-            git -c user.name='GridFix CI' -c user.email='ci@gridfix.local' commit -qm 'Sync v0.9.19 (portable slices, Vincenty, shared golden vectors) source from bootstrap workflow'
+            git -c user.name='GridFix CI' -c user.email='ci@gridfix.local' commit -qm 'Sync v0.9.20 (graphics GeoJSON, notification permission, recording failures visible) source from bootstrap workflow'
             git push origin HEAD:main
           fi
           fi
