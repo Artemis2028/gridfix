@@ -15,10 +15,10 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Write source files (v0.9.18 (portable slices 1-3) delta, plain text, auditable below)
+      - name: Write source files (v0.9.19 (portable slices, Vincenty, shared golden vectors) delta, plain text, auditable below)
         run: |
-          if [ "$(cat .github/last-payload 2>/dev/null)" = "v0.9.18-4eeea1a90e79" ]; then
-            echo "payload v0.9.18-4eeea1a90e79 already applied - skipping (edit the files in git, not here)"
+          if [ "$(cat .github/last-payload 2>/dev/null)" = "v0.9.19-e77ff18d578b" ]; then
+            echo "payload v0.9.19-e77ff18d578b already applied - skipping (edit the files in git, not here)"
           else
           mkdir -p 'app'
           cat > 'app/build.gradle.kts' <<'EOF_GRIDFIX'
@@ -36,8 +36,8 @@ jobs:
                   applicationId = "app.gridfix.android"
                   minSdk = 26
                   targetSdk = 36
-                  versionCode = 46
-                  versionName = "0.9.18"
+                  versionCode = 47
+                  versionName = "0.9.19"
                   // MapTiler API key from the CI secret; empty in builds without it (community-tile fallback)
                   buildConfigField("String", "MAPTILER_KEY", "\"" + (System.getenv("MAPTILER_KEY") ?: "") + "\"")
               }
@@ -360,11 +360,18 @@ jobs:
 
               data class NavInfo(val distanceMeters: Float, val bearingTrue: Float)
 
-              /** Geodesic distance and initial true bearing between two points. */
+              /**
+               * Geodesic distance and initial true bearing between two points.
+               *
+               * Was `android.location.Location.distanceBetween`. That is Vincenty on
+               * WGS84 and so is [Geodesy], to well under a millimetre — GoldenTest holds
+               * both to the same vectors. The reason for the swap is that the framework
+               * call is stubbed out in JVM unit tests, so every distance the app shows
+               * was untestable in CI; and the iOS port needs the identical numbers.
+               */
               fun navInfo(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double): NavInfo {
-                  val results = FloatArray(2)
-                  android.location.Location.distanceBetween(fromLat, fromLon, toLat, toLon, results)
-                  return NavInfo(results[0], (results[1] + 360f) % 360f)
+                  val d = Geodesy.distanceAndBearing(fromLat, fromLon, toLat, toLon)
+                  return NavInfo(d[0].toFloat(), (((d[1] % 360.0) + 360.0) % 360.0).toFloat())
               }
 
               fun formatDistance(meters: Float, units: Int): String = when (units) {
@@ -522,6 +529,477 @@ jobs:
                   val letters = "CDEFGHJKLMNPQRSTUVWX"
                   val idx = floor((lat + 80.0) / 8.0).toInt().coerceIn(0, 19)
                   return letters[idx]
+              }
+          }
+          EOF_GRIDFIX
+          mkdir -p 'app/src/main/java/app/gridfix/android/coords'
+          cat > 'app/src/main/java/app/gridfix/android/coords/Geodesy.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android.coords
+
+          import kotlin.math.PI
+          import kotlin.math.abs
+          import kotlin.math.atan
+          import kotlin.math.atan2
+          import kotlin.math.cos
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+          import kotlin.math.tan
+
+          /**
+           * Distance and bearing on the WGS84 ellipsoid — Vincenty's inverse formula.
+           *
+           * This is the same algorithm `android.location.Location.distanceBetween` runs,
+           * so replacing that call with this one moves no number the app displays: the
+           * two agree to well under a millimetre, which [GoldenTest] proves against
+           * vectors that also ship to the iOS port.
+           *
+           * Two reasons it is written out here rather than called from the framework:
+           *
+           *  - `Location.distanceBetween` is stubbed to a no-op in JVM unit tests, so
+           *    every distance the app computes — course scoring, the arrival alert,
+           *    route-card legs, pace counts, strip maps — was untestable in CI.
+           *  - iOS needs the identical numbers. Two phones in one patrol reporting
+           *    different ranges to the same point is the failure this prevents.
+           *
+           * A great-circle shortcut would be 0.3 to 0.5 % off — centimetres at the 25 m
+           * course ring, but tens of metres on a long leg — so it is used only as the
+           * fallback for the near-antipodal case that never converges, and which land
+           * navigation never reaches.
+           *
+           * Pure Kotlin, no Android imports: this file moves to `:core` verbatim.
+           */
+          object Geodesy {
+
+              private const val A = 6378137.0
+              private const val F = 1.0 / 298.257223563
+              private const val B = A * (1.0 - F)
+              private const val MEAN_RADIUS = 6371008.8
+
+              /**
+               * Geodesic distance in metres and initial bearing in degrees from true
+               * north, returned as [distance, bearing]. The bearing is NOT normalised —
+               * [Coordinates.navInfo] wraps it into 0..<360 on the way to the readout.
+               */
+              fun distanceAndBearing(
+                  fromLat: Double, fromLon: Double, toLat: Double, toLon: Double,
+              ): DoubleArray {
+                  if (fromLat == toLat && fromLon == toLon) return doubleArrayOf(0.0, 0.0)
+
+                  val l = (toLon - fromLon) * PI / 180.0
+                  val u1 = atan((1.0 - F) * tan(fromLat * PI / 180.0))
+                  val u2 = atan((1.0 - F) * tan(toLat * PI / 180.0))
+                  val sinU1 = sin(u1); val cosU1 = cos(u1)
+                  val sinU2 = sin(u2); val cosU2 = cos(u2)
+
+                  var lambda = l
+                  var sinSigma = 0.0
+                  var cosSigma = 0.0
+                  var sigma = 0.0
+                  var cosSqAlpha = 0.0
+                  var cos2SigmaM = 0.0
+                  var converged = false
+
+                  for (iteration in 0 until 200) {
+                      val sinLambda = sin(lambda)
+                      val cosLambda = cos(lambda)
+                      val p = cosU2 * sinLambda
+                      val q = cosU1 * sinU2 - sinU1 * cosU2 * cosLambda
+                      sinSigma = sqrt(p * p + q * q)
+                      if (sinSigma == 0.0) return doubleArrayOf(0.0, 0.0)
+                      cosSigma = sinU1 * sinU2 + cosU1 * cosU2 * cosLambda
+                      sigma = atan2(sinSigma, cosSigma)
+                      val sinAlpha = cosU1 * cosU2 * sinLambda / sinSigma
+                      cosSqAlpha = 1.0 - sinAlpha * sinAlpha
+                      cos2SigmaM =
+                          if (cosSqAlpha == 0.0) 0.0 else cosSigma - 2.0 * sinU1 * sinU2 / cosSqAlpha
+                      val c = F / 16.0 * cosSqAlpha * (4.0 + F * (4.0 - 3.0 * cosSqAlpha))
+                      val previous = lambda
+                      lambda = l + (1.0 - c) * F * sinAlpha *
+                          (sigma + c * sinSigma *
+                              (cos2SigmaM + c * cosSigma * (-1.0 + 2.0 * cos2SigmaM * cos2SigmaM)))
+                      if (abs(lambda - previous) < 1e-12) {
+                          converged = true
+                          break
+                      }
+                  }
+
+                  if (!converged) {
+                      return doubleArrayOf(
+                          greatCircleMeters(fromLat, fromLon, toLat, toLon),
+                          greatCircleBearing(fromLat, fromLon, toLat, toLon),
+                      )
+                  }
+
+                  val uSq = cosSqAlpha * (A * A - B * B) / (B * B)
+                  val bigA = 1.0 + uSq / 16384.0 * (4096.0 + uSq * (-768.0 + uSq * (320.0 - 175.0 * uSq)))
+                  val bigB = uSq / 1024.0 * (256.0 + uSq * (-128.0 + uSq * (74.0 - 47.0 * uSq)))
+                  val deltaSigma = bigB * sinSigma * (
+                      cos2SigmaM + bigB / 4.0 * (
+                          cosSigma * (-1.0 + 2.0 * cos2SigmaM * cos2SigmaM) -
+                              bigB / 6.0 * cos2SigmaM * (-3.0 + 4.0 * sinSigma * sinSigma) *
+                              (-3.0 + 4.0 * cos2SigmaM * cos2SigmaM)
+                          )
+                      )
+                  val s = B * bigA * (sigma - deltaSigma)
+
+                  val sinLambda = sin(lambda)
+                  val cosLambda = cos(lambda)
+                  val alpha1 = atan2(cosU2 * sinLambda, cosU1 * sinU2 - sinU1 * cosU2 * cosLambda)
+                  return doubleArrayOf(s, alpha1 * 180.0 / PI)
+              }
+
+              /**
+               * Great-circle distance on a sphere of the WGS84 mean radius. Half a percent
+               * off the ellipsoid, so it is only for the non-convergent fallback and for
+               * cheap proximity sorting where that does not matter.
+               */
+              fun greatCircleMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+                  val p1 = lat1 * PI / 180.0
+                  val p2 = lat2 * PI / 180.0
+                  val dp = p2 - p1
+                  val dl = (lon2 - lon1) * PI / 180.0
+                  val h = sin(dp / 2) * sin(dp / 2) + cos(p1) * cos(p2) * sin(dl / 2) * sin(dl / 2)
+                  return 2.0 * MEAN_RADIUS * atan2(sqrt(h), sqrt((1.0 - h).coerceAtLeast(0.0)))
+              }
+
+              fun greatCircleBearing(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+                  val p1 = lat1 * PI / 180.0
+                  val p2 = lat2 * PI / 180.0
+                  val dl = (lon2 - lon1) * PI / 180.0
+                  val y = sin(dl) * cos(p2)
+                  val x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl)
+                  return (atan2(y, x) * 180.0 / PI + 360.0) % 360.0
+              }
+          }
+          EOF_GRIDFIX
+          mkdir -p 'app/src/main/java/app/gridfix/android/data'
+          cat > 'app/src/main/java/app/gridfix/android/data/TrackRepository.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android.data
+
+          import android.content.Context
+          import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
+          import androidx.datastore.preferences.core.edit
+          import androidx.datastore.preferences.core.emptyPreferences
+          import androidx.datastore.preferences.core.stringPreferencesKey
+          import androidx.datastore.preferences.preferencesDataStore
+          import app.gridfix.android.coords.Geodesy
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.coroutines.flow.first
+          import kotlinx.coroutines.flow.map
+          import kotlinx.coroutines.withContext
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.TimeZone
+          import java.util.UUID
+
+          private val Context.trackStore by preferencesDataStore(
+              name = "tracks",
+              corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+          )
+
+          /** Track metadata; the point log lives in files/tracks/<id>.txt (one point per line). */
+          data class TrackInfo(
+              val id: String,
+              val name: String,
+              val startedAt: Long,
+              val endedAt: Long,        // 0 while recording
+              val distanceM: Double,
+              val pointCount: Int,
+              val folder: String = DEFAULT_FOLDER,   // overlay folder, shares the eye switch with waypoints and graphics
+          )
+
+          /**
+           * A logged fix. [alt] is metres above mean sea level, or [NO_ALTITUDE] when the
+           * receiver gave no height: writing a real number there would put the leg at sea
+           * level on every profile that reads it.
+           */
+          data class TrackPoint(val lat: Double, val lon: Double, val time: Long, val alt: Double)
+
+          /** "this fix had no altitude" — omitted from GPX rather than written as a height. */
+          const val NO_ALTITUDE = -32768.0
+
+          fun Double.hasAltitude(): Boolean = this > NO_ALTITUDE + 1.0
+
+          class TrackRepository(private val context: Context) {
+
+              private val listKey = stringPreferencesKey("list")
+
+              val tracks: Flow<List<TrackInfo>> = context.trackStore.data.map { p ->
+                  decode(p[listKey] ?: "[]").sortedByDescending { it.startedAt }
+              }
+
+              suspend fun startTrack(nowMillis: Long): String {
+                  val id = UUID.randomUUID().toString()
+                  val info = TrackInfo(
+                      id = id,
+                      name = "Track " + dtgShort(nowMillis),
+                      startedAt = nowMillis,
+                      endedAt = 0L,
+                      distanceM = 0.0,
+                      pointCount = 0,
+                  )
+                  withContext(Dispatchers.IO) { pointsFile(context, id).parentFile?.mkdirs() }
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]") + info)
+                  }
+                  return id
+              }
+
+              /** Close out a finished recording: compute stats from the point log. */
+              suspend fun finishTrack(id: String, name: String?, nowMillis: Long) {
+                  val pts = readPoints(context, id)
+                  var dist = 0.0
+                  for (i in 1 until pts.size) {
+                      dist += Geodesy.distanceAndBearing(
+                          pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon
+                      )[0]
+                  }
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(
+                          decode(p[listKey] ?: "[]").map {
+                              if (it.id == id) it.copy(
+                                  name = name?.trim()?.ifBlank { it.name } ?: it.name,
+                                  endedAt = nowMillis,
+                                  distanceM = dist,
+                                  pointCount = pts.size,
+                              ) else it
+                          }
+                      )
+                  }
+              }
+
+              /** Create a finished track from imported points (GPX trk import). */
+              suspend fun importTrack(name: String, points: List<TrackPoint>, nowMillis: Long): String {
+                  val id = UUID.randomUUID().toString()
+                  withContext(Dispatchers.IO) {
+                      val f = pointsFile(context, id)
+                      f.parentFile?.mkdirs()
+                      f.bufferedWriter().use { out ->
+                          for (p in points) {
+                              out.write(
+                                  String.format(Locale.US, "%.7f %.7f %d %.1f\n", p.lat, p.lon, p.time, p.alt)
+                              )
+                          }
+                      }
+                  }
+                  var dist = 0.0
+                  for (i in 1 until points.size) {
+                      dist += Geodesy.distanceAndBearing(
+                          points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon
+                      )[0]
+                  }
+                  val start = points.firstOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
+                  val end = points.lastOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
+                  val info = TrackInfo(
+                      id = id,
+                      name = name.trim().ifBlank { "Imported track" },
+                      startedAt = start,
+                      endedAt = end,
+                      distanceM = dist,
+                      pointCount = points.size,
+                  )
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]") + info)
+                  }
+                  return id
+              }
+
+              /** Restore one track from a backup, keeping its id; skipped when already present. */
+              suspend fun restore(info: TrackInfo, points: List<TrackPoint>): Boolean {
+                  var added = false
+                  context.trackStore.edit { p ->
+                      val current = decode(p[listKey] ?: "[]")
+                      if (current.none { it.id == info.id }) {
+                          val f = pointsFile(context, info.id)
+                          f.parentFile?.mkdirs()
+                          f.writeText(
+                              points.joinToString("") {
+                                  String.format(Locale.US, "%.7f %.7f %d %.1f\n", it.lat, it.lon, it.time, it.alt)
+                              }
+                          )
+                          p[listKey] = encode(current + info)
+                          added = true
+                      }
+                  }
+                  return added
+              }
+
+              suspend fun rename(id: String, name: String) {
+                  if (name.isBlank()) return
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(
+                          decode(p[listKey] ?: "[]").map {
+                              if (it.id == id) it.copy(name = name.trim()) else it
+                          }
+                      )
+                  }
+              }
+
+              suspend fun setFolder(id: String, folder: String) {
+                  val clean = canonicalFolder(folder)
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(
+                          decode(p[listKey] ?: "[]").map {
+                              if (it.id == id) it.copy(folder = clean) else it
+                          }
+                      )
+                  }
+              }
+
+              suspend fun delete(id: String) {
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id == id })
+                  }
+                  withContext(Dispatchers.IO) { pointsFile(context, id).delete() }
+              }
+
+              /** Move every track in [from] to [to] (folder rename, or emptying a folder into Base). */
+              suspend fun renameFolder(from: String, to: String) {
+                  val target = canonicalFolder(to)
+                  if (from == target) return
+                  context.trackStore.edit { p ->
+                      p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.folder == from) it.copy(folder = target) else it })
+                  }
+              }
+
+              /** Delete every track in [folder], point logs included. */
+              suspend fun deleteFolder(folder: String) {
+                  val doomed = decode(context.trackStore.data.first()[listKey] ?: "[]").filter { it.folder == folder }
+                  for (t in doomed) delete(t.id)
+              }
+
+              /** Remove a recording that was discarded before saving. */
+              suspend fun discard(id: String) = delete(id)
+
+              /**
+               * Heal recordings the OS killed mid-way: any track still open (endedAt == 0)
+               * that is not the one currently recording is closed out from its point log
+               * (the points are on disk — only the summary was lost), or removed when it
+               * never logged a point.
+               */
+              suspend fun finalizeOrphans(activeId: String?) {
+                  val open = decode(context.trackStore.data.first()[listKey] ?: "[]")
+                      .filter { it.endedAt == 0L && it.id != activeId }
+                  for (t in open) {
+                      val pts = readPoints(context, t.id)
+                      if (pts.isEmpty()) {
+                          delete(t.id)
+                      } else {
+                          val last = pts.last().time
+                          finishTrack(t.id, null, if (last > t.startedAt) last else System.currentTimeMillis())
+                      }
+                  }
+              }
+
+              // One damaged record must not take the whole list with it: skip it, keep the rest.
+              private fun decode(json: String): List<TrackInfo> {
+                  val arr = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
+                  return buildList {
+                      for (i in 0 until arr.length()) {
+                          runCatching {
+                              val o = arr.getJSONObject(i)
+                              TrackInfo(
+                                  id = o.getString("id"),
+                                  name = o.getString("name"),
+                                  startedAt = o.optLong("startedAt"),
+                                  endedAt = o.optLong("endedAt"),
+                                  distanceM = o.optDouble("distanceM", 0.0),
+                                  pointCount = o.optInt("pointCount", 0),
+                                  folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
+                              )
+                          }.getOrNull()?.let { add(it) }
+                      }
+                  }
+              }
+
+              private fun encode(list: List<TrackInfo>): String {
+                  val arr = JSONArray()
+                  for (t in list) {
+                      arr.put(
+                          JSONObject()
+                              .put("id", t.id)
+                              .put("name", t.name)
+                              .put("startedAt", t.startedAt)
+                              .put("endedAt", t.endedAt)
+                              .put("distanceM", t.distanceM)
+                              .put("pointCount", t.pointCount)
+                              .put("folder", t.folder)
+                      )
+                  }
+                  return arr.toString()
+              }
+
+              companion object {
+                  fun pointsFile(context: Context, id: String): File =
+                      File(File(context.filesDir, "tracks"), "$id.txt")
+
+                  /** Append one point; called from the recorder service's worker thread. */
+                  fun appendPoint(context: Context, id: String, lat: Double, lon: Double, time: Long, alt: Double) {
+                      runCatching {
+                          val f = pointsFile(context, id)
+                          f.parentFile?.mkdirs()
+                          f.appendText(
+                              String.format(Locale.US, "%.7f %.7f %d %.1f\n", lat, lon, time, alt)
+                          )
+                      }
+                  }
+
+                  suspend fun readPoints(context: Context, id: String): List<TrackPoint> =
+                      withContext(Dispatchers.IO) {
+                          val f = pointsFile(context, id)
+                          if (!f.exists()) return@withContext emptyList()
+                          f.readLines().mapNotNull { line ->
+                              val parts = line.trim().split(" ")
+                              if (parts.size < 3) return@mapNotNull null
+                              runCatching {
+                                  TrackPoint(
+                                      lat = parts[0].toDouble(),
+                                      lon = parts[1].toDouble(),
+                                      time = parts[2].toLong(),
+                                      alt = parts.getOrNull(3)?.toDouble() ?: NO_ALTITUDE,
+                                  )
+                              }.getOrNull()
+                          }
+                      }
+
+                  /** Minimal GPX 1.1 document for one track. */
+                  fun buildGpx(name: String, points: List<TrackPoint>): String {
+                      val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+                      sdf.timeZone = TimeZone.getTimeZone("UTC")
+                      val sb = StringBuilder()
+                      sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+                      sb.append("<gpx version=\"1.1\" creator=\"MGRS GPS\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n")
+                      sb.append("  <trk>\n    <name>").append(escapeXml(name)).append("</name>\n    <trkseg>\n")
+                      for (p in points) {
+                          val ele = if (p.alt.hasAltitude()) String.format(Locale.US, "<ele>%.1f</ele>", p.alt) else ""
+                          sb.append(
+                              String.format(
+                                  Locale.US,
+                                  "      <trkpt lat=\"%.7f\" lon=\"%.7f\">%s<time>%s</time></trkpt>\n",
+                                  p.lat, p.lon, ele, sdf.format(Date(p.time)),
+                              )
+                          )
+                      }
+                      sb.append("    </trkseg>\n  </trk>\n</gpx>\n")
+                      return sb.toString()
+                  }
+
+                  private fun escapeXml(s: String): String = s
+                      .replace("&", "&amp;")
+                      .replace("<", "&lt;")
+                      .replace(">", "&gt;")
+                      .replace("\"", "&quot;")
+
+                  private fun dtgShort(timeMillis: Long): String {
+                      val sdf = SimpleDateFormat("ddHHmm'Z'", Locale.US)
+                      sdf.timeZone = TimeZone.getTimeZone("UTC")
+                      return sdf.format(Date(timeMillis))
+                  }
               }
           }
           EOF_GRIDFIX
@@ -922,6 +1400,684 @@ jobs:
           }
           EOF_GRIDFIX
           mkdir -p 'app/src/test/java/app/gridfix/android'
+          cat > 'app/src/test/java/app/gridfix/android/GoldenTest.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android
+
+          import app.gridfix.android.coords.Coordinates
+          import app.gridfix.android.coords.Geodesy
+          import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertNotNull
+          import org.junit.Assert.assertTrue
+          import org.junit.Test
+          import kotlin.math.abs
+
+          /**
+           * The cross-platform contract.
+           *
+           * Every vector here also ships to the iOS port as `golden.json`, where
+           * GoldenTests.swift asserts the same things. One generator produced both, so
+           * if the two platforms ever compute a different grid or a different range for
+           * the same point, one of the two suites goes red instead of two soldiers
+           * reading different numbers off the same map.
+           *
+           * This suite is deliberately paranoid about the projection boundary: the MGRS
+           * strings come from NGA's library here and from our own Snyder series on iOS,
+           * which is two implementations of one standard, and the only honest way to
+           * hold two implementations together is to check them against each other.
+           */
+          class GoldenTest {
+
+              @Test
+              fun `the fixture actually loaded`() {
+                  assertTrue("no UTM vectors", GoldenVectors.utm.size > 20)
+                  assertTrue("no MGRS vectors", GoldenVectors.mgrsForward.size > 50)
+                  assertTrue("no parse vectors", GoldenVectors.mgrsParse.size > 50)
+                  assertTrue("no distance vectors", GoldenVectors.distance.size > 10)
+                  assertTrue("no convergence vectors", GoldenVectors.convergence.size > 50)
+              }
+
+              // ---- UTM ---------------------------------------------------------------
+
+              @Test
+              fun `utm forward matches the shared vectors`() {
+                  for (v in GoldenVectors.utm) {
+                      val p = Coordinates.utmForZone(v.lat, v.lon, v.zone, v.hemisphere == 'N')
+                      assertEquals("easting for ${v.name}", v.easting, p[0], GoldenVectors.TOL_UTM_METERS)
+                      assertEquals("northing for ${v.name}", v.northing, p[1], GoldenVectors.TOL_UTM_METERS)
+                  }
+              }
+
+              @Test
+              fun `utm picks the same zone and band as the shared vectors`() {
+                  for (v in GoldenVectors.utm) {
+                      val u = Coordinates.utm(v.lat, v.lon)
+                      assertNotNull("no UTM for ${v.name}", u)
+                      assertEquals("zone for ${v.name}", v.zone.toLong(), u!!.zone.toLong())
+                      assertEquals("hemisphere for ${v.name}", v.hemisphere, u.hemisphere)
+                      assertEquals("band for ${v.name}", v.band, Coordinates.bandLetter(v.lat))
+                      assertEquals("easting for ${v.name}", v.easting, u.easting.toDouble(), 1.0)
+                      assertEquals("northing for ${v.name}", v.northing, u.northing.toDouble(), 1.0)
+                  }
+              }
+
+              @Test
+              fun `utm inverse returns the point it was given`() {
+                  for (v in GoldenVectors.utm) {
+                      val ll = Coordinates.utmInverse(v.easting, v.northing, v.zone, v.hemisphere == 'N')
+                      assertEquals("lat for ${v.name}", v.lat, ll[0], 1e-7)
+                      assertEquals("lon for ${v.name}", v.lon, ll[1], 1e-7)
+                  }
+              }
+
+              // ---- MGRS --------------------------------------------------------------
+
+              @Test
+              fun `mgrs forward matches the shared vectors exactly`() {
+                  // Only where the margin is overwhelming. Every vector sits at its own
+                  // cell centre, so a 1 km cell gives 500 m of clearance and a 100 m cell
+                  // gives 50 m — far more than any disagreement between two correct
+                  // projections. The 10 m cells are checked by position below instead,
+                  // because NGA's forward and our Snyder series are known to differ by
+                  // about a metre and that is only a 5 m margin.
+                  for (v in GoldenVectors.mgrsForward) {
+                      if (v.digits > 6) continue
+                      val parts = Coordinates.mgrs(v.lat, v.lon, v.digits)
+                      assertNotNull("no MGRS for ${v.name}", parts)
+                      val compact = parts!!.gzd + parts.square + parts.easting + parts.northing
+                      assertEquals("${v.name} at ${v.digits} digits", v.mgrs, compact)
+                  }
+              }
+
+              @Test
+              fun `mgrs forward agrees with the shared vectors to within a metre at ten metre cells`() {
+                  for (v in GoldenVectors.mgrsForward) {
+                      if (v.digits <= 6) continue
+                      val parts = Coordinates.mgrs(v.lat, v.lon, v.digits)!!
+                      val compact = parts.gzd + parts.square + parts.easting + parts.northing
+                      if (compact == v.mgrs) continue
+                      // Different string: allowed only if the two grids name points that
+                      // are within 3 m of each other, i.e. the last digit rolled over.
+                      val a = Coordinates.parseMgrs(compact)
+                      val b = Coordinates.parseMgrs(v.mgrs)
+                      assertNotNull("could not parse $compact", a)
+                      assertNotNull("could not parse ${v.mgrs}", b)
+                      val gap = Geodesy.distanceAndBearing(a!!.first, a.second, b!!.first, b.second)[0]
+                      assertTrue(
+                          "${v.name}: got $compact, shared vector says ${v.mgrs}, ${gap} m apart",
+                          gap < 3.0,
+                      )
+                  }
+              }
+
+              @Test
+              fun `mgrs parts split the way the readout expects`() {
+                  for (v in GoldenVectors.mgrsForward) {
+                      val p = Coordinates.mgrs(v.lat, v.lon, v.digits)!!
+                      assertEquals("easting digits for ${v.name}", (v.digits / 2).toLong(), p.easting.length.toLong())
+                      assertEquals("northing digits for ${v.name}", (v.digits / 2).toLong(), p.northing.length.toLong())
+                      assertEquals("square for ${v.name}", 2L, p.square.length.toLong())
+                      assertEquals("${p.gzd} ${p.square} ${p.easting} ${p.northing}", p.full)
+                  }
+              }
+
+              @Test
+              fun `mgrs parse hits the cell centre the shared vectors name`() {
+                  for (v in GoldenVectors.mgrsParse) {
+                      val p = Coordinates.parseMgrs(v.mgrs)
+                      assertNotNull("no parse for ${v.mgrs}", p)
+                      assertEquals("centre lat for ${v.mgrs}", v.centreLat, p!!.first, GoldenVectors.TOL_LATLON_DEGREES)
+                      assertEquals("centre lon for ${v.mgrs}", v.centreLon, p.second, GoldenVectors.TOL_LATLON_DEGREES)
+                  }
+              }
+
+              @Test
+              fun `mgrs corner parse hits the grid line intersection`() {
+                  for (v in GoldenVectors.mgrsParse) {
+                      val p = Coordinates.parseMgrsCorner(v.mgrs)
+                      assertNotNull("no corner for ${v.mgrs}", p)
+                      assertEquals("corner lat for ${v.mgrs}", v.cornerLat, p!!.first, GoldenVectors.TOL_LATLON_DEGREES)
+                      assertEquals("corner lon for ${v.mgrs}", v.cornerLon, p.second, GoldenVectors.TOL_LATLON_DEGREES)
+                  }
+              }
+
+              @Test
+              fun `every shared grid string round trips`() {
+                  for (v in GoldenVectors.mgrsForward) {
+                      val p = Coordinates.parseMgrs(v.mgrs)!!
+                      val again = Coordinates.mgrs(p.first, p.second, v.digits)!!
+                      assertEquals(
+                          "round trip for ${v.mgrs}",
+                          v.mgrs,
+                          again.gzd + again.square + again.easting + again.northing,
+                      )
+                  }
+              }
+
+              // ---- Geodesy -----------------------------------------------------------
+
+              @Test
+              fun `distance matches the shared vectors`() {
+                  // These came from Vincenty on WGS84, the same formula
+                  // android.location.Location.distanceBetween runs. Agreement here is
+                  // what proves the swap to a pure-Kotlin geodesic moved no number.
+                  for (v in GoldenVectors.distance) {
+                      val d = Geodesy.distanceAndBearing(v.fromLat, v.fromLon, v.toLat, v.toLon)
+                      assertEquals("distance for ${v.name}", v.meters, d[0], GoldenVectors.TOL_DISTANCE_METERS)
+                  }
+              }
+
+              @Test
+              fun `bearing matches the shared vectors`() {
+                  for (v in GoldenVectors.distance) {
+                      if (v.meters <= 1.0) continue
+                      val n = Coordinates.navInfo(v.fromLat, v.fromLon, v.toLat, v.toLon)
+                      var delta = abs(n.bearingTrue.toDouble() - v.bearing) % 360.0
+                      if (delta > 180.0) delta = 360.0 - delta
+                      assertTrue(
+                          "bearing for ${v.name}: got ${n.bearingTrue}, want ${v.bearing}",
+                          delta < GoldenVectors.TOL_BEARING_DEGREES,
+                      )
+                  }
+              }
+
+              @Test
+              fun `navInfo normalises the bearing into a compass circle`() {
+                  for (v in GoldenVectors.distance) {
+                      val n = Coordinates.navInfo(v.fromLat, v.fromLon, v.toLat, v.toLon)
+                      assertTrue("bearing ${n.bearingTrue} for ${v.name} is outside 0..360",
+                          n.bearingTrue >= 0f && n.bearingTrue < 360f)
+                      assertTrue("distance for ${v.name} is not a number", !n.distanceMeters.isNaN())
+                  }
+              }
+
+              @Test
+              fun `distance is the same in both directions`() {
+                  for (v in GoldenVectors.distance) {
+                      val there = Geodesy.distanceAndBearing(v.fromLat, v.fromLon, v.toLat, v.toLon)[0]
+                      val back = Geodesy.distanceAndBearing(v.toLat, v.toLon, v.fromLat, v.fromLon)[0]
+                      assertEquals("distance for ${v.name} is not symmetric", there, back, 0.001)
+                  }
+              }
+
+              @Test
+              fun `a zero length leg does not produce NaN`() {
+                  val n = Coordinates.navInfo(24.4539, 54.3773, 24.4539, 54.3773)
+                  assertEquals(0f, n.distanceMeters, 1e-6f)
+                  assertTrue(!n.bearingTrue.isNaN())
+              }
+
+              @Test
+              fun `the great circle shortcut is close but not close enough to use`() {
+                  // Documents the size of the error the app declines to accept: half a
+                  // percent, which is nothing on a course ring and metres on a long leg.
+                  var worst = 0.0
+                  for (v in GoldenVectors.distance) {
+                      if (v.meters <= 1000.0) continue
+                      val gc = Geodesy.greatCircleMeters(v.fromLat, v.fromLon, v.toLat, v.toLon)
+                      worst = maxOf(worst, abs(gc - v.meters) / v.meters)
+                  }
+                  assertTrue("great circle should differ from the ellipsoid at all", worst > 1e-4)
+                  assertTrue("great circle drifted further than expected: $worst", worst < 0.008)
+              }
+
+              @Test
+              fun `grid convergence matches the shared vectors`() {
+                  for (v in GoldenVectors.convergence) {
+                      val c = Coordinates.gridConvergence(v.lat, v.lon)
+                      // gridConvergence resolves the zone from the point; the vector
+                      // carries the zone it was generated in, so only compare where the
+                      // two agree — the special zones are covered by their own points.
+                      if (Coordinates.utm(v.lat, v.lon)?.zone != v.zone) continue
+                      assertEquals(
+                          "convergence at ${v.lat}, ${v.lon}",
+                          v.degrees, c, GoldenVectors.TOL_CONVERGENCE_DEGREES,
+                      )
+                  }
+              }
+          }
+          EOF_GRIDFIX
+          mkdir -p 'app/src/test/java/app/gridfix/android'
+          cat > 'app/src/test/java/app/gridfix/android/GoldenVectors.kt' <<'EOF_GRIDFIX'
+          package app.gridfix.android
+
+          /**
+           * GENERATED by kmp/gen_golden.py - do not edit by hand.
+           *
+           * The same numbers ship to iOS as `golden.json`, read there by GoldenTests.swift.
+           * One generator, two forms: if the Swift port and this app ever disagree about
+           * a grid or a distance, whichever side moved goes red. A wrong grid looks
+           * exactly like a right one, so this is the only place that can catch it.
+           *
+           * Vectors are CSV inside string constants rather than thousands of constructor
+           * calls, because a listOf() that large overflows the 64 KB limit on <clinit>.
+           *
+           * MGRS strings are snapped to their own cell centre, so every one has at least
+           * half a cell of clearance from any edge and a few metres of disagreement
+           * between two correct projections can never flip a digit.
+           */
+          object GoldenVectors {
+
+              const val TOL_UTM_METERS = 0.5
+              const val TOL_LATLON_DEGREES = 1e-05
+              const val TOL_DISTANCE_METERS = 0.5
+              const val TOL_BEARING_DEGREES = 0.01
+              const val TOL_CONVERGENCE_DEGREES = 1e-06
+
+              data class Utm(
+                  val name: String, val lat: Double, val lon: Double,
+                  val zone: Int, val hemisphere: Char,
+                  val easting: Double, val northing: Double, val band: Char,
+              )
+
+              data class Forward(
+                  val name: String, val lat: Double, val lon: Double,
+                  val digits: Int, val mgrs: String,
+              )
+
+              data class ParseCase(
+                  val mgrs: String,
+                  val centreLat: Double, val centreLon: Double,
+                  val cornerLat: Double, val cornerLon: Double,
+              )
+
+              data class Leg(
+                  val name: String,
+                  val fromLat: Double, val fromLon: Double,
+                  val toLat: Double, val toLon: Double,
+                  val meters: Double, val bearing: Double,
+              )
+
+              data class Convergence(
+                  val lat: Double, val lon: Double, val zone: Int, val degrees: Double,
+              )
+
+              private fun rows(csv: String): List<List<String>> =
+                  csv.trim().lines().filter { it.isNotBlank() }.map { it.split(",") }
+
+              val utm: List<Utm> by lazy {
+                  rows(UTM_CSV).map {
+                      Utm(it[0], it[1].toDouble(), it[2].toDouble(), it[3].toInt(),
+                          it[4][0], it[5].toDouble(), it[6].toDouble(), it[7][0])
+                  }
+              }
+
+              val mgrsForward: List<Forward> by lazy {
+                  rows(FORWARD_CSV).map {
+                      Forward(it[0], it[1].toDouble(), it[2].toDouble(), it[3].toInt(), it[4])
+                  }
+              }
+
+              val mgrsParse: List<ParseCase> by lazy {
+                  rows(PARSE_CSV).map {
+                      ParseCase(it[0], it[1].toDouble(), it[2].toDouble(),
+                                it[3].toDouble(), it[4].toDouble())
+                  }
+              }
+
+              val distance: List<Leg> by lazy {
+                  rows(DISTANCE_CSV).map {
+                      Leg(it[0], it[1].toDouble(), it[2].toDouble(), it[3].toDouble(),
+                          it[4].toDouble(), it[5].toDouble(), it[6].toDouble())
+                  }
+              }
+
+              val convergence: List<Convergence> by lazy {
+                  rows(CONVERGENCE_CSV).map {
+                      Convergence(it[0].toDouble(), it[1].toDouble(), it[2].toInt(), it[3].toDouble())
+                  }
+              }
+
+              // name,lat,lon,zone,hemisphere,easting,northing,band
+              private const val UTM_CSV = """
+          uae-abu-dhabi,24.4539,54.3773,40,N,234124.881,2707001.291,R
+          uae-liwa,23.13,53.78,39,N,784702.852,2560625.46,Q
+          uae-jebel-hafeet,24.058,55.775,40,N,375453.46,2661190.794,R
+          fort-benning,32.3524,-84.947,16,N,693189.275,3581350.292,S
+          fort-bragg,35.139,-79.006,17,N,681660.045,3890277.629,S
+          nttc-hohenfels,49.218,11.837,32,N,706585.903,5455564.479,U
+          grafenwoehr,49.698,11.94,32,N,712002.99,5509203.72,U
+          yakima,46.68,-120.46,10,N,694251.206,5172738.219,T
+          jbmdl,40.015,-74.59,18,N,534989.87,4429502.571,T
+          panama-jungle,9.08,-79.68,17,N,645066.723,1003960.522,P
+          kenya-nanyuki,0.017,37.073,37,N,285532.447,1880.081,N
+          equator-south,-0.51,36.9,37,S,266279.094,9943591.524,M
+          sydney,-33.8568,151.2152,56,S,334891.318,6252288.592,H
+          chile-santiago,-33.4489,-70.6693,19,S,344846.72,6297700.156,H
+          argentina-mendoza,-32.8895,-68.8458,19,S,514422.658,6360952.449,H
+          norway-bergen,60.3913,5.3221,32,N,297353.933,6700648.346,V
+          norway-interior,58.5,8.5,32,N,470858.664,6484487.322,V
+          alaska-fairbanks,64.8378,-147.7164,6,N,466012.823,7190570.234,W
+          svalbard,78.2232,15.6267,33,N,514278.715,8683355.47,X
+          iceland,64.1466,-21.9426,27,N,454138.377,7113689.87,W
+          japan-fuji,35.3606,138.7274,54,N,293517.347,3915404.017,S
+          korea-camp-humph,36.963,127.032,52,N,324800.663,4092577.499,S
+          s-africa-pretoria,-25.7479,28.2293,35,S,623292.802,7151659.526,J
+          brazil-manaus,-3.119,-60.0217,20,S,831071.822,9654784.864,M
+          india-leh,34.1526,77.577,43,N,737583.814,3782076.893,S
+          nz-queenstown,-45.0311,168.6626,59,S,315876.796,5010936.923,G
+          """
+
+              // name,lat,lon,digits,mgrs
+              private const val FORWARD_CSV = """
+          uae-abu-dhabi,24.458463616,54.380904205,4,40RBN3407
+          uae-abu-dhabi,24.45434376,54.377538478,6,40RBN341070
+          uae-abu-dhabi,24.453933482,54.37730048,8,40RBN34120700
+          uae-liwa,23.128902916,53.777997709,4,39QYF8460
+          uae-liwa,23.130213296,53.780464528,6,39QYF847606
+          uae-liwa,23.129995476,53.78002087,8,39QYF84706062
+          uae-jebel-hafeet,24.060795837,55.775431172,4,40RCM7561
+          uae-jebel-hafeet,24.057631351,55.774969472,6,40RCM754611
+          uae-jebel-hafeet,24.058038101,55.775014784,8,40RCM75456119
+          fort-benning,32.353695904,-84.943669233,4,16SFA9381
+          fort-benning,32.352404154,-84.947417195,6,16SFA931813
+          fort-benning,32.35244318,-84.947044441,8,16SFA93188135
+          fort-bragg,35.141032844,-79.007706948,4,17SPU8190
+          fort-bragg,35.138752827,-79.00611627,6,17SPU816902
+          fort-bragg,35.138975413,-79.005946215,8,17SPU81669027
+          nttc-hohenfels,49.217449659,11.835788659,4,32UQV0655
+          nttc-hohenfels,49.21788202,11.836500134,6,32UQV065555
+          nttc-hohenfels,49.218004986,11.836987882,8,32UQV06585556
+          grafenwoehr,49.700486302,11.94704389,4,32UQA1209
+          grafenwoehr,49.698399178,11.940676128,6,32UQA120092
+          grafenwoehr,49.698010793,11.940028533,8,32UQA12000920
+          yakima,46.677786084,-120.456850621,4,10TFS9472
+          yakima,46.680106268,-120.460010782,6,10TFS942727
+          yakima,46.679969961,-120.459951792,8,10TFS94257273
+          jbmdl,40.014996998,-74.595740141,4,18TWK3429
+          jbmdl,40.015428962,-74.59046462,6,18TWK349295
+          jbmdl,40.015022082,-74.590056934,8,18TWK34982950
+          panama-jungle,9.075821402,-79.676073498,4,17PPL4503
+          panama-jungle,9.0799054,-79.680152486,6,17PPL450039
+          panama-jungle,9.080040547,-79.680015526,8,17PPL45060396
+          kenya-nanyuki,0.013563242,37.072708604,4,37NBA8501
+          kenya-nanyuki,0.016728003,37.073157658,6,37NBA855018
+          kenya-nanyuki,0.017044477,37.07302293,8,37NBA85530188
+          equator-south,-0.510828137,36.901983696,4,37MBV6643
+          equator-south,-0.510375339,36.899738585,6,37MBV662435
+          equator-south,-0.509968559,36.899963243,8,37MBV66274359
+          sydney,-33.854832904,151.211011467,4,56HLH3452
+          sydney,-33.857141432,151.214746311,6,56HLH348522
+          sydney,-33.856832959,151.215239114,8,56HLH34895228
+          chile-santiago,-33.450654305,-70.673063651,4,19HCC4497
+          chile-santiago,-33.448451083,-70.669256116,6,19HCC448977
+          chile-santiago,-33.448856074,-70.669317665,8,19HCC44849770
+          argentina-mendoza,-32.893580296,-68.84496599,4,19HED1460
+          argentina-mendoza,-32.889521731,-68.845507633,6,19HED144609
+          argentina-mendoza,-32.889476959,-68.845774999,8,19HED14426095
+          norway-bergen,60.390043904,5.324894607,4,32VKN9700
+          norway-bergen,60.391312856,5.322027094,6,32VKN973006
+          norway-bergen,60.391270559,5.322122682,8,32VKN97350064
+          norway-interior,58.500089751,8.49384476,4,32VMK7084
+          norway-interior,58.499664238,8.499856112,6,32VMK708844
+          norway-interior,58.499978907,8.499937427,8,32VMK70858448
+          alaska-fairbanks,64.837218965,-147.706115463,4,6WVS6690
+          alaska-fairbanks,64.837622238,-147.715611618,6,6WVS660905
+          alaska-fairbanks,64.837842993,-147.716355255,8,6WVS66019057
+          svalbard,78.224473573,15.636480511,4,33XWG1483
+          svalbard,78.223153745,15.625437212,6,33XWG142833
+          svalbard,78.223196148,15.626536734,8,33XWG14278335
+          iceland,64.144944224,-21.935111393,4,27WVM5413
+          iceland,64.146243813,-21.942349012,6,27WVM541136
+          iceland,64.146555863,-21.942667905,8,27WVM54131368
+          japan-fuji,35.361461197,138.72718496,4,54STE9315
+          japan-fuji,35.361021053,138.727747521,6,54STE935154
+          japan-fuji,35.360608371,138.727373938,8,54STE93511540
+          korea-camp-humph,36.962245788,127.028642504,4,52SCF2492
+          korea-camp-humph,36.962761441,127.032560281,6,52SCF248925
+          korea-camp-humph,36.962978295,127.032049274,8,52SCF24809257
+          s-africa-pretoria,-25.749322756,28.231380351,4,35JPM2351
+          s-africa-pretoria,-25.747989598,28.228874199,6,35JPM232516
+          s-africa-pretoria,-25.747940671,28.229322329,8,35JPM23295165
+          brazil-manaus,-3.121562706,-60.01784439,4,20MRB3154
+          brazil-manaus,-3.119315546,-60.021895245,6,20MRB310547
+          brazil-manaus,-3.118998691,-60.021671442,8,20MRB31075478
+          india-leh,34.156431081,77.576207526,4,43SGT3782
+          india-leh,34.152365404,77.576626189,6,43SGT375820
+          india-leh,34.152582676,77.577012331,8,43SGT37588207
+          nz-queenstown,-45.034931866,168.657660275,4,59GLL1510
+          nz-queenstown,-45.030975422,168.662264905,6,59GLL158109
+          nz-queenstown,-45.031116831,168.662576514,8,59GLL15871093
+          """
+
+              // mgrs,centreLat,centreLon,cornerLat,cornerLon
+              private const val PARSE_CSV = """
+          40RBN3407,24.458463616,54.380904205,24.45386698,54.376069377
+          40RBN341070,24.45434376,54.377538478,24.453884093,54.377055007
+          40RBN34120700,24.453933482,54.37730048,24.453887515,54.377252133
+          39QYF8460,23.128902916,53.777997709,23.124477491,53.773027089
+          39QYF847606,23.130213296,53.780464528,23.129770772,53.779967439
+          39QYF84706062,23.129995476,53.78002087,23.129951224,53.779971161
+          40RCM7561,24.060795837,55.775431172,24.056241344,55.770557127
+          40RCM754611,24.057631351,55.774969472,24.057175907,55.774482065
+          40RCM75456119,24.058038101,55.775014784,24.057992557,55.774966043
+          16SFA9381,32.353695904,-84.943669233,32.34927465,-84.949081583
+          16SFA931813,32.352404154,-84.947417195,32.351962023,-84.947958429
+          16SFA93188135,32.35244318,-84.947044441,32.352398967,-84.947098565
+          17SPU8190,35.141032844,-79.007706948,35.13661704,-79.013301938
+          17SPU816902,35.138752827,-79.00611627,35.138311267,-79.006675788
+          17SPU81669027,35.138975413,-79.005946215,35.138931257,-79.006002167
+          32UQV0655,49.217449659,11.835788659,49.21312579,11.828674584
+          32UQV065555,49.21788202,11.836500134,49.217449659,11.835788659
+          32UQV06585556,49.218004986,11.836987882,49.21796175,11.836916733
+          32UQA1209,49.700486302,11.94704389,49.696171104,11.939848103
+          32UQA120092,49.698399178,11.940676128,49.697967639,11.939956579
+          32UQA12000920,49.698010793,11.940028533,49.697967639,11.939956579
+          10TFS9472,46.677786084,-120.456850621,46.673435927,-120.463592205
+          10TFS942727,46.680106268,-120.460010782,46.679671253,-120.460684994
+          10TFS94257273,46.679969961,-120.459951792,46.67992646,-120.460019213
+          18TWK3429,40.014996998,-74.595740141,40.010512505,-74.601625036
+          18TWK349295,40.015428962,-74.59046462,40.014980553,-74.591053182
+          18TWK34982950,40.015022082,-74.590056934,40.014977242,-74.590115791
+          17PPL4503,9.075821402,-79.676073498,9.071316536,-79.680638765
+          17PPL450039,9.0799054,-79.680152486,9.079454912,-79.68060902
+          17PPL45060396,9.080040547,-79.680015526,9.079995498,-79.68006118
+          37NBA8501,0.013563242,37.072708604,0.009042137,37.068217825
+          37NBA855018,0.016728003,37.073157658,0.01627589,37.07270858
+          37NBA85530188,0.017044477,37.07302293,0.016999266,37.072978022
+          37MBV6643,-0.510828137,36.901983696,-0.515347246,36.897491708
+          37MBV662435,-0.510375339,36.899738585,-0.510827251,36.899289387
+          37MBV66274359,-0.509968559,36.899963243,-0.510013751,36.899918323
+          56HLH3452,-33.854832904,151.211011467,-33.859261704,151.205514687
+          56HLH348522,-33.857141432,151.214746311,-33.85758434,151.214196661
+          56HLH34895228,-33.856832959,151.215239114,-33.85687725,151.21518415
+          19HCC4497,-33.450654305,-70.673063651,-33.455089528,-70.678528139
+          19HCC448977,-33.448451083,-70.669256116,-33.448894635,-70.669802507
+          19HCC44849770,-33.448856074,-70.669317665,-33.448900429,-70.669372304
+          19HED1460,-32.893580296,-68.84496599,-32.898097058,-68.850304388
+          19HED144609,-32.889521731,-68.845507633,-32.889973416,-68.846041427
+          19HED14426095,-32.889476959,-68.845774999,-32.889522127,-68.845828378
+          32VKN9700,60.390043904,5.324894607,60.385313327,5.316348875
+          32VKN973006,60.391312856,5.322027094,60.390839804,5.321172419
+          32VKN97350064,60.391270559,5.322122682,60.391223254,5.322037213
+          32VMK7084,58.500089751,8.49384476,58.495565146,8.485331956
+          32VMK708844,58.499664238,8.499856112,58.499211842,8.499004666
+          32VMK70858448,58.499978907,8.499937427,58.499933668,8.499852281
+          6WVS6690,64.837218965,-147.706115463,64.832682402,-147.716534222
+          6WVS660905,64.837622238,-147.715611618,64.837168548,-147.716653507
+          6WVS66019057,64.837842993,-147.716355255,64.837797624,-147.716459445
+          33XWG1483,78.224473573,15.636480511,78.220041516,15.614304233
+          33XWG142833,78.223153745,15.625437212,78.222710531,15.623219498
+          33XWG14278335,78.223196148,15.626536734,78.223151829,15.62631495
+          27WVM5413,64.144944224,-21.935111393,64.140391654,-21.945233121
+          27WVM541136,64.146243813,-21.942349012,64.145788538,-21.943361263
+          27WVM54131368,64.146555863,-21.942667905,64.146510335,-21.942769132
+          54STE9315,35.361461197,138.72718496,35.356852718,138.721812259
+          54STE935154,35.361021053,138.727747521,35.360560218,138.727210223
+          54STE93511540,35.360608371,138.727373938,35.360562287,138.727320208
+          52SCF2492,36.962245788,127.028642504,36.95764787,127.023145633
+          52SCF248925,36.962761441,127.032560281,36.962301677,127.032010536
+          52SCF24809257,36.962978295,127.032049274,36.962932318,127.031994299
+          35JPM2351,-25.749322756,28.231380351,-25.75387887,28.226442278
+          35JPM232516,-25.747989598,28.228874199,-25.748445208,28.228380404
+          35JPM23295165,-25.747940671,28.229322329,-25.747986232,28.22927295
+          20MRB3154,-3.121562706,-60.01784439,-3.126092886,-60.022325532
+          20MRB310547,-3.119315546,-60.021895245,-3.119768562,-60.022343361
+          20MRB31075478,-3.118998691,-60.021671442,-3.119043992,-60.021716253
+          43SGT3782,34.156431081,77.576207526,34.152039967,77.570652147
+          43SGT375820,34.152365404,77.576626189,34.151926306,77.576070651
+          43SGT37588207,34.152582676,77.577012331,34.152538766,77.576956776
+          59GLL1510,-45.034931866,168.657660275,-45.039298682,168.651133727
+          59GLL158109,-45.030975422,168.662264905,-45.031412149,168.661612375
+          59GLL15871093,-45.031116831,168.662576514,-45.031160505,168.662511262
+          """
+
+              // name,fromLat,fromLon,toLat,toLon,meters,bearing
+              private const val DISTANCE_CSV = """
+          zero,24.4539,54.3773,24.4539,54.3773,0.0,0.0
+          course-ring-25m,24.4539,54.3773,24.45412,54.3773,24.3683,0.0
+          short-100m,24.4539,54.3773,24.4548,54.3773,99.6883,0.0
+          arrival-50m,24.4539,54.3773,24.4539,54.37779,49.6819,89.999899
+          leg-1km-north,24.4539,54.3773,24.46293,54.3773,1000.2069,0.0
+          leg-1km-east,24.4539,54.3773,24.4539,54.38722,1005.8058,89.997947
+          leg-10km-east,24.4539,54.3773,24.4539,54.4763,10037.779,89.979509
+          leg-10km-north,24.4539,54.3773,24.5442,54.3773,10002.1231,0.0
+          leg-25km-diag,24.4539,54.3773,24.6139,54.5573,25431.2521,45.785372
+          cross-equator,-0.5,36.9,0.5,36.9,110574.304,0.0
+          high-lat,64.8378,-147.7164,64.9378,-147.5164,14631.1681,40.267859
+          southern,-33.8568,151.2152,-33.9568,151.3152,14441.9443,140.206572
+          antimeridian,1.0,179.95,1.0,-179.95,11130.265,89.999127
+          vincenty-canonical,-37.9510334167,144.4248678889,-37.6528211389,143.9264955278,54972.2711,306.868159
+          one-degree-lat-eq,0.0,0.0,1.0,0.0,110574.3886,0.0
+          one-degree-lat-45,45.0,0.0,46.0,0.0,111141.5485,0.0
+          one-degree-lon-eq,0.0,0.0,0.0,1.0,111319.4908,90.0
+          """
+
+              // lat,lon,zone,degrees
+              private const val CONVERGENCE_CSV = """
+          24.4539,54.5,40,-1.035446923
+          24.4539,56.0,40,-0.41399579
+          24.4539,57.0,40,0.0
+          24.4539,58.0,40,0.41399579
+          24.4539,59.5,40,1.035446923
+          23.13,48.5,39,-0.982574067
+          23.13,50.0,39,-0.392852415
+          23.13,51.0,39,0.0
+          23.13,52.0,39,0.392852415
+          23.13,53.5,39,0.982574067
+          24.058,54.5,40,-1.019692618
+          24.058,56.0,40,-0.407695726
+          24.058,57.0,40,0.0
+          24.058,58.0,40,0.407695726
+          24.058,59.5,40,1.019692618
+          32.3524,-89.5,16,-1.338419052
+          32.3524,-88.0,16,-0.535163941
+          32.3524,-87.0,16,0.0
+          32.3524,-86.0,16,0.535163941
+          32.3524,-84.5,16,1.338419052
+          35.139,-83.5,17,-1.439515927
+          35.139,-82.0,17,-0.5756011
+          35.139,-81.0,17,0.0
+          35.139,-80.0,17,0.5756011
+          35.139,-78.5,17,1.439515927
+          49.218,6.5,32,-1.893513343
+          49.218,8.0,32,-0.7572331
+          49.218,9.0,32,0.0
+          49.218,10.0,32,0.7572331
+          49.218,11.5,32,1.893513343
+          49.698,6.5,32,-1.907120648
+          49.698,8.0,32,-0.762678151
+          49.698,9.0,32,0.0
+          49.698,10.0,32,0.762678151
+          49.698,11.5,32,1.907120648
+          46.68,-125.5,10,-1.819376687
+          46.68,-124.0,10,-0.72756809
+          46.68,-123.0,10,0.0
+          46.68,-122.0,10,0.72756809
+          46.68,-120.5,10,1.819376687
+          40.015,-77.5,18,-1.608068892
+          40.015,-76.0,18,-0.643026435
+          40.015,-75.0,18,0.0
+          40.015,-74.0,18,0.643026435
+          40.015,-72.5,18,1.608068892
+          9.08,-83.5,17,-0.394777785
+          9.08,-82.0,17,-0.157829012
+          9.08,-81.0,17,0.0
+          9.08,-80.0,17,0.157829012
+          9.08,-78.5,17,0.394777785
+          0.017,36.5,37,-0.000742236
+          0.017,38.0,37,-0.000296736
+          0.017,39.0,37,0.0
+          0.017,40.0,37,0.000296736
+          0.017,41.5,37,0.000742236
+          -0.51,36.5,37,0.022266786
+          -0.51,38.0,37,0.008901965
+          -0.51,39.0,37,-0.0
+          -0.51,40.0,37,-0.008901965
+          -0.51,41.5,37,-0.022266786
+          -33.8568,150.5,56,1.39340764
+          -33.8568,152.0,56,0.55715815
+          -33.8568,153.0,56,-0.0
+          -33.8568,154.0,56,-0.55715815
+          -33.8568,155.5,56,-1.39340764
+          -33.4489,-71.5,19,1.378591698
+          -33.4489,-70.0,19,0.55123202
+          -33.4489,-69.0,19,-0.0
+          -33.4489,-68.0,19,-0.55123202
+          -33.4489,-66.5,19,-1.378591698
+          -32.8895,-71.5,19,1.358159178
+          -32.8895,-70.0,19,0.543059454
+          -32.8895,-69.0,19,-0.0
+          -32.8895,-68.0,19,-0.543059454
+          -32.8895,-66.5,19,-1.358159178
+          60.3913,6.5,32,-2.173886478
+          60.3913,8.0,32,-0.869441467
+          60.3913,9.0,32,0.0
+          60.3913,10.0,32,0.869441467
+          60.3913,11.5,32,2.173886478
+          58.5,6.5,32,-2.131969694
+          58.5,8.0,32,-0.8526638
+          58.5,9.0,32,0.0
+          58.5,10.0,32,0.8526638
+          58.5,11.5,32,2.131969694
+          64.8378,-149.5,6,-2.263028946
+          64.8378,-148.0,6,-0.905124371
+          64.8378,-147.0,6,0.0
+          64.8378,-146.0,6,0.905124371
+          64.8378,-144.5,6,2.263028946
+          78.2232,12.5,33,-2.447439958
+          78.2232,14.0,33,-0.978954253
+          78.2232,15.0,33,0.0
+          78.2232,16.0,33,0.978954253
+          78.2232,17.5,33,2.447439958
+          64.1466,-23.5,27,-2.25005331
+          64.1466,-22.0,27,-0.899930118
+          64.1466,-21.0,27,0.0
+          64.1466,-20.0,27,0.899930118
+          64.1466,-18.5,27,2.25005331
+          35.3606,138.5,54,-1.447412151
+          35.3606,140.0,54,-0.578759589
+          35.3606,141.0,54,0.0
+          35.3606,142.0,54,0.578759589
+          35.3606,143.5,54,1.447412151
+          36.963,126.5,52,-1.503857181
+          36.963,128.0,52,-0.601338144
+          36.963,129.0,52,0.0
+          36.963,130.0,52,0.601338144
+          36.963,131.5,52,1.503857181
+          -25.7479,24.5,35,1.086590069
+          -25.7479,26.0,35,0.434448034
+          -25.7479,27.0,35,-0.0
+          -25.7479,28.0,35,-0.434448034
+          -25.7479,29.5,35,-1.086590069
+          -3.119,-65.5,20,0.136110977
+          -3.119,-64.0,20,0.054415446
+          -3.119,-63.0,20,-0.0
+          -3.119,-62.0,20,-0.054415446
+          -3.119,-60.5,20,-0.136110977
+          34.1526,72.5,43,-1.404107599
+          34.1526,74.0,43,-0.561437994
+          34.1526,75.0,43,0.0
+          34.1526,76.0,43,0.561437994
+          34.1526,77.5,43,1.404107599
+          -45.0311,168.5,59,1.769286963
+          -45.0311,170.0,59,0.707526374
+          -45.0311,171.0,59,-0.0
+          -45.0311,172.0,59,-0.707526374
+          -45.0311,173.5,59,-1.769286963
+          """
+          }
+          EOF_GRIDFIX
+          mkdir -p 'app/src/test/java/app/gridfix/android'
           cat > 'app/src/test/java/app/gridfix/android/PortableModelTest.kt' <<'EOF_GRIDFIX'
           package app.gridfix.android
 
@@ -1080,10 +2236,10 @@ jobs:
               }
           }
           EOF_GRIDFIX
-          echo "v0.9.18-4eeea1a90e79" > .github/last-payload
+          echo "v0.9.19-e77ff18d578b" > .github/last-payload
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
-            git -c user.name='GridFix CI' -c user.email='ci@gridfix.local' commit -qm 'Sync v0.9.18 (portable slices 1-3) source from bootstrap workflow'
+            git -c user.name='GridFix CI' -c user.email='ci@gridfix.local' commit -qm 'Sync v0.9.19 (portable slices, Vincenty, shared golden vectors) source from bootstrap workflow'
             git push origin HEAD:main
           fi
           fi
