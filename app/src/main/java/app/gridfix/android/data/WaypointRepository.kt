@@ -309,6 +309,33 @@ class WaypointRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Flip the eye on each of [ids] **individually** - a mixed selection swaps, it does
+     * not get forced to one value. Selecting some shown and some hidden waypoints and
+     * tapping the eye is how you exchange one set for the other in a single gesture,
+     * which is the whole point of the action.
+     *
+     * One transaction for the batch: the store is a single JSON blob, so N calls to
+     * [setVisible] would rewrite the whole list N times.
+     */
+    suspend fun toggleVisible(ids: Set<String>) {
+        if (ids.isEmpty()) return
+        context.wpStore.edit { p ->
+            p[listKey] = encode(
+                decode(p[listKey] ?: "[]").map { if (it.id in ids) it.copy(visible = !it.visible) else it }
+            )
+        }
+    }
+
+    /** Delete every id in [ids] in one transaction. */
+    suspend fun deleteAll(ids: Set<String>) {
+        if (ids.isEmpty()) return
+        context.wpStore.edit { p ->
+            p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id in ids })
+            if (p[selectedKey] in ids) p.remove(selectedKey)
+        }
+    }
+
     suspend fun select(id: String) {
         context.wpStore.edit { p -> p[selectedKey] = id }
     }

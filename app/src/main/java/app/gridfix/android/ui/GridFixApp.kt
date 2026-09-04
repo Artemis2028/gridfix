@@ -768,6 +768,24 @@ fun GridFixApp() {
                         onSetTrackVisible = { id, visible ->
                             scope.launch { trackRepo.setVisible(id, visible) }
                         },
+                        onBatchToggleVisible = { wpIds, graphicIds, trackIds ->
+                            // Each repository flips its own selection in one transaction:
+                            // every selected item swaps its own state, so a mixed selection
+                            // exchanges shown for hidden rather than forcing one value.
+                            scope.launch {
+                                waypointRepo.toggleVisible(wpIds)
+                                graphicsRepo.toggleVisible(graphicIds)
+                                trackRepo.toggleVisible(trackIds)
+                            }
+                        },
+                        onBatchDelete = { wpIds, graphicIds, trackIds ->
+                            if (viewedTrackId in trackIds) viewedTrackId = null
+                            scope.launch {
+                                waypointRepo.deleteAll(wpIds)
+                                graphicsRepo.deleteAll(graphicIds)
+                                trackRepo.deleteAll(trackIds)
+                            }
+                        },
                         onRenameFolder = { from, to ->
                             scope.launch {
                                 val target = waypointRepo.renameFolder(from, to)

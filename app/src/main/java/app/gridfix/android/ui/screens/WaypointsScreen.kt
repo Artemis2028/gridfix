@@ -41,13 +41,16 @@ import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.FileUpload
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Map
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.MoreVert
+import androidx.compose.material.icons.outlined.SelectAll
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Timeline
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -123,6 +126,8 @@ fun WaypointsScreen(
     onSetWaypointVisible: (id: String, visible: Boolean) -> Unit = { _, _ -> },
     onSetGraphicVisible: (id: String, visible: Boolean) -> Unit = { _, _ -> },
     onSetTrackVisible: (id: String, visible: Boolean) -> Unit = { _, _ -> },
+    onBatchToggleVisible: (wpIds: Set<String>, graphicIds: Set<String>, trackIds: Set<String>) -> Unit = { _, _, _ -> },
+    onBatchDelete: (wpIds: Set<String>, graphicIds: Set<String>, trackIds: Set<String>) -> Unit = { _, _, _ -> },
     onRenameFolder: (from: String, to: String) -> Unit = { _, _ -> },
     onDeleteFolder: (name: String, deleteContents: Boolean) -> Unit = { _, _ -> },
     graphics: List<TacGraphic>,
@@ -148,6 +153,20 @@ fun WaypointsScreen(
     var deleteCandidate by remember { mutableStateOf<Waypoint?>(null) }
     var deleteGraphicCandidate by remember { mutableStateOf<TacGraphic?>(null) }
     var deleteTrackCandidate by remember { mutableStateOf<TrackInfo?>(null) }
+
+    // Multi-select. Three sets rather than one of prefixed keys: the batch calls go to
+    // three different repositories anyway, so keeping them apart avoids inventing a key
+    // format that could drift from the lazy-list keys.
+    var selecting by remember { mutableStateOf(false) }
+    var selectedWps by remember { mutableStateOf(emptySet<String>()) }
+    var selectedGraphics by remember { mutableStateOf(emptySet<String>()) }
+    var selectedTracks by remember { mutableStateOf(emptySet<String>()) }
+    var batchDeleteOpen by remember { mutableStateOf(false) }
+    val selectedCount = selectedWps.size + selectedGraphics.size + selectedTracks.size
+    fun clearSelection() {
+        selectedWps = emptySet(); selectedGraphics = emptySet(); selectedTracks = emptySet()
+    }
+    fun endSelecting() { selecting = false; clearSelection() }
     var clearFolderCandidate by remember { mutableStateOf<String?>(null) }
     var routeCardFor by remember { mutableStateOf<TacGraphic?>(null) }
     var exportOpen by remember { mutableStateOf(false) }
@@ -270,7 +289,8 @@ fun WaypointsScreen(
                     if (listedTracks.isNotEmpty()) add("${listedTracks.size} tracks")
                 }
                 Text(
-                    parts.joinToString(" · ").uppercase(Locale.US),
+                    if (selecting) "$selectedCount selected".uppercase(Locale.US)
+                    else parts.joinToString(" · ").uppercase(Locale.US),
                     fontFamily = LabelFamily,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Medium,
@@ -279,6 +299,59 @@ fun WaypointsScreen(
                     maxLines = 1,
                     modifier = Modifier.weight(1f),
                 )
+                if (selecting) {
+                    val everythingListed =
+                        selectedWps.size == listed.size &&
+                            selectedGraphics.size == listedGraphics.size &&
+                            selectedTracks.size == listedTracks.size
+                    IconButton(onClick = {
+                        if (everythingListed) {
+                            clearSelection()
+                        } else {
+                            selectedWps = listed.map { it.id }.toSet()
+                            selectedGraphics = listedGraphics.map { it.id }.toSet()
+                            selectedTracks = listedTracks.map { it.id }.toSet()
+                        }
+                    }) {
+                        Icon(
+                            Icons.Outlined.SelectAll,
+                            contentDescription = if (everythingListed) "Select none" else "Select all",
+                            tint = if (everythingListed) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    IconButton(
+                        enabled = selectedCount > 0,
+                        onClick = {
+                            onBatchToggleVisible(selectedWps, selectedGraphics, selectedTracks)
+                            endSelecting()
+                        },
+                    ) {
+                        Icon(
+                            Icons.Outlined.Visibility,
+                            // "Swap", not "hide": each selected item flips its own state, so a
+                            // mixed selection exchanges shown for hidden in one go.
+                            contentDescription = "Swap visibility of the selected items",
+                            tint = if (selectedCount > 0) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    IconButton(enabled = selectedCount > 0, onClick = { batchDeleteOpen = true }) {
+                        Icon(
+                            Icons.Outlined.Delete,
+                            contentDescription = "Delete the selected items",
+                            tint = if (selectedCount > 0) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    IconButton(onClick = { endSelecting() }) {
+                        Icon(
+                            Icons.Outlined.Close,
+                            contentDescription = "Leave selection",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
                 currentFolder?.let { f ->
                     IconButton(onClick = { onSetFolderVisible(f.name, !f.visible) }) {
                         Icon(
@@ -326,6 +399,23 @@ fun WaypointsScreen(
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                var listMenu by remember { mutableStateOf(false) }
+                Box {
+                    IconButton(onClick = { listMenu = true }) {
+                        Icon(
+                            Icons.Outlined.MoreVert,
+                            contentDescription = "List options",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    DropdownMenu(expanded = listMenu, onDismissRequest = { listMenu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Select items…") },
+                            onClick = { listMenu = false; selecting = true },
+                        )
+                    }
+                }
+                }
             }
 
             LazyColumn(
@@ -367,8 +457,13 @@ fun WaypointsScreen(
                 if (listed.isNotEmpty()) {
                     item(key = "sec-wp") { SectionLabel("Waypoints · ${listed.size}") }
                     items(listed, key = { it.id }) { w ->
-                        SwipeRow(
+                        ListRow(
+                            selecting = selecting,
+                            selected = w.id in selectedWps,
                             visible = w.visible,
+                            onToggleSelected = {
+                                selectedWps = if (w.id in selectedWps) selectedWps - w.id else selectedWps + w.id
+                            },
                             onToggleVisible = { onSetWaypointVisible(w.id, !w.visible) },
                             onDelete = { deleteCandidate = w },
                         ) {
@@ -394,8 +489,14 @@ fun WaypointsScreen(
                 if (listedGraphics.isNotEmpty()) {
                     item(key = "sec-g") { SectionLabel("Graphics · ${listedGraphics.size}") }
                     items(listedGraphics, key = { "g-" + it.id }) { g ->
-                        SwipeRow(
+                        ListRow(
+                            selecting = selecting,
+                            selected = g.id in selectedGraphics,
                             visible = g.visible,
+                            onToggleSelected = {
+                                selectedGraphics =
+                                    if (g.id in selectedGraphics) selectedGraphics - g.id else selectedGraphics + g.id
+                            },
                             onToggleVisible = { onSetGraphicVisible(g.id, !g.visible) },
                             onDelete = { deleteGraphicCandidate = g },
                         ) {
@@ -424,8 +525,14 @@ fun WaypointsScreen(
                 if (listedTracks.isNotEmpty()) {
                     item(key = "sec-t") { SectionLabel("Tracks · ${listedTracks.size}") }
                     items(listedTracks, key = { "t-" + it.id }) { t ->
-                        SwipeRow(
+                        ListRow(
+                            selecting = selecting,
+                            selected = t.id in selectedTracks,
                             visible = t.visible,
+                            onToggleSelected = {
+                                selectedTracks =
+                                    if (t.id in selectedTracks) selectedTracks - t.id else selectedTracks + t.id
+                            },
                             onToggleVisible = { onSetTrackVisible(t.id, !t.visible) },
                             onDelete = { deleteTrackCandidate = t },
                         ) {
@@ -691,6 +798,35 @@ fun WaypointsScreen(
         )
     }
 
+    if (batchDeleteOpen) {
+        val parts = buildList {
+            if (selectedWps.isNotEmpty()) add("${selectedWps.size} waypoint" + if (selectedWps.size == 1) "" else "s")
+            if (selectedGraphics.isNotEmpty()) add("${selectedGraphics.size} graphic" + if (selectedGraphics.size == 1) "" else "s")
+            if (selectedTracks.isNotEmpty()) add("${selectedTracks.size} track" + if (selectedTracks.size == 1) "" else "s")
+        }
+        AlertDialog(
+            onDismissRequest = { batchDeleteOpen = false },
+            title = { Text("Delete $selectedCount item" + if (selectedCount == 1) "?" else "s?") },
+            text = {
+                Text(
+                    parts.joinToString(", ") + " will be removed permanently" +
+                        (if (selectedTracks.isNotEmpty()) ", point logs included." else ".") +
+                        " Export a backup first if you might want them again."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onBatchDelete(selectedWps, selectedGraphics, selectedTracks)
+                    batchDeleteOpen = false
+                    endSelecting()
+                }) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { batchDeleteOpen = false }) { Text("Cancel") }
+            },
+        )
+    }
+
     deleteGraphicCandidate?.let { g ->
         AlertDialog(
             onDismissRequest = { deleteGraphicCandidate = null },
@@ -741,6 +877,39 @@ fun WaypointsScreen(
                 TextButton(onClick = { deleteCandidate = null }) { Text("Cancel") }
             },
         )
+    }
+}
+
+/**
+ * A row in either of the list's two modes.
+ *
+ * Normally it is a [SwipeRow]. While a multi-select is running the swipes are off - two
+ * gesture systems fighting over the same horizontal drag is how you get a delete you
+ * did not ask for - and the whole row becomes one tap target instead.
+ */
+@Composable
+private fun ListRow(
+    selecting: Boolean,
+    selected: Boolean,
+    visible: Boolean,
+    onToggleSelected: () -> Unit,
+    onToggleVisible: () -> Unit,
+    onDelete: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    if (!selecting) {
+        SwipeRow(visible = visible, onToggleVisible = onToggleVisible, onDelete = onDelete, content = content)
+        return
+    }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(checked = selected, onCheckedChange = { onToggleSelected() })
+        Box(Modifier.weight(1f)) {
+            Box(Modifier.alpha(if (visible) 1f else 0.4f)) { content() }
+            // The card underneath keeps its own buttons and click targets. While selecting,
+            // the row is a single target instead, so a transparent layer on top takes every
+            // tap before the card sees it.
+            Box(Modifier.matchParentSize().clickable(onClick = onToggleSelected))
+        }
     }
 }
 
