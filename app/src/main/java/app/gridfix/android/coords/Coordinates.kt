@@ -235,11 +235,18 @@ object Coordinates {
 
     data class NavInfo(val distanceMeters: Float, val bearingTrue: Float)
 
-    /** Geodesic distance and initial true bearing between two points. */
+    /**
+     * Geodesic distance and initial true bearing between two points.
+     *
+     * Was `android.location.Location.distanceBetween`. That is Vincenty on
+     * WGS84 and so is [Geodesy], to well under a millimetre — GoldenTest holds
+     * both to the same vectors. The reason for the swap is that the framework
+     * call is stubbed out in JVM unit tests, so every distance the app shows
+     * was untestable in CI; and the iOS port needs the identical numbers.
+     */
     fun navInfo(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double): NavInfo {
-        val results = FloatArray(2)
-        android.location.Location.distanceBetween(fromLat, fromLon, toLat, toLon, results)
-        return NavInfo(results[0], (results[1] + 360f) % 360f)
+        val d = Geodesy.distanceAndBearing(fromLat, fromLon, toLat, toLon)
+        return NavInfo(d[0].toFloat(), (((d[1] % 360.0) + 360.0) % 360.0).toFloat())
     }
 
     fun formatDistance(meters: Float, units: Int): String = when (units) {

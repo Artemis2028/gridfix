@@ -1,12 +1,12 @@
 package app.gridfix.android.data
 
 import android.content.Context
-import android.location.Location
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import app.gridfix.android.coords.Geodesy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -79,11 +79,9 @@ class TrackRepository(private val context: Context) {
         val pts = readPoints(context, id)
         var dist = 0.0
         for (i in 1 until pts.size) {
-            val out = FloatArray(1)
-            Location.distanceBetween(
-                pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon, out
-            )
-            dist += out[0]
+            dist += Geodesy.distanceAndBearing(
+                pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon
+            )[0]
         }
         context.trackStore.edit { p ->
             p[listKey] = encode(
@@ -115,11 +113,9 @@ class TrackRepository(private val context: Context) {
         }
         var dist = 0.0
         for (i in 1 until points.size) {
-            val out = FloatArray(1)
-            Location.distanceBetween(
-                points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon, out
-            )
-            dist += out[0]
+            dist += Geodesy.distanceAndBearing(
+                points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon
+            )[0]
         }
         val start = points.firstOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
         val end = points.lastOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
