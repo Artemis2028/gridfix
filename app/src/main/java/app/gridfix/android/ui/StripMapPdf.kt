@@ -194,7 +194,11 @@ object StripMapPdf {
             canvas.drawLine(bx, by - 4f, bx, by + 4f, line)
             canvas.drawLine(bx + barPt, by - 4f, bx + barPt, by + 4f, line)
             val barLabel = if (niceM >= 1000f) {
-                String.format(Locale.US, "%.0f km", niceM / 1000f)
+                // 2500 m is a 2.5 km bar. "%.0f" rounded it to "3 km", so the printed
+                // label disagreed with the bar it was labelling - on paper, in the field,
+                // with no way to check it.
+                if (niceM % 1000f == 0f) String.format(Locale.US, "%.0f km", niceM / 1000f)
+                else String.format(Locale.US, "%.1f km", niceM / 1000f)
             } else {
                 String.format(Locale.US, "%.0f m", niceM)
             }

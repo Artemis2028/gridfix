@@ -72,6 +72,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -381,7 +382,23 @@ fun MapScreen(
             var mapView by remember { mutableStateOf<MapView?>(null) }
 
             androidx.compose.ui.viewinterop.AndroidView(
-                modifier = Modifier.fillMaxSize(),
+                // The activity handles orientation itself (manifest configChanges), so a
+                // rotation recreates nothing: Compose re-lays-out around this native view,
+                // but the MapView keeps the geometry it was last measured at and paints at
+                // it - over the navigation rail on one side, short of the window on the
+                // other - until a touch happens to force a pass. That is what made the rail
+                // "invisible until you tap where a button would be". clipToBounds keeps the
+                // map inside its slot whatever size it thinks it is; the size callback makes
+                // it re-measure and repaint the moment the slot changes.
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clipToBounds()
+                    .onSizeChanged {
+                        holder.map?.let { m ->
+                            m.requestLayout()
+                            m.invalidate()
+                        }
+                    },
                 onRelease = { view ->
                     // Runs for the exact MapView leaving the composition. When the
                     // layer key changes, the new map may already be in the holder —
@@ -948,6 +965,20 @@ fun MapScreen(
             ) {
                 val parts = center?.let { Coordinates.mgrs(it.latitude, it.longitude, settings.mgrsDigits) }
                 if (landscape && parts != null && parts.easting.isNotEmpty()) {
+                    // The wordmark lives here when the phone is on its side: the landscape
+                    // app bar gives its 48 dp back to the map, and this block is already
+                    // the one thing on screen that is always legible.
+                    Text(
+                        "MGRS GPS",
+                        fontFamily = LabelFamily,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 9.sp,
+                        letterSpacing = 3.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f),
+                        maxLines = 1,
+                        softWrap = false,
+                        modifier = Modifier.padding(bottom = 3.dp),
+                    )
                     // Square block: zone and square on one line, the numbers under them
                     Text(
                         "${parts.gzd} ${parts.square}",

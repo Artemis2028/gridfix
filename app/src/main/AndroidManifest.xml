@@ -21,11 +21,21 @@
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
         android:supportsRtl="true"
-        android:theme="@style/Theme.GridFix">
+        android:theme="@style/Theme.GridFix"
+        android:allowBackup="false">
+
+        <!--
+          allowBackup="false" is deliberate and load-bearing. The permission screen
+          tells the user "everything stays on your phone - no account, no tracking",
+          and the default (true) would copy every waypoint, track, folder and setting
+          into their Google Drive backup. The app's own backup zip is the supported
+          way to move data between devices.
+        -->
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

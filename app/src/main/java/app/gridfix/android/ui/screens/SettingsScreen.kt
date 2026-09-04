@@ -41,7 +41,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -65,14 +64,15 @@ fun SettingsScreen(
     repo: SettingsRepository,
     settings: AppSettings,
     modelDeclination: Float? = null,   // the phone's magnetic model at the current fix, for the caption
+    gridConvergence: Float? = null,    // true -> grid at the current fix; converts a typed G-M angle
     entitled: Boolean = false,
     onPreviewPaywall: () -> Unit = {},
     onOpenReference: () -> Unit = {},
     onBackup: (android.net.Uri, (String) -> Unit) -> Unit = { _, _ -> },
     onRestore: (android.net.Uri, (String) -> Unit) -> Unit = { _, _ -> },
 ) {
-    val uriHandler = LocalUriHandler.current
     val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
     var backupStatus by remember { mutableStateOf<String?>(null) }
     val backupLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/zip")
@@ -185,6 +185,7 @@ fun SettingsScreen(
         DeclinationSetting(
             override = settings.declinationOverride,
             model = modelDeclination,
+            convergence = gridConvergence,
             angleUnit = settings.angleUnit,
             onChange = { v -> scope.launch { repo.setDeclinationOverride(v) } },
         )
@@ -248,7 +249,7 @@ fun SettingsScreen(
             )
             Row {
                 TextButton(onClick = {
-                    uriHandler.openUri(app.gridfix.android.billing.BillingManager.MANAGE_URL)
+                    app.gridfix.android.ui.openLink(context, app.gridfix.android.billing.BillingManager.MANAGE_URL)
                 }) { Text("Manage subscription") }
                 if (app.gridfix.android.BuildConfig.DEBUG) {
                     TextButton(onClick = onPreviewPaywall) { Text("Preview paywall") }
@@ -272,8 +273,8 @@ fun SettingsScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Row {
-            TextButton(onClick = { uriHandler.openUri(AppInfo.PRIVACY_URL) }) { Text("Privacy policy") }
-            TextButton(onClick = { uriHandler.openUri(AppInfo.TERMS_URL) }) { Text("Terms") }
+            TextButton(onClick = { app.gridfix.android.ui.openLink(context, AppInfo.PRIVACY_URL) }) { Text("Privacy policy") }
+            TextButton(onClick = { app.gridfix.android.ui.openLink(context, AppInfo.TERMS_URL) }) { Text("Terms") }
         }
     }
 }
@@ -385,27 +386,55 @@ private fun DataRow(title: String, subtitle: String, onClick: () -> Unit) {
 }
 
 /**
- * Magnetic declination: the phone's World Magnetic Model, or a G-M angle typed
- * from the map sheet / the order. Entered in degrees (or mils, per the angle
- * unit) with an E/W switch; stored east-positive.
+ * Magnetic declination: the phone's World Magnetic Model, or an angle typed from the
+ * map sheet / the order. Entered in degrees (or mils, per the angle unit) with an E/W
+ * switch; always **stored** as declination, east-positive.
+ *
+ * The store has always held declination - true north to magnetic north - and every
+ * azimuth is computed as `magnetic = true - declination`. But the field's hint told
+ * the user to type "the G-M angle from your map sheet", and on a declination diagram
+ * the G-M angle is *grid* north to magnetic north. The two differ by the grid
+ * convergence: about 1.1 deg at Abu Dhabi, which is 19 mils, which is 38 m off at the
+ * end of a 2 km leg, and approaches 2.5 deg at a zone edge in high latitudes. So a
+ * soldier who read his sheet exactly right got every magnetic azimuth wrong.
+ *
+ * The fix is to ask which angle he has rather than guess, and convert on entry:
+ * `declination = G-M + convergence`. Nothing about the stored format changes, so
+ * existing settings and backups keep their meaning.
  */
 @Composable
-private fun DeclinationSetting(override: Float?, model: Float?, angleUnit: Int, onChange: (Float?) -> Unit) {
+private fun DeclinationSetting(
+    override: Float?,
+    model: Float?,
+    convergence: Float?,
+    angleUnit: Int,
+    onChange: (Float?) -> Unit,
+) {
     val manual = override != null
     val mils = angleUnit == 1
+    val conv = convergence ?: 0f
+    var asGm by remember(manual) { mutableStateOf(true) }
+    fun toStored(typed: Float): Float = if (asGm) typed + conv else typed
+    fun fromStored(stored: Float): Float = if (asGm) stored - conv else stored
     fun toDisplay(deg: Float): String {
         val v = abs(deg)
         return if (mils) (v * 6400f / 360f).roundToInt().toString()
         else String.format(Locale.US, "%.1f", v)
     }
     // Keyed on the value too: a backup restore changes `override` without changing
-    // `manual`, and the field would otherwise keep showing the old number.
-    var text by remember(manual, mils, override) { mutableStateOf(if (override != null) toDisplay(override) else "") }
-    var east by remember(manual, override) { mutableStateOf(override == null || override >= 0f) }
+    // `manual`, and the field would otherwise keep showing the old number. Keyed on
+    // `asGm` as well, so switching which angle you are typing re-reads the same stored
+    // declination in the other convention instead of silently reinterpreting it.
+    var text by remember(manual, mils, override, asGm) {
+        mutableStateOf(if (override != null) toDisplay(fromStored(override)) else "")
+    }
+    var east by remember(manual, override, asGm) {
+        mutableStateOf(override == null || fromStored(override) >= 0f)
+    }
     fun push(t: String, e: Boolean) {
         val v = t.toFloatOrNull() ?: return
         val deg = if (mils) v * 360f / 6400f else v
-        if (deg in 0f..180f) onChange(if (e) deg else -deg)
+        if (deg in 0f..180f) onChange(toStored(if (e) deg else -deg))
     }
     Setting("Declination") {
         Segmented(options = listOf("Model", "Manual"), selected = if (manual) 1 else 0) { index ->
@@ -414,6 +443,10 @@ private fun DeclinationSetting(override: Float?, model: Float?, angleUnit: Int, 
         }
         Spacer(Modifier.height(6.dp))
         if (manual) {
+            Segmented(options = listOf("G-M angle", "Declination"), selected = if (asGm) 0 else 1) { index ->
+                asGm = index == 0
+            }
+            Spacer(Modifier.height(6.dp))
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
                     value = text,
@@ -439,12 +472,20 @@ private fun DeclinationSetting(override: Float?, model: Float?, angleUnit: Int, 
         }
         Text(
             when {
-                manual -> "Pinned to " + Declination.format(override ?: 0f, angleUnit) +
-                    (model?.let { " — the phone's model says " + Declination.format(it, angleUnit) + " here" } ?: "") +
-                    ". Every azimuth, the compass faces and the route cards use this value."
+                manual -> {
+                    val stored = override ?: 0f
+                    "G-M " + Declination.format(stored - conv, angleUnit) +
+                        " → declination " + Declination.format(stored, angleUnit) +
+                        (if (convergence == null) " (no fix yet — grid convergence taken as zero until you have one)"
+                        else " here, using a grid convergence of " + Declination.format(conv, angleUnit)) +
+                        (model?.let { ". The phone's model says " + Declination.format(it, angleUnit) } ?: "") +
+                        ". Every azimuth, the compass faces and the route cards use the declination."
+                }
                 model != null -> "Phone's World Magnetic Model at your fix: " + Declination.format(model, angleUnit) +
-                    ". Switch to Manual to use the G-M angle from your map sheet or the order."
-                else -> "Phone's World Magnetic Model at your fix. Switch to Manual to use the G-M angle from your map sheet or the order."
+                    ". Switch to Manual to type the G-M angle from your map sheet or the order — " +
+                    "it is converted to declination using the grid convergence where you are."
+                else -> "Phone's World Magnetic Model at your fix. Switch to Manual to type the G-M angle " +
+                    "from your map sheet or the order — it is converted to declination using the grid convergence."
             },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,

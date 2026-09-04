@@ -51,7 +51,11 @@ class LocationTracker(context: Context) {
     private val _fix = MutableStateFlow(FixData())
     val fix: StateFlow<FixData> = _fix.asStateFlow()
 
-    private var started = false
+    // One flag per provider rather than one for the tracker: start() has to be able to
+    // pick up a provider that was switched on after the first call.
+    private var gpsRequested = false
+    private var networkRequested = false
+    private var gnssRegistered = false
 
     // Full interface implementation (not a SAM lambda): on API 26–29 devices the
     // framework still calls the legacy callbacks, which have no platform defaults there.
@@ -95,52 +99,80 @@ class LocationTracker(context: Context) {
         }
     }
 
+    /**
+     * Begin (or resume) listening. Safe to call repeatedly: each provider is tracked
+     * separately and only requested if it is not already running.
+     *
+     * The old version set one `started` flag on the first call and returned early ever
+     * after, and only asked for GPS if the provider happened to be enabled at that
+     * moment. So: open the app with Location off, read the message telling you to turn
+     * it on, turn it on, come back - and GPS was never requested again for the life of
+     * the process. If the network provider was up, the app quietly ran on Wi-Fi and cell
+     * fixes, which in open desert is no fix at all. The listener's onProviderEnabled
+     * could not rescue it either, being registered against the network provider only.
+     *
+     * GPS is now requested whether or not the provider reports enabled. That is allowed
+     * from API 26: it simply delivers nothing while the provider is off and starts
+     * delivering when it comes on, which removes the "was it on at launch" question
+     * rather than answering it.
+     *
+     * Each provider is still requested independently, because an "Approximate"
+     * (coarse-only) grant makes the GPS request throw and that must not also cost us
+     * the network provider and the GNSS status callback.
+     */
     @SuppressLint("MissingPermission")
     fun start() {
-        if (started) return
-        started = true
         val looper = Looper.getMainLooper()
-        // Each provider is requested independently: an "Approximate" (coarse-only)
-        // grant makes the GPS request throw, which must not also cost us the
-        // network provider and the GNSS status callback.
-        var any = false
-        val gpsEnabled = runCatching {
-            locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
-        }.getOrDefault(false)
-        if (gpsEnabled) {
+        if (!gpsRequested) {
             runCatching {
                 locationManager.requestLocationUpdates(
                     LocationManager.GPS_PROVIDER, 1000L, 0f, listener, looper
                 )
-                any = true
+                gpsRequested = true
             }
         }
-        runCatching {
-            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                locationManager.requestLocationUpdates(
-                    LocationManager.NETWORK_PROVIDER, 5000L, 0f, listener, looper
-                )
-                any = true
+        if (!networkRequested) {
+            runCatching {
+                if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                    locationManager.requestLocationUpdates(
+                        LocationManager.NETWORK_PROVIDER, 5000L, 0f, listener, looper
+                    )
+                    networkRequested = true
+                }
             }
         }
-        runCatching { locationManager.registerGnssStatusCallback(gnssCallback, Handler(looper)) }
+        if (!gnssRegistered) {
+            runCatching {
+                locationManager.registerGnssStatusCallback(gnssCallback, Handler(looper))
+                gnssRegistered = true
+            }
+        }
+        val gpsEnabled = runCatching {
+            locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+        }.getOrDefault(false)
         runCatching {
             val last = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
                 ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
             _fix.update { it.copy(location = last ?: it.location, gpsEnabled = gpsEnabled) }
             last?.let { addMslAltitude(it) }
         }
-        if (!any) started = false
     }
 
     fun stop() {
-        if (!started) return
-        started = false
+        if (!gpsRequested && !networkRequested && !gnssRegistered) return
         try {
             locationManager.removeUpdates(listener)
-            locationManager.unregisterGnssStatusCallback(gnssCallback)
         } catch (_: SecurityException) {
         }
+        if (gnssRegistered) {
+            try {
+                locationManager.unregisterGnssStatusCallback(gnssCallback)
+            } catch (_: SecurityException) {
+            }
+        }
+        gpsRequested = false
+        networkRequested = false
+        gnssRegistered = false
     }
 }
 

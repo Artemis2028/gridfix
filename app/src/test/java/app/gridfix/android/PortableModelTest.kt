@@ -6,7 +6,9 @@ import app.gridfix.android.map.GridLine
 import app.gridfix.android.map.ImageQuad
 import app.gridfix.android.map.chooseGridInterval
 import app.gridfix.android.map.gridIntervalLabel
+import app.gridfix.android.map.gridLineValues
 import app.gridfix.android.map.trimOldest
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -46,6 +48,78 @@ class PortableModelTest {
         val coarse = chooseGridInterval(metersPerPixel = 2.0, density = 1f)
         val dense = chooseGridInterval(metersPerPixel = 2.0, density = 4f)
         assertTrue("density should never make the grid finer", dense >= coarse)
+    }
+
+    // ---- Grid line values: the seam the missing 100 km line lived in ---------
+
+    @Test
+    fun `every multiple in range is present and nothing else, from an unaligned start`() {
+        // The exact viewport from the 0.9.20 review: a 10 km grid, ~85 km wide, with
+        // bounds floored to the fine interval. The old walk rounded 330000 down to
+        // 300000 (off screen) and stopped at 430000 > eMax, so 400000 - the one line
+        // actually on screen - was never drawn.
+        val values = gridLineValues(min = 330000.0, max = 415000.0, interval = 100000)
+        assertArrayEquals(longArrayOf(400000L), values)
+    }
+
+    @Test
+    fun `an aligned minimum is included, not skipped`() {
+        assertArrayEquals(
+            longArrayOf(300000L, 400000L),
+            gridLineValues(min = 300000.0, max = 415000.0, interval = 100000),
+        )
+    }
+
+    @Test
+    fun `the fine pass walks every step across the span`() {
+        assertArrayEquals(
+            longArrayOf(330000L, 340000L, 350000L, 360000L, 370000L, 380000L, 390000L, 400000L, 410000L),
+            gridLineValues(min = 330000.0, max = 415000.0, interval = 10000),
+        )
+    }
+
+    @Test
+    fun `no multiple in the span means no lines rather than a wrong one`() {
+        assertEquals(0L, gridLineValues(min = 330001.0, max = 399999.0, interval = 100000).size.toLong())
+    }
+
+    @Test
+    fun `values are multiples, ascending, and inside the range - swept`() {
+        // A drift guard over every interval the chooser can return, at a range of
+        // unaligned starts: the property, not the arithmetic, is what must hold.
+        for (interval in intArrayOf(10, 100, 1000, 10000, 100000)) {
+            for (offset in 0 until 10) {
+                val min = 1_234_567.0 + offset * 137.0
+                val max = min + interval * 6.5
+                val values = gridLineValues(min, max, interval)
+                var previous = Long.MIN_VALUE
+                for (v in values) {
+                    assertEquals("interval $interval offset $offset: not a multiple", 0L, v % interval)
+                    assertTrue("interval $interval offset $offset: below range", v >= min)
+                    assertTrue("interval $interval offset $offset: above range", v <= max)
+                    assertTrue("interval $interval offset $offset: not ascending", v > previous)
+                    previous = v
+                }
+                // Nothing in range may be missing: the count is the span over the step.
+                val expected = Math.floor(max / interval).toLong() - Math.ceil(min / interval).toLong() + 1L
+                assertEquals("interval $interval offset $offset: wrong count", expected, values.size.toLong())
+            }
+        }
+    }
+
+    @Test
+    fun `the guard caps output without dropping the start of the run`() {
+        val values = gridLineValues(min = 0.0, max = 1_000_000.0, interval = 10, guard = 5)
+        assertArrayEquals(longArrayOf(0L, 10L, 20L, 30L, 40L), values)
+    }
+
+    @Test
+    fun `nonsense input yields no lines rather than an exception`() {
+        assertEquals(0L, gridLineValues(min = 0.0, max = 100.0, interval = 0).size.toLong())
+        assertEquals(0L, gridLineValues(min = 0.0, max = 100.0, interval = -10).size.toLong())
+        assertEquals(0L, gridLineValues(min = 100.0, max = 0.0, interval = 10).size.toLong())
+        assertEquals(0L, gridLineValues(min = Double.NaN, max = 100.0, interval = 10).size.toLong())
+        assertEquals(0L, gridLineValues(min = 0.0, max = Double.POSITIVE_INFINITY, interval = 10).size.toLong())
     }
 
     @Test

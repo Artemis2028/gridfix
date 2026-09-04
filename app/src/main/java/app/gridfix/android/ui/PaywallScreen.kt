@@ -44,7 +44,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -76,7 +75,6 @@ fun PaywallScreen(
     onClose: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
-    val uriHandler = LocalUriHandler.current
     val plans by billing.plans.collectAsStateWithLifecycle()
     val plansStatus by billing.plansStatus.collectAsStateWithLifecycle()
     val notice by billing.notice.collectAsStateWithLifecycle()
@@ -257,7 +255,7 @@ fun PaywallScreen(
                     fontSize = 11.sp,
                     color = cs.onSurfaceVariant,
                     modifier = Modifier
-                        .clickable { uriHandler.openUri(AppInfo.TERMS_URL) }
+                        .clickable { openLink(context, AppInfo.TERMS_URL) }
                         .padding(vertical = 8.dp, horizontal = 4.dp),
                 )
                 Text(
@@ -272,7 +270,7 @@ fun PaywallScreen(
                     fontSize = 11.sp,
                     color = cs.onSurfaceVariant,
                     modifier = Modifier
-                        .clickable { uriHandler.openUri(AppInfo.PRIVACY_URL) }
+                        .clickable { openLink(context, AppInfo.PRIVACY_URL) }
                         .padding(vertical = 8.dp, horizontal = 4.dp),
                 )
             }

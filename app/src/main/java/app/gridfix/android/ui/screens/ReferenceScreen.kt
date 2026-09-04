@@ -142,12 +142,16 @@ fun ReferenceScreen() {
             Body(
                 "TRUE north: the geographic pole — what the stars give you. GRID north: " +
                     "the map's vertical grid lines. MAGNETIC north: where the compass " +
-                    "needle points. The G-M angle between them is your declination, and it " +
-                    "changes with location and time."
+                    "needle points. The angle from GRID to MAGNETIC is the G-M angle, the " +
+                    "one printed in the declination diagram on your sheet. The angle from " +
+                    "TRUE to MAGNETIC is the declination. They are not the same: they differ " +
+                    "by the grid convergence, which is also on the sheet. Both change with " +
+                    "location and time."
             )
             Spacer(Modifier.height(6.dp))
             MonoRow("Magnetic → True", "ADD east declination (subtract west)")
             MonoRow("True → Grid", "subtract grid convergence")
+            MonoRow("Declination", "G-M angle + grid convergence")
             Spacer(Modifier.height(6.dp))
             Body(
                 "MGRS GPS computes both from the World Magnetic Model for wherever you " +

@@ -417,13 +417,10 @@ class MgrsGridOverlay(private val density: Float) : Overlay() {
         val steps = 12
         val guard = 90
 
-        // Vertical lines: constant easting
-        var v = eMin
-        var count = 0
-        while (v <= eMax && count < guard) {
-            val eL = Math.round(v / interval) * interval.toLong()
-            v += interval
-            count++
+        // Vertical lines: constant easting.
+        // The values come from the pure helper (and its tests) rather than from a
+        // rounded walk off an unaligned start - see gridLineValues for what that cost.
+        for (eL in gridLineValues(eMin, eMax, interval, guard)) {
             if (skipMultiple > 0 && eL % skipMultiple == 0L) continue
             beginLine(if (labeled) 1 else 0)
             var prevIn = false
@@ -443,12 +440,7 @@ class MgrsGridOverlay(private val density: Float) : Overlay() {
         }
 
         // Horizontal lines: constant northing
-        v = nMin
-        count = 0
-        while (v <= nMax && count < guard) {
-            val nL = Math.round(v / interval) * interval.toLong()
-            v += interval
-            count++
+        for (nL in gridLineValues(nMin, nMax, interval, guard)) {
             if (skipMultiple > 0 && nL % skipMultiple == 0L) continue
             beginLine(if (labeled) 2 else 0)
             var prevIn = false

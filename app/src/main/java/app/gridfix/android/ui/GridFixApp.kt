@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -82,6 +83,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -278,9 +280,16 @@ fun GridFixApp() {
     LaunchedEffect(Unit) {
         runCatching { trackRepo.finalizeOrphans(TrackRecorderService.active.value?.trackId) }
     }
-    DisposableEffect(hasPermission) {
+    // Tied to the lifecycle, not to the composition. onDispose only fires when the
+    // activity is destroyed, so the foreground GPS listener used to run for as long as
+    // the process lived - and, worse, start() was called exactly once, so a user who
+    // turned Location on after launch never got a GPS request at all. ON_START also
+    // means a trip to the system settings and back re-runs start(), which now picks up
+    // whichever providers are enabled by then. The compass has always done this; the
+    // tracker should have too.
+    LifecycleStartEffect(hasPermission) {
         if (hasPermission) tracker.start()
-        onDispose { tracker.stop() }
+        onStopOrDispose { tracker.stop() }
     }
     val fix by tracker.fix.collectAsStateWithLifecycle()
 
@@ -412,8 +421,11 @@ fun GridFixApp() {
             contentWindowInsets = ScaffoldDefaults.contentWindowInsets.union(WindowInsets.displayCutout),
             topBar = {
                 if (landscape) {
-                    // Sideways there is no vertical room to spare: a 48 dp bar
-                    CompactTopBar(title = barTitle, navigationIcon = backButton, actions = barActions)
+                    // Sideways there is no vertical room to spare: a 48 dp strip with no
+                    // wordmark in it. The wordmark moves into the map's grid-readout block,
+                    // which is on screen anyway - branding is not worth 48 dp of map when
+                    // the phone is on its side.
+                    CompactTopBar(navigationIcon = backButton, actions = barActions)
                 } else {
                     CenterAlignedTopAppBar(
                         title = barTitle,
@@ -827,6 +839,9 @@ fun GridFixApp() {
                         repo,
                         settings,
                         modelDeclination = fix.location?.let { Declination.model(it.latitude, it.longitude) },
+                        gridConvergence = fix.location?.let {
+                            Coordinates.gridConvergence(it.latitude, it.longitude).toFloat()
+                        },
                         entitled = entitlement == BillingManager.State.ENTITLED,
                         onPreviewPaywall = { paywallPreview = true },
                         onOpenReference = {
@@ -986,16 +1001,23 @@ fun GridFixApp() {
     }
 }
 
-/** A 48 dp app bar for landscape: title centred, back on the left, actions on the right. */
+/**
+ * A 48 dp actions strip for landscape: back on the left, actions on the right, no title.
+ *
+ * The background is not decoration. Material's own app bars paint one; this hand-rolled
+ * Box did not, so anything behind it showed through - which is how the wordmark came to
+ * look translucent over the map. Painted before the inset padding so the fill reaches
+ * under the status bar too.
+ */
 @Composable
 private fun CompactTopBar(
-    title: @Composable () -> Unit,
     navigationIcon: @Composable () -> Unit,
     actions: @Composable () -> Unit,
 ) {
     Box(
         Modifier
             .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.background)
             .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Top))
             .height(48.dp),
     ) {
@@ -1008,11 +1030,6 @@ private fun CompactTopBar(
             androidx.compose.runtime.CompositionLocalProvider(
                 androidx.compose.material3.LocalContentColor provides MaterialTheme.colorScheme.onSurfaceVariant,
             ) { navigationIcon() }
-        }
-        Box(Modifier.align(Alignment.Center)) {
-            androidx.compose.runtime.CompositionLocalProvider(
-                androidx.compose.material3.LocalContentColor provides MaterialTheme.colorScheme.onBackground,
-            ) { title() }
         }
         Row(
             Modifier
@@ -1090,6 +1107,26 @@ private fun buzz(context: android.content.Context) {
 @Composable
 private fun PermissionGate(onRequest: () -> Unit, approximateOnly: Boolean = false) {
     val context = LocalContext.current
+    val activity = context.hostActivity()
+    // After a permanent denial Android answers instantly with "denied" and shows no
+    // dialog at all, so the button appears to do nothing and the screen is a dead end
+    // with no way forward. shouldShowRequestPermissionRationale is what tells the two
+    // apart - but it only means anything once we have actually asked in this process,
+    // which is what `asked` is for.
+    var asked by remember { mutableStateOf(false) }
+    val permanentlyDenied = asked && activity != null &&
+        !activity.shouldShowRequestPermissionRationale(android.Manifest.permission.ACCESS_FINE_LOCATION)
+    val openAppSettings: () -> Unit = {
+        runCatching {
+            context.startActivity(
+                android.content.Intent(
+                    android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.fromParts("package", context.packageName, null),
+                )
+            )
+        }
+        Unit
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1110,7 +1147,10 @@ private fun PermissionGate(onRequest: () -> Unit, approximateOnly: Boolean = fal
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            if (approximateOnly) {
+            if (permanentlyDenied) {
+                "Android will not ask again on this phone. Turn location on for MGRS GPS in " +
+                    "the app's permission settings, then come back."
+            } else if (approximateOnly) {
                 "Only approximate location was allowed. A grid readout needs the GPS chip — " +
                     "choose \"Precise\" when asked, or switch it on in the app's permission settings."
             } else {
@@ -1121,21 +1161,16 @@ private fun PermissionGate(onRequest: () -> Unit, approximateOnly: Boolean = fal
             textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(24.dp))
-        Button(onClick = onRequest) {
-            Text(if (approximateOnly) "Allow precise location" else "Grant location access")
-        }
-        if (approximateOnly) {
-            Spacer(Modifier.height(8.dp))
-            TextButton(onClick = {
-                runCatching {
-                    context.startActivity(
-                        android.content.Intent(
-                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            android.net.Uri.fromParts("package", context.packageName, null),
-                        )
-                    )
-                }
-            }) { Text("Open app settings") }
+        if (permanentlyDenied) {
+            Button(onClick = openAppSettings) { Text("Open app settings") }
+        } else {
+            Button(onClick = { asked = true; onRequest() }) {
+                Text(if (approximateOnly) "Allow precise location" else "Grant location access")
+            }
+            if (approximateOnly) {
+                Spacer(Modifier.height(8.dp))
+                TextButton(onClick = openAppSettings) { Text("Open app settings") }
+            }
         }
     }
 }

@@ -100,8 +100,13 @@ object DataPackage {
                         uid = parser.getAttributeValue(null, "uid") ?: ""
                     }
                     "point" -> {
-                        lat = parser.getAttributeValue(null, "lat")?.toDoubleOrNull()
-                        lon = parser.getAttributeValue(null, "lon")?.toDoubleOrNull()
+                        // The same range check the GPX and KML paths already used. Without
+                        // it a NaN in one .cot aborted the entire import with "Forbidden
+                        // numeric value", and a lat of 500 was stored as written.
+                        lat = InterchangeFiles.coord(parser.getAttributeValue(null, "lat"), 90.0)
+                            .takeIf { it.isFinite() }
+                        lon = InterchangeFiles.coord(parser.getAttributeValue(null, "lon"), 180.0)
+                            .takeIf { it.isFinite() }
                     }
                     "contact" -> {
                         callsign = parser.getAttributeValue(null, "callsign") ?: callsign

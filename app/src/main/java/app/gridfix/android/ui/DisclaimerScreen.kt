@@ -26,7 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
-import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -41,7 +41,7 @@ import app.gridfix.android.ui.theme.LabelFamily
 @Composable
 fun DisclaimerScreen(onAccept: () -> Unit) {
     val cs = MaterialTheme.colorScheme
-    val uriHandler = LocalUriHandler.current
+    val linkContext = LocalContext.current
     Surface(modifier = Modifier.fillMaxSize(), color = cs.background) {
         Column(
             modifier = Modifier
@@ -114,7 +114,7 @@ fun DisclaimerScreen(onAccept: () -> Unit) {
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.Center,
             ) {
-                TextButton(onClick = { uriHandler.openUri(AppInfo.PRIVACY_URL) }) {
+                TextButton(onClick = { openLink(linkContext, AppInfo.PRIVACY_URL) }) {
                     Text("Privacy policy", fontFamily = LabelFamily, fontSize = 12.sp)
                 }
             }

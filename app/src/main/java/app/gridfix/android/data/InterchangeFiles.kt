@@ -17,8 +17,12 @@ import java.util.zip.ZipInputStream
  */
 object InterchangeFiles {
 
-    /** A coordinate attribute as a finite, in-range double, else NaN (rejects "NaN", "Infinity", 120). */
-    private fun coord(raw: String?, limit: Double): Double {
+    /**
+     * A coordinate attribute as a finite, in-range double, else NaN (rejects "NaN",
+     * "Infinity", 120). Internal rather than private so the CoT path in [DataPackage]
+     * uses the same check instead of its own looser one.
+     */
+    internal fun coord(raw: String?, limit: Double): Double {
         val v = raw?.trim()?.toDoubleOrNull() ?: return Double.NaN
         return if (v.isFinite() && v >= -limit && v <= limit) v else Double.NaN
     }
