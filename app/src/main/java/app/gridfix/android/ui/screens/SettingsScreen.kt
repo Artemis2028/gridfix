@@ -276,6 +276,15 @@ fun SettingsScreen(
             TextButton(onClick = { app.gridfix.android.ui.openLink(context, AppInfo.PRIVACY_URL) }) { Text("Privacy policy") }
             TextButton(onClick = { app.gridfix.android.ui.openLink(context, AppInfo.TERMS_URL) }) { Text("Terms") }
         }
+        // The only way anyone can reach the developer from inside the app. During a
+        // closed test it is the difference between a tester telling you what broke and
+        // a tester uninstalling - and an uninstall is what actually costs you the
+        // 14-day opt-in count.
+        DataRow(
+            title = "Send feedback",
+            subtitle = "Email the developer — your version and device are filled in for you",
+            onClick = { app.gridfix.android.ui.sendFeedback(context) },
+        )
     }
 }
 

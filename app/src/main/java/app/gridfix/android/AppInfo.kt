@@ -14,6 +14,13 @@ object AppInfo {
     const val TERMS_URL = "https://github.com/Artemis2028/gridfix-legal/blob/main/TERMS.md"
 
     /**
+     * Where a tester or a user writes to. Already public in PRIVACY.md, and only ever
+     * reached by a deliberate tap in Settings - unlike [CONTACT_URL], which goes out in
+     * the User-Agent on every tile request and must stay impersonal.
+     */
+    const val SUPPORT_EMAIL = "ozwash1776@gmail.com"
+
+    /**
      * User-Agent for OpenStreetMap, OpenTopoMap and the Terrarium terrain tiles.
      * OSM's tile usage policy asks for an identifiable app and a way to make
      * contact; the URL above is that contact.
