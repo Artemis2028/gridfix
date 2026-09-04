@@ -26,6 +26,15 @@ import androidx.compose.material.icons.filled.Add
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.outlined.CreateNewFolder
+import androidx.compose.animation.core.Animatable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
+import androidx.compose.foundation.layout.offset
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntOffset
+import kotlin.math.roundToInt
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.FileDownload
@@ -111,6 +120,9 @@ fun WaypointsScreen(
     onNavigateTo: (String) -> Unit,
     onAddFolder: (String) -> Unit,
     onSetFolderVisible: (name: String, visible: Boolean) -> Unit,
+    onSetWaypointVisible: (id: String, visible: Boolean) -> Unit = { _, _ -> },
+    onSetGraphicVisible: (id: String, visible: Boolean) -> Unit = { _, _ -> },
+    onSetTrackVisible: (id: String, visible: Boolean) -> Unit = { _, _ -> },
     onRenameFolder: (from: String, to: String) -> Unit = { _, _ -> },
     onDeleteFolder: (name: String, deleteContents: Boolean) -> Unit = { _, _ -> },
     graphics: List<TacGraphic>,
@@ -355,6 +367,11 @@ fun WaypointsScreen(
                 if (listed.isNotEmpty()) {
                     item(key = "sec-wp") { SectionLabel("Waypoints · ${listed.size}") }
                     items(listed, key = { it.id }) { w ->
+                        SwipeRow(
+                            visible = w.visible,
+                            onToggleVisible = { onSetWaypointVisible(w.id, !w.visible) },
+                            onDelete = { deleteCandidate = w },
+                        ) {
                         WaypointCard(
                             w = w,
                             loc = loc,
@@ -369,6 +386,7 @@ fun WaypointsScreen(
                             onDelete = { deleteCandidate = w },
                             onShowOnMap = { onShowOnMap(w) },
                         )
+                        }
                     }
                 }
 
@@ -376,6 +394,11 @@ fun WaypointsScreen(
                 if (listedGraphics.isNotEmpty()) {
                     item(key = "sec-g") { SectionLabel("Graphics · ${listedGraphics.size}") }
                     items(listedGraphics, key = { "g-" + it.id }) { g ->
+                        SwipeRow(
+                            visible = g.visible,
+                            onToggleVisible = { onSetGraphicVisible(g.id, !g.visible) },
+                            onDelete = { deleteGraphicCandidate = g },
+                        ) {
                         GraphicRow(
                             g = g,
                             night = settings.nightMode,
@@ -386,6 +409,7 @@ fun WaypointsScreen(
                             } else null,
                             onDelete = { deleteGraphicCandidate = g },
                         )
+                        }
                     }
                     if (currentFolder != null && listedGraphics.size > 1) {
                         item(key = "clear-${currentFolder.name}") {
@@ -400,6 +424,11 @@ fun WaypointsScreen(
                 if (listedTracks.isNotEmpty()) {
                     item(key = "sec-t") { SectionLabel("Tracks · ${listedTracks.size}") }
                     items(listedTracks, key = { "t-" + it.id }) { t ->
+                        SwipeRow(
+                            visible = t.visible,
+                            onToggleVisible = { onSetTrackVisible(t.id, !t.visible) },
+                            onDelete = { deleteTrackCandidate = t },
+                        ) {
                         TrackRow(
                             t = t,
                             settings = settings,
@@ -411,6 +440,7 @@ fun WaypointsScreen(
                             onBacktrack = { onBacktrackTrack(t) },
                             onMove = { moveTrackCandidate = t },
                         )
+                        }
                     }
                 }
 
@@ -711,6 +741,84 @@ fun WaypointsScreen(
                 TextButton(onClick = { deleteCandidate = null }) { Text("Cancel") }
             },
         )
+    }
+}
+
+/**
+ * One list row with the two swipe actions, shared by waypoints, graphics and tracks.
+ *
+ * Drag right-to-left to uncover an eye and toggle whether the item is drawn on the map;
+ * drag left-to-right to uncover a red bin, which asks before deleting. **Neither gesture
+ * removes the card** - the row always springs back and the action is what changes, so the
+ * list never animates something away that has not been confirmed.
+ *
+ * Hand-rolled on `draggable` rather than Material's `SwipeToDismissBox` on purpose: that
+ * component's signature has changed shape across material3 versions, nothing in this
+ * sandbox can compile against the one this project pins (1.2.1 via Compose BOM
+ * 2024.06.00), and a build spent finding that out costs more than these thirty lines.
+ * `draggable` has been stable for years.
+ */
+@Composable
+private fun SwipeRow(
+    visible: Boolean,
+    onToggleVisible: () -> Unit,
+    onDelete: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val offsetX = remember { Animatable(0f) }
+    val density = LocalDensity.current
+    val trigger = with(density) { 84.dp.toPx() }   // how far to commit to the action
+    val limit = with(density) { 112.dp.toPx() }    // as far as the card will travel
+    val dragState = rememberDraggableState { delta ->
+        scope.launch { offsetX.snapTo((offsetX.value + delta).coerceIn(-limit, limit)) }
+    }
+    val pulled = offsetX.value
+    val deleting = pulled > 0f
+
+    Box(Modifier.fillMaxWidth()) {
+        // The action under the card, on whichever side it has been pulled away from.
+        if (pulled != 0f) {
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .background(
+                        if (deleting) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.surfaceVariant
+                    )
+                    .padding(horizontal = 24.dp),
+                contentAlignment = if (deleting) Alignment.CenterStart else Alignment.CenterEnd,
+            ) {
+                Icon(
+                    // The icon shows what the swipe will DO, not the current state:
+                    // a visible item offers to hide, a hidden one offers to show.
+                    if (deleting) Icons.Outlined.Delete
+                    else if (visible) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                    contentDescription = null,
+                    tint = if (deleting) MaterialTheme.colorScheme.onError
+                    else MaterialTheme.colorScheme.onSurface,
+                )
+            }
+        }
+        Box(
+            Modifier
+                .offset { IntOffset(offsetX.value.roundToInt(), 0) }
+                .draggable(
+                    state = dragState,
+                    orientation = Orientation.Horizontal,
+                    onDragStopped = {
+                        val travelled = offsetX.value
+                        when {
+                            travelled <= -trigger -> onToggleVisible()
+                            travelled >= trigger -> onDelete()
+                        }
+                        offsetX.animateTo(0f)
+                    },
+                ),
+        ) {
+            // A hidden item stays in the list, dimmed, so it can be found and shown again.
+            Box(Modifier.alpha(if (visible) 1f else 0.4f)) { content() }
+        }
     }
 }
 

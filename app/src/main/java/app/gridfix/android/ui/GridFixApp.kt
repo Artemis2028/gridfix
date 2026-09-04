@@ -207,10 +207,15 @@ fun GridFixApp() {
         }
     }
 
-    // Waypoints in visible ("active") overlays are the ones offered for navigation
-    val navigableWaypoints = if (folders.isEmpty()) waypoints else {
-        val visibleNames = folders.filter { it.visible }.map { it.name }.toSet()
-        waypoints.filter { it.folder in visibleNames }
+    // Waypoints offered for navigation: the overlay's eye open and the waypoint's own
+    // eye open. A hidden waypoint is held, not navigable - it is not on the map either,
+    // and offering a target you cannot see would be worse than not offering it.
+    val navigableWaypoints = run {
+        val shown = waypoints.filter { it.visible }
+        if (folders.isEmpty()) shown else {
+            val visibleNames = folders.filter { it.visible }.map { it.name }.toSet()
+            shown.filter { it.folder in visibleNames }
+        }
     }
     val scope = rememberCoroutineScope()
     val recordGate = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
@@ -362,8 +367,11 @@ fun GridFixApp() {
 
     // A viewed track in a hidden folder would draw nothing: gate the id once, for
     // the map and the list alike, and un-hide the folder when a track is viewed.
+    // The track's own eye gates it the same way.
     val shownTrackId = viewedTrackId?.takeIf { id ->
-        val f = tracks.firstOrNull { it.id == id }?.folder
+        val track = tracks.firstOrNull { it.id == id }
+        if (track?.visible == false) return@takeIf false
+        val f = track?.folder
         f == null || folders.firstOrNull { it.name == f }?.visible != false
     }
 
@@ -750,6 +758,15 @@ fun GridFixApp() {
                         onAddFolder = { name -> scope.launch { waypointRepo.addFolder(name) } },
                         onSetFolderVisible = { name, visible ->
                             scope.launch { waypointRepo.setFolderVisible(name, visible) }
+                        },
+                        onSetWaypointVisible = { id, visible ->
+                            scope.launch { waypointRepo.setVisible(id, visible) }
+                        },
+                        onSetGraphicVisible = { id, visible ->
+                            scope.launch { graphicsRepo.setVisible(id, visible) }
+                        },
+                        onSetTrackVisible = { id, visible ->
+                            scope.launch { trackRepo.setVisible(id, visible) }
                         },
                         onRenameFolder = { from, to ->
                             scope.launch {

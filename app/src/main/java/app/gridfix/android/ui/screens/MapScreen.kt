@@ -248,18 +248,22 @@ fun MapScreen(
     val density = LocalDensity.current
     val holder = remember { MapHolder() }
 
-    // Waypoints and graphics in visible folders are drawn on the map
+    // Waypoints and graphics are drawn when their folder's eye is open AND their own
+    // is: the folder switch hides a whole overlay, the item switch hides one thing
+    // inside an overlay that is otherwise shown.
     val visibleWaypoints = remember(waypoints, folders) {
-        if (folders.isEmpty()) waypoints else {
+        val shown = waypoints.filter { it.visible }
+        if (folders.isEmpty()) shown else {
             val visible = folders.filter { it.visible }.map { it.name }.toSet()
-            waypoints.filter { it.folder in visible }
+            shown.filter { it.folder in visible }
         }
     }
     val visibleGraphics = remember(graphics, folders) {
-        if (folders.isEmpty()) graphics else {
+        val shown = graphics.filter { it.visible }
+        if (folders.isEmpty()) shown else {
             val visible = folders.filter { it.visible }.map { it.name }.toSet()
             val known = folders.map { it.name }.toSet()
-            graphics.filter { it.folder in visible || it.folder !in known }
+            shown.filter { it.folder in visible || it.folder !in known }
         }
     }
 

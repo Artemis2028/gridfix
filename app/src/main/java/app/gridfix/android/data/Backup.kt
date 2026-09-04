@@ -46,6 +46,7 @@ object Backup {
                     .put("symbol", w.symbol).put("affiliation", w.affiliation)
                     .put("echelon", w.echelon).put("designation", w.designation)
                     .put("kind", w.kind).put("rotation", w.rotation.toDouble())
+                    .put("visible", w.visible)
             )
         })
         root.put("folders", JSONArray().also { a ->
@@ -60,7 +61,7 @@ object Backup {
                         .put("id", g.id).put("name", g.name).put("type", g.type)
                         .put("points", pts).put("folder", g.folder)
                         .put("affiliation", g.affiliation).put("createdAt", g.createdAt)
-                        .put("echelon", g.echelon)
+                        .put("echelon", g.echelon).put("visible", g.visible)
                 )
             }
         })
@@ -84,7 +85,7 @@ object Backup {
                     .put("id", t.id).put("name", t.name)
                     .put("startedAt", t.startedAt).put("endedAt", t.endedAt)
                     .put("distanceM", t.distanceM).put("pointCount", t.pointCount)
-                    .put("folder", t.folder)
+                    .put("folder", t.folder).put("visible", t.visible)
             )
         })
         root.put("courseHistory", JSONArray().also { a ->
@@ -183,6 +184,7 @@ object Backup {
                         designation = o.optString("designation", ""),
                         kind = o.optString("kind", KIND_WP),
                         rotation = o.optDouble("rotation", 0.0).toFloat(),
+                        visible = o.optBoolean("visible", true),
                     )
                 )
             }
@@ -214,6 +216,7 @@ object Backup {
                         affiliation = o.optString("affiliation", "none"),
                         createdAt = o.optLong("createdAt"),
                         echelon = o.optString("echelon", ""),
+                        visible = o.optBoolean("visible", true),
                     )
                 )
             }
@@ -230,6 +233,7 @@ object Backup {
                     distanceM = o.optDouble("distanceM", 0.0),
                     pointCount = o.optInt("pointCount", 0),
                     folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
+                    visible = o.optBoolean("visible", true),
                 )
                 val ptBytes = entries["tracks/${info.id}.txt"] ?: continue
                 val pts = String(ptBytes).lines().mapNotNull { line ->

@@ -34,6 +34,8 @@ data class TacGraphic(
     val affiliation: String = "none",
     val createdAt: Long = 0L,
     val echelon: String = "",   // boundary lines carry the echelon mark on the line
+    /** Drawn on the map, or held but hidden. See [Waypoint.visible]. */
+    val visible: Boolean = true,
 )
 
 object GraphicTypes {
@@ -214,6 +216,16 @@ class GraphicsRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Show or hide one graphic on the map without deleting it, independently of its
+     * folder's eye. The list still shows it, marked hidden.
+     */
+    suspend fun setVisible(id: String, visible: Boolean) {
+        context.graphicsStore.edit { p ->
+            p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.id == id) it.copy(visible = visible) else it })
+        }
+    }
+
     /** Move every graphic in [from] to [to] (folder rename, or emptying a folder into Base). */
     suspend fun renameFolder(from: String, to: String) {
         val target = canonicalFolder(to)
@@ -253,6 +265,7 @@ class GraphicsRepository(private val context: Context) {
                         affiliation = o.optString("affiliation", "none"),
                         createdAt = o.optLong("createdAt"),
                         echelon = o.optString("echelon", ""),
+                        visible = o.optBoolean("visible", true),
                     )
                 }.getOrNull()?.let { add(it) }
             }
@@ -276,6 +289,7 @@ class GraphicsRepository(private val context: Context) {
                     .put("affiliation", g.affiliation)
                     .put("createdAt", g.createdAt)
                     .put("echelon", g.echelon)
+                    .put("visible", g.visible)
             )
         }
         return arr.toString()

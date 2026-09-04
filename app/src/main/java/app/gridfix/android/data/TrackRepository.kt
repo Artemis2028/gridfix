@@ -35,6 +35,8 @@ data class TrackInfo(
     val distanceM: Double,
     val pointCount: Int,
     val folder: String = DEFAULT_FOLDER,   // overlay folder, shares the eye switch with waypoints and graphics
+    /** Drawn on the map, or held but hidden. See [Waypoint.visible]. */
+    val visible: Boolean = true,
 )
 
 /**
@@ -182,6 +184,16 @@ class TrackRepository(private val context: Context) {
         withContext(Dispatchers.IO) { pointsFile(context, id).delete() }
     }
 
+    /**
+     * Show or hide one track on the map without deleting it, independently of its
+     * folder's eye. The list still shows it, marked hidden.
+     */
+    suspend fun setVisible(id: String, visible: Boolean) {
+        context.trackStore.edit { p ->
+            p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.id == id) it.copy(visible = visible) else it })
+        }
+    }
+
     /** Move every track in [from] to [to] (folder rename, or emptying a folder into Base). */
     suspend fun renameFolder(from: String, to: String) {
         val target = canonicalFolder(to)
@@ -235,6 +247,7 @@ class TrackRepository(private val context: Context) {
                         distanceM = o.optDouble("distanceM", 0.0),
                         pointCount = o.optInt("pointCount", 0),
                         folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
+                        visible = o.optBoolean("visible", true),
                     )
                 }.getOrNull()?.let { add(it) }
             }
@@ -253,6 +266,7 @@ class TrackRepository(private val context: Context) {
                     .put("distanceM", t.distanceM)
                     .put("pointCount", t.pointCount)
                     .put("folder", t.folder)
+                    .put("visible", t.visible)
             )
         }
         return arr.toString()

@@ -61,6 +61,13 @@ data class Waypoint(
     val designation: String = "",   // free-text unit designation amplifier
     val kind: String = KIND_WP,     // KIND_WP (navigation point) or KIND_UNIT (plotted unit)
     val rotation: Float = 0f,       // degrees clockwise from north; direction of fire for task symbols
+    /**
+     * Drawn on the map, or held but hidden. Independent of the folder's eye: a
+     * hidden folder hides everything in it, and this hides one item inside a folder
+     * that is otherwise shown. Defaults true, so every existing record and every
+     * backup written before 0.9.26 reads back visible.
+     */
+    val visible: Boolean = true,
 )
 
 const val KIND_WP = "wp"
@@ -292,6 +299,16 @@ class WaypointRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Show or hide one waypoint on the map without deleting it, independently of its
+     * folder's eye. The list still shows it, marked hidden.
+     */
+    suspend fun setVisible(id: String, visible: Boolean) {
+        context.wpStore.edit { p ->
+            p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.id == id) it.copy(visible = visible) else it })
+        }
+    }
+
     suspend fun select(id: String) {
         context.wpStore.edit { p -> p[selectedKey] = id }
     }
@@ -320,6 +337,7 @@ class WaypointRepository(private val context: Context) {
                             if (o.optString("symbol", "").startsWith("nato_")) KIND_UNIT else KIND_WP,
                         ),
                         rotation = o.optDouble("rotation", 0.0).toFloat(),
+                        visible = o.optBoolean("visible", true),
                     )
                 }.getOrNull()?.let { add(it) }
             }
@@ -382,6 +400,7 @@ class WaypointRepository(private val context: Context) {
                     .put("designation", w.designation)
                     .put("kind", w.kind)
                     .put("rotation", w.rotation.toDouble())
+                    .put("visible", w.visible)
             )
         }
         return arr.toString()
