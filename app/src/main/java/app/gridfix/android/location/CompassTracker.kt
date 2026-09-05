@@ -18,13 +18,14 @@ data class CompassData(
     val accuracy: Int = SensorManager.SENSOR_STATUS_ACCURACY_HIGH,
     val hasSensor: Boolean = true,
     val hasReading: Boolean = false,
+    val timestampNanos: Long = 0L,
 )
 
 /**
  * Compass heading from the rotation-vector sensor with circular low-pass smoothing.
  * Azimuth is referenced to MAGNETIC north; callers apply declination for true north.
  */
-class CompassTracker(context: Context) : SensorEventListener {
+class CompassTracker(context: Context, private val followDisplayRotation: Boolean = true) : SensorEventListener {
 
     private val appContext = context.applicationContext
     private val remapped = FloatArray(9)
@@ -47,19 +48,24 @@ class CompassTracker(context: Context) : SensorEventListener {
     private var smoothSin = 0.0
     private var smoothCos = 0.0
     private var initialized = false
+    private var started = false
 
     fun start() {
+        if (started) return
         rotationSensor?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+            started = sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
     }
 
     fun stop() {
         sensorManager.unregisterListener(this)
         initialized = false
+        started = false
+        _data.update { it.copy(hasReading = false, timestampNanos = 0L) }
     }
 
     override fun onSensorChanged(event: SensorEvent) {
+        if (!started) return
         if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR &&
             event.sensor.type != Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR
         ) return
@@ -67,7 +73,9 @@ class CompassTracker(context: Context) : SensorEventListener {
         // The raw azimuth is the device's natural "up" edge. Remap to the current
         // display rotation so a landscape phone (or landscape-natural tablet)
         // does not read 90 or 180 degrees off.
-        val rotation = displayRotation()
+        // A pocket guide follows the device's physical top edge, independent of
+        // whichever display orientation was last visible before the screen locked.
+        val rotation = if (followDisplayRotation) displayRotation() else android.view.Surface.ROTATION_0
         val (ax, ay) = when (rotation) {
             android.view.Surface.ROTATION_90 -> SensorManager.AXIS_Y to SensorManager.AXIS_MINUS_X
             android.view.Surface.ROTATION_180 -> SensorManager.AXIS_MINUS_X to SensorManager.AXIS_MINUS_Y
@@ -91,7 +99,7 @@ class CompassTracker(context: Context) : SensorEventListener {
         val smoothed = (Math.toDegrees(atan2(smoothSin, smoothCos)) + 360.0) % 360.0
 
         _data.update {
-            it.copy(azimuthMagnetic = smoothed.toFloat(), hasReading = true)
+            it.copy(azimuthMagnetic = smoothed.toFloat(), hasReading = true, timestampNanos = event.timestamp)
         }
     }
 

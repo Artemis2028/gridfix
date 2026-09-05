@@ -1143,8 +1143,8 @@ fun MapScreen(
             }
             if (viewshedOn) {
                 StatusChip(
-                    if (settings.nightMode) "Viewshed: faint seen · mid standing · bright masked — tap to clear"
-                    else "Viewshed: green seen · amber standing · red masked — tap to clear"
+                    if (settings.nightMode) "Viewshed: faint seen · mid standing · bright masked · hatched unknown — tap to clear"
+                    else "Viewshed: green seen · amber standing · red masked · hatched unknown — tap to clear"
                 ) {
                     holder.viewshed?.data = null
                     viewshedOn = false
@@ -2016,8 +2016,8 @@ fun MapScreen(
                 onViewshed = { vs ->
                     holder.viewshed?.data = vs
                     viewshedOn = true
-                    if (vs.missing > 500) {
-                        notice = "Viewshed has data gaps — download elevation for this area"
+                    if (vs.missing > 0) {
+                        notice = "Viewshed has unknown areas — download elevation for this area"
                     }
                     holder.map?.invalidate()
                 },

@@ -1,13 +1,13 @@
 package app.gridfix.android.ui.screens
 
-import android.content.Context
+import android.Manifest
+import android.content.pm.PackageManager
 import android.hardware.SensorManager
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
 import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
+import android.os.SystemClock
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -41,7 +41,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,6 +52,12 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.LifecycleStartEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.gridfix.android.coords.Coordinates
 import app.gridfix.android.data.AppSettings
@@ -60,6 +65,11 @@ import app.gridfix.android.data.Waypoint
 import app.gridfix.android.location.CompassData
 import app.gridfix.android.location.CompassTracker
 import app.gridfix.android.location.FixData
+import app.gridfix.android.location.ArrivalAlertState
+import app.gridfix.android.location.NavigationFixPolicy
+import app.gridfix.android.location.PocketGuideService
+import app.gridfix.android.location.deviceVibrator
+import app.gridfix.android.location.isUsableForNavigation
 import app.gridfix.android.ui.WaypointMarker
 import app.gridfix.android.ui.faces.DialNavigateFace
 import app.gridfix.android.ui.faces.DialNavigateInstrument
@@ -96,7 +106,19 @@ fun NavigateScreen(
     val compassData by compass.data.collectAsStateWithLifecycle()
     val landscape = isLandscape()
 
-    val loc = fix.location
+    // Expire a stopped provider's last fix even when no new location is emitted.
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var freshnessTickNanos by remember { mutableStateOf(SystemClock.elapsedRealtimeNanos()) }
+    LaunchedEffect(lifecycle) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                freshnessTickNanos = SystemClock.elapsedRealtimeNanos()
+                kotlinx.coroutines.delay(1000L)
+            }
+        }
+    }
+    val nowNanos = maxOf(freshnessTickNanos, SystemClock.elapsedRealtimeNanos())
+    val loc = fix.location?.takeIf { it.isUsableForNavigation(nowNanos) }
     val target = waypoints.firstOrNull { it.id == selectedId } ?: waypoints.firstOrNull()
 
     // Magnetic declination: the manual G-M angle if one is set, else the phone's
@@ -112,9 +134,11 @@ fun NavigateScreen(
 
     // Heading: compass sensor preferred, GPS course as fallback while moving
     val headingTrue: Float? = when {
-        compassData.hasSensor && compassData.hasReading ->
+        loc != null && compassData.hasSensor && compassData.hasReading &&
+            compassData.accuracy > SensorManager.SENSOR_STATUS_ACCURACY_LOW &&
+            NavigationFixPolicy.isFresh(compassData.timestampNanos, nowNanos, NavigationFixPolicy.MAX_HEADING_AGE_NANOS) ->
             (compassData.azimuthMagnetic + declination + 360f) % 360f
-        loc != null && loc.hasBearing() && loc.hasSpeed() && loc.speed > 0.5f ->
+        !compassData.hasSensor && loc != null && loc.hasBearing() && loc.hasSpeed() && loc.speed > 0.5f ->
             (loc.bearing + 360f) % 360f
         else -> null
     }
@@ -126,64 +150,53 @@ fun NavigateScreen(
         Coordinates.navInfo(loc.latitude, loc.longitude, target.lat, target.lon)
     } else null
 
-    // Arrival alert: one buzz + tone when closing inside 50 m of the target;
-    // re-arms after moving back out past 150 m or switching targets.
-    var alertedFor by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(nav?.distanceMeters?.toInt(), target?.id) {
-        val t = target ?: return@LaunchedEffect
-        val dist = nav?.distanceMeters ?: return@LaunchedEffect
-        if (dist < 50f && alertedFor != t.id) {
-            alertedFor = t.id
-            runCatching {
-                deviceVibrator(context)
-                    ?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 300, 150, 300), -1))
-            }
-            runCatching {
-                val tg = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85)
-                tg.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 500)
-                kotlinx.coroutines.delay(700)
-                tg.release()
-            }
-        } else if (dist > 150f && alertedFor == t.id) {
-            alertedFor = null
+    // The service owns pocket guidance, including arrival, while the screen is locked.
+    val guideState by PocketGuideService.active.collectAsStateWithLifecycle()
+    val guideError by PocketGuideService.error.collectAsStateWithLifecycle()
+    val hapticGuide = guideState != null
+    var notificationWarning by remember { mutableStateOf<String?>(null) }
+    fun startGuide() {
+        target?.let { PocketGuideService.start(context, it, settings.declinationOverride) }
+    }
+    val notificationRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        notificationWarning = if (granted) null else "Notifications are off. Return here to stop the pocket guide."
+        startGuide()
+    }
+    val toggleGuide: () -> Unit = {
+        if (hapticGuide) PocketGuideService.stop(context)
+        else if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            notificationRequest.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else startGuide()
+    }
+    // Explicit target/declination changes update the already running guide. Do not
+    // stop it when this composable leaves the foreground: screen lock is supported.
+    LaunchedEffect(target, settings.declinationOverride) {
+        if (PocketGuideService.active.value != null) {
+            if (target == null) PocketGuideService.stop(context) else startGuide()
         }
     }
 
-    // Off-azimuth haptic guide: silence means on line; two short taps = target
-    // is to your RIGHT, one long buzz = to your LEFT. Cadence quickens the
-    // further off you drift, so it works with the phone in a pocket.
-    var hapticGuide by remember { mutableStateOf(false) }
-    val deviation: Float? = if (nav != null && headingTrue != null) {
-        ((nav.bearingTrue - headingTrue + 540f) % 360f) - 180f
-    } else null
-    val devState = rememberUpdatedState(deviation)
-    LaunchedEffect(hapticGuide) {
-        if (!hapticGuide) return@LaunchedEffect
-        val vib = deviceVibrator(context) ?: return@LaunchedEffect
-        while (true) {
-            val d = devState.value
-            when {
-                d == null -> kotlinx.coroutines.delay(1500)
-                abs(d) <= 8f -> kotlinx.coroutines.delay(1200)
-                else -> {
-                    runCatching {
-                        if (d > 0f) {
-                            vib.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 70, 90, 70), -1))
-                        } else {
-                            vib.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 300), -1))
-                        }
-                    }
-                    kotlinx.coroutines.delay(
-                        when {
-                            abs(d) > 60f -> 800L
-                            abs(d) > 25f -> 1300L
-                            else -> 2000L
-                        }
-                    )
-                }
+    val arrival = remember { ArrivalAlertState() }
+    LaunchedEffect(loc?.elapsedRealtimeNanos, target?.id, hapticGuide) {
+        if (hapticGuide) return@LaunchedEffect
+        val t = target ?: return@LaunchedEffect
+        if (arrival.update(t.id, nav?.distanceMeters, loc?.accuracy)) {
+            runCatching {
+                deviceVibrator(context)?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 400, 200, 400), -1))
+            }
+            val tone = runCatching { ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85) }.getOrNull()
+            try {
+                tone?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 500)
+                kotlinx.coroutines.delay(700)
+            } finally {
+                tone?.release()
             }
         }
     }
+
+    val deviation: Float? = if (nav != null && headingTrue != null) {
+        ((nav.bearingTrue - headingTrue + 540f) % 360f) - 180f
+    } else null
 
     if (waypoints.isEmpty()) {
         Column(
@@ -308,13 +321,13 @@ fun NavigateScreen(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             FilterChip(
                                 selected = hapticGuide,
-                                onClick = { hapticGuide = !hapticGuide },
+                                onClick = toggleGuide,
                                 label = { Text(if (hapticGuide) "HAPTIC GUIDE ON" else "HAPTIC GUIDE") },
                             )
                         }
                     }
                 }
-                NavigateHints(loc, compassData, hapticGuide, subtle)
+                NavigateHints(loc, compassData, hapticGuide, listOfNotNull(guideState?.status, guideError, notificationWarning).joinToString("\n").ifEmpty { null }, subtle)
             } else {
                 TargetSelector(target, waypoints, settings, subtle, onSelect, centered = true)
 
@@ -350,10 +363,10 @@ fun NavigateScreen(
                 // Eyes-free aid: haptic azimuth guide
                 FilterChip(
                     selected = hapticGuide,
-                    onClick = { hapticGuide = !hapticGuide },
+                    onClick = toggleGuide,
                     label = { Text(if (hapticGuide) "HAPTIC GUIDE ON" else "HAPTIC GUIDE") },
                 )
-                NavigateHints(loc, compassData, hapticGuide, subtle)
+                NavigateHints(loc, compassData, hapticGuide, listOfNotNull(guideState?.status, guideError, notificationWarning).joinToString("\n").ifEmpty { null }, subtle)
             }
         }
     }
@@ -420,21 +433,26 @@ private fun NavigateHints(
     loc: android.location.Location?,
     compassData: CompassData,
     hapticGuide: Boolean,
+    guideStatus: String?,
     subtle: androidx.compose.ui.graphics.Color,
 ) {
     if (hapticGuide) {
         Spacer(Modifier.height(6.dp))
         Text(
-            "Pocket the phone: silence = on azimuth · two taps = turn RIGHT · long buzz = turn LEFT",
+            "Works with the screen locked. Keep the phone’s top edge pointing ahead. One short pulse = on bearing · two taps = RIGHT · long pulse = LEFT · three taps = unavailable · two long pulses = arrival. Silence does not confirm a bearing.",
             style = MaterialTheme.typography.bodySmall,
             color = subtle,
             textAlign = TextAlign.Center,
         )
     }
+    if (guideStatus != null) {
+        Spacer(Modifier.height(6.dp))
+        Text(guideStatus, style = MaterialTheme.typography.bodySmall, color = subtle, textAlign = TextAlign.Center)
+    }
     if (loc == null) {
         Spacer(Modifier.height(12.dp))
         Text(
-            "Acquiring GPS signal…",
+            "Waiting for a fresh location accurate to 25 m or better…",
             style = MaterialTheme.typography.bodyMedium,
             color = subtle,
         )
@@ -468,13 +486,3 @@ private fun NavigateHints(
         )
     }
 }
-
-private fun deviceVibrator(context: Context): Vibrator? = runCatching {
-    if (Build.VERSION.SDK_INT >= 31) {
-        (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager)
-            .defaultVibrator
-    } else {
-        @Suppress("DEPRECATION")
-        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-    }
-}.getOrNull()

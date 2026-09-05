@@ -2,6 +2,7 @@ package app.gridfix.android.billing
 
 import android.app.Activity
 import android.content.Context
+import android.os.SystemClock
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
@@ -21,13 +22,20 @@ import com.android.billingclient.api.PurchasesUpdatedListener
 import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
 
 private val Context.billingStore by preferencesDataStore(
     name = "billing",
@@ -75,10 +83,21 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
     val plansStatus: StateFlow<PlansStatus> = plansStatusFlow
     private val noticeFlow = MutableStateFlow<String?>(null)
     val notice: StateFlow<String?> = noticeFlow
+    // This survives the paywall disappearing and entitlement/status notices clearing.
+    private val acknowledgementNoticeFlow = MutableStateFlow<String?>(null)
+    val acknowledgementNotice: StateFlow<String?> = acknowledgementNoticeFlow
+    private val acknowledgements = AcknowledgementRetryQueue()
+    private val acknowledgementWakeups = Channel<Unit>(Channel.CONFLATED)
 
     private var client: BillingClient? = null
     private var connecting = false
     private var userRestore = false
+    private var closed = false
+    private var purchasesGeneration = 0L
+
+    init {
+        scope.launch { processAcknowledgements() }
+    }
 
     companion object {
         const val MONTHLY = "gridfix_pro_monthly"
@@ -121,6 +140,8 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
     }
 
     fun close() {
+        closed = true
+        scope.cancel()
         client?.endConnection()
         client = null
         connecting = false
@@ -128,13 +149,17 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
 
     /** Re-check purchases when the app comes back to the foreground. */
     fun refresh() {
+        if (closed) return
+        retryAcknowledgements()
         val c = client
         if (c != null && c.isReady) refreshPurchases() else if (!connecting) connect()
     }
 
     /** Paywall "Restore purchases" / retry: reconnect if needed, re-query everything. */
     fun restore() {
+        if (closed) return
         noticeFlow.value = null
+        retryAcknowledgements()
         userRestore = true
         plansStatusFlow.value = PlansStatus.LOADING
         val c = client
@@ -147,7 +172,7 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
     }
 
     private fun connect() {
-        if (connecting) return
+        if (closed || connecting) return
         client?.let { old ->
             if (old.isReady) {
                 refreshPurchases()
@@ -169,8 +194,8 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
         client = c
         c.startConnection(object : BillingClientStateListener {
             override fun onBillingSetupFinished(result: BillingResult) {
-                connecting = false
                 if (c !== client) return   // superseded by a newer client
+                connecting = false
                 if (result.responseCode == BillingClient.BillingResponseCode.OK) {
                     refreshPurchases()
                     queryPlans()
@@ -181,8 +206,8 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
             }
 
             override fun onBillingServiceDisconnected() {
-                connecting = false
                 if (c !== client) return
+                connecting = false
                 if (stateFlow.value == State.CHECKING) fallBackToCache(null)
                 if (plansStatusFlow.value == PlansStatus.LOADING) {
                     plansStatusFlow.value = PlansStatus.ERROR
@@ -213,35 +238,34 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
 
     private fun refreshPurchases() {
         val c = client ?: return
+        val generation = ++purchasesGeneration
         val params = QueryPurchasesParams.newBuilder()
             .setProductType(BillingClient.ProductType.SUBS)
             .build()
         c.queryPurchasesAsync(params) { result, purchases ->
-            if (result.responseCode == BillingClient.BillingResponseCode.OK) {
-                applyPurchases(purchases)
-            } else {
-                fallBackToCache(describe(result))
+            scope.launch {
+                // An older query must not discard a purchase that completed while
+                // it was in flight, or replace a more recent inventory response.
+                if (closed || c !== client || generation != purchasesGeneration) return@launch
+                if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                    applyPurchases(purchases, completeSnapshot = true)
+                } else {
+                    fallBackToCache(describe(result))
+                }
             }
         }
     }
 
-    private fun applyPurchases(purchases: List<Purchase>) {
+    private fun applyPurchases(purchases: List<Purchase>, completeSnapshot: Boolean = false) {
         val active = purchases.filter { it.purchaseState == Purchase.PurchaseState.PURCHASED }
-        // Google refunds unacknowledged purchases after 3 days — acknowledge promptly.
-        active.filter { !it.isAcknowledged }.forEach { p ->
-            val c = client ?: return@forEach
-            val ack = AcknowledgePurchaseParams.newBuilder()
-                .setPurchaseToken(p.purchaseToken)
-                .build()
-            // Google refunds a purchase that is never acknowledged, so a failure here
-            // has to be visible and retried on the next refresh, not swallowed.
-            c.acknowledgePurchase(ack) { r ->
-                if (r.responseCode != BillingClient.BillingResponseCode.OK) {
-                    noticeFlow.value =
-                        "Could not confirm the purchase with Google Play \u2014 reopen the app while online"
-                }
-            }
+        val observedAt = SystemClock.elapsedRealtime()
+        active.forEach { p ->
+            acknowledgements.observe(p.purchaseToken, p.isAcknowledged, observedAt)
         }
+        // Purchase-update callbacks are deltas; only a full query can retire work.
+        if (completeSnapshot) acknowledgements.retainActiveTokens(active.map { it.purchaseToken }.toSet())
+        updateAcknowledgementNotice()
+        acknowledgementWakeups.trySend(Unit)
         val entitled = active.isNotEmpty()
         val pending = purchases.any { it.purchaseState == Purchase.PurchaseState.PENDING }
         val fromRestore = userRestore
@@ -281,6 +305,71 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
         }
     }
 
+    /** Retry is available after purchase as well as from the paywall. */
+    fun retryAcknowledgements() {
+        if (closed) return
+        acknowledgements.retryNow(SystemClock.elapsedRealtime())
+        acknowledgementWakeups.trySend(Unit)
+    }
+
+    private fun updateAcknowledgementNotice() {
+        acknowledgementNoticeFlow.value = if (acknowledgements.hasFailures) {
+            "Google Play has not confirmed your purchase yet. Access remains available while we retry. " +
+                "Connect to the internet and tap Retry to try again now."
+        } else null
+    }
+
+    /**
+     * One cancellable worker serialises acknowledgement calls. Failed/time-out
+     * requests back off from 5s to 60s; queries recover work after process death.
+     * Successful acknowledgements cannot be undone by a stale query or callback.
+     */
+    private suspend fun processAcknowledgements() {
+        while (scope.isActive) {
+            val now = SystemClock.elapsedRealtime()
+            val attempt = acknowledgements.nextAttempt(now)
+            if (attempt == null) {
+                val wait = acknowledgements.delayUntilNextAttempt(now)
+                if (wait == null) acknowledgementWakeups.receive()
+                else withTimeoutOrNull(wait) { acknowledgementWakeups.receive() }
+                continue
+            }
+            val c = client
+            val result = if (c == null || !c.isReady) {
+                connect()
+                null
+            } else {
+                try {
+                    withTimeoutOrNull(STARTUP_TIMEOUT_MS) {
+                        suspendCancellableCoroutine<BillingResult> { continuation ->
+                            val params = AcknowledgePurchaseParams.newBuilder()
+                                .setPurchaseToken(attempt.token)
+                                .build()
+                            c.acknowledgePurchase(params) { response ->
+                                if (continuation.isActive) continuation.resume(response)
+                            }
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            if (result?.responseCode == BillingClient.BillingResponseCode.OK) {
+                acknowledgements.succeeded(attempt)
+            } else {
+                acknowledgements.failed(attempt, SystemClock.elapsedRealtime())
+                // ITEM_NOT_OWNED can mean Play's cache was stale, or that a
+                // refund/replacement completed. Refresh before retrying its token.
+                if (result?.responseCode == BillingClient.BillingResponseCode.ITEM_NOT_OWNED) {
+                    refreshPurchases()
+                }
+            }
+            updateAcknowledgementNotice()
+        }
+    }
+
     private fun fallBackToCache(reason: String? = null) {
         scope.launch {
             val cached = cachedEntitled()
@@ -306,6 +395,7 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
             )
             .build()
         c.queryProductDetailsAsync(params) { result, detailsResult ->
+            if (closed || c !== client) return@queryProductDetailsAsync
             if (result.responseCode != BillingClient.BillingResponseCode.OK) {
                 plansStatusFlow.value = PlansStatus.ERROR
                 noticeFlow.value = "Google Play could not load the plans — " + describe(result)
@@ -373,6 +463,7 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
     }
 
     fun launchPurchase(activity: Activity, plan: Plan) {
+        if (closed) return
         noticeFlow.value = null
         val c = client
         if (c == null || !c.isReady) {
@@ -397,13 +488,17 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
     }
 
     override fun onPurchasesUpdated(result: BillingResult, purchases: List<Purchase>?) {
-        when (result.responseCode) {
-            BillingClient.BillingResponseCode.OK -> {
-                if (purchases.isNullOrEmpty()) refreshPurchases() else applyPurchases(purchases)
+        scope.launch {
+            if (closed) return@launch
+            when (result.responseCode) {
+                BillingClient.BillingResponseCode.OK -> {
+                    ++purchasesGeneration
+                    if (purchases.isNullOrEmpty()) refreshPurchases() else applyPurchases(purchases)
+                }
+                BillingClient.BillingResponseCode.USER_CANCELED -> Unit
+                BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> refreshPurchases()
+                else -> noticeFlow.value = "Purchase did not complete — " + describe(result)
             }
-            BillingClient.BillingResponseCode.USER_CANCELED -> Unit
-            BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> refreshPurchases()
-            else -> noticeFlow.value = "Purchase did not complete — " + describe(result)
         }
     }
 

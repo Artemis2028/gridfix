@@ -50,6 +50,7 @@ import app.gridfix.android.AppInfo
 import app.gridfix.android.data.AppSettings
 import app.gridfix.android.data.SettingsRepository
 import app.gridfix.android.location.Declination
+import app.gridfix.android.location.manualDeclination
 import app.gridfix.android.ui.ScreenOrientation
 import app.gridfix.android.ui.faces.Face
 import app.gridfix.android.ui.theme.LabelFamily
@@ -421,30 +422,23 @@ private fun DeclinationSetting(
 ) {
     val manual = override != null
     val mils = angleUnit == 1
-    val conv = convergence ?: 0f
+    val conv = convergence?.takeIf { it.isFinite() }
     var asGm by remember(manual) { mutableStateOf(true) }
-    fun toStored(typed: Float): Float = if (asGm) typed + conv else typed
-    fun fromStored(stored: Float): Float = if (asGm) stored - conv else stored
+    fun fromStored(stored: Float): Float = if (asGm) stored - (conv ?: 0f) else stored
     fun toDisplay(deg: Float): String {
         val v = abs(deg)
         return if (mils) (v * 6400f / 360f).roundToInt().toString()
         else String.format(Locale.US, "%.1f", v)
     }
-    // Keyed on the value too: a backup restore changes `override` without changing
-    // `manual`, and the field would otherwise keep showing the old number. Keyed on
-    // `asGm` as well, so switching which angle you are typing re-reads the same stored
-    // declination in the other convention instead of silently reinterpreting it.
-    var text by remember(manual, mils, override, asGm) {
-        mutableStateOf(if (override != null) toDisplay(fromStored(override)) else "")
+    // Apply explicitly: saving each keystroke re-keyed the draft and made a multi-
+    // digit value jump while typing. A restore or reference change still reloads it.
+    var text by remember(manual, mils, override, asGm, conv != null) {
+        mutableStateOf(if (override != null && (!asGm || conv != null)) toDisplay(fromStored(override)) else "")
     }
-    var east by remember(manual, override, asGm) {
+    var east by remember(manual, override, asGm, conv != null) {
         mutableStateOf(override == null || fromStored(override) >= 0f)
     }
-    fun push(t: String, e: Boolean) {
-        val v = t.toFloatOrNull() ?: return
-        val deg = if (mils) v * 360f / 6400f else v
-        if (deg in 0f..180f) onChange(toStored(if (e) deg else -deg))
-    }
+    val draft = manualDeclination(text, east, mils, asGm, conv)
     Setting("Declination") {
         Segmented(options = listOf("Model", "Manual"), selected = if (manual) 1 else 0) { index ->
             if (index == 0) onChange(null)
@@ -461,7 +455,6 @@ private fun DeclinationSetting(
                     value = text,
                     onValueChange = { v ->
                         text = v.filter { it.isDigit() || it == '.' }.take(6)
-                        push(text, east)
                     },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
@@ -473,20 +466,26 @@ private fun DeclinationSetting(
                 Box(Modifier.weight(1f)) {
                     Segmented(options = listOf("East", "West"), selected = if (east) 0 else 1) { index ->
                         east = index == 0
-                        push(text, east)
                     }
                 }
             }
             Spacer(Modifier.height(6.dp))
+            TextButton(enabled = draft != null, onClick = { draft?.let(onChange) }) {
+                Text("Apply angle")
+            }
+            if (asGm && conv == null) {
+                Text("A location fix is required to apply a G-M angle. You can enter a true-to-magnetic declination without a fix.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            }
         }
         Text(
             when {
                 manual -> {
                     val stored = override ?: 0f
-                    "G-M " + Declination.format(stored - conv, angleUnit) +
-                        " → declination " + Declination.format(stored, angleUnit) +
-                        (if (convergence == null) " (no fix yet — grid convergence taken as zero until you have one)"
-                        else " here, using a grid convergence of " + Declination.format(conv, angleUnit)) +
+                    "Saved declination " + Declination.format(stored, angleUnit) +
+                        (if (conv == null) "; G-M angle unavailable until a location fix"
+                        else "; G-M " + Declination.format(stored - conv, angleUnit) +
+                            " here, using a grid convergence of " + Declination.format(conv, angleUnit)) +
                         (model?.let { ". The phone's model says " + Declination.format(it, angleUnit) } ?: "") +
                         ". Every azimuth, the compass faces and the route cards use the declination."
                 }

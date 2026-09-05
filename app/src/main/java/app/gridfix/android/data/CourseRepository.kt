@@ -90,17 +90,15 @@ class CourseRepository(private val context: Context) {
                         prev = t
                     }
                 }
-                val result = JSONObject()
-                    .put("name", cur.name)
-                    .put("points", cur.waypointIds.size)
-                    .put("started", cur.startedAt)
-                    .put("total", cur.foundAt.last() - cur.startedAt)
-                    .put("splits", JSONArray(splits))
-                val hist = JSONArray(p[Keys.HISTORY] ?: "[]")
-                hist.put(result)
-                // keep the latest 30 results
-                while (hist.length() > 30) hist.remove(0)
-                p[Keys.HISTORY] = hist.toString()
+                val result = CourseResult(
+                    name = cur.name,
+                    points = cur.waypointIds.size,
+                    startedAt = cur.startedAt,
+                    totalMillis = cur.foundAt.last() - cur.startedAt,
+                    splitsMillis = splits,
+                )
+                val merged = mergeCourseHistory(decodeHistory(p[Keys.HISTORY] ?: "[]"), listOf(result))
+                p[Keys.HISTORY] = encodeHistory(merged.results)
             }
             p[Keys.ACTIVE] = ""
         }
@@ -114,30 +112,23 @@ class CourseRepository(private val context: Context) {
     suspend fun restoreHistory(results: List<CourseResult>): Int {
         var added = 0
         context.courseStore.edit { p ->
-            val hist = JSONArray(p[Keys.HISTORY] ?: "[]")
-            val existing = HashSet<String>()
-            for (i in 0 until hist.length()) {
-                val o = hist.getJSONObject(i)
-                existing.add(o.getLong("started").toString() + "|" + o.getString("name"))
-            }
-            for (r in results) {
-                val key = r.startedAt.toString() + "|" + r.name
-                if (key in existing) continue
-                hist.put(
-                    JSONObject()
-                        .put("name", r.name)
-                        .put("points", r.points)
-                        .put("started", r.startedAt)
-                        .put("total", r.totalMillis)
-                        .put("splits", JSONArray(r.splitsMillis))
-                )
-                added++
-            }
-            while (hist.length() > 30) hist.remove(0)
-            p[Keys.HISTORY] = hist.toString()
+            val merged = mergeCourseHistory(decodeHistory(p[Keys.HISTORY] ?: "[]"), results)
+            added = merged.added
+            p[Keys.HISTORY] = encodeHistory(merged.results)
         }
         return added
     }
+
+    private fun encodeHistory(results: List<CourseResult>): String = JSONArray().apply {
+        for (r in results) {
+            put(JSONObject()
+                .put("name", r.name)
+                .put("points", r.points)
+                .put("started", r.startedAt)
+                .put("total", r.totalMillis)
+                .put("splits", JSONArray(r.splitsMillis)))
+        }
+    }.toString()
 
     private fun decodeActive(json: String): CourseState? = runCatching {
         if (json.isBlank()) return null
@@ -170,6 +161,6 @@ class CourseRepository(private val context: Context) {
                     )
                 }.getOrNull()?.let { add(it) }
             }
-        }.reversed()   // newest first
+        }.sortedByDescending { it.startedAt }   // also correct legacy restore order
     }
 }

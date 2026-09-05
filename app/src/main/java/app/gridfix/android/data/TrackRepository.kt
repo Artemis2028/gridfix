@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import app.gridfix.android.coords.Geodesy
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -136,24 +137,45 @@ class TrackRepository(private val context: Context) {
     }
 
     /** Restore one track from a backup, keeping its id; skipped when already present. */
-    suspend fun restore(info: TrackInfo, points: List<TrackPoint>): Boolean {
-        var added = false
-        context.trackStore.edit { p ->
-            val current = decode(p[listKey] ?: "[]")
-            if (current.none { it.id == info.id }) {
-                val f = pointsFile(context, info.id)
-                f.parentFile?.mkdirs()
-                f.writeText(
-                    points.joinToString("") {
-                        String.format(Locale.US, "%.7f %.7f %d %.1f\n", it.lat, it.lon, it.time, it.alt)
+    suspend fun restore(info: TrackInfo, points: List<TrackPoint>): Boolean =
+        restoreAll(listOf(info to points)) > 0
+
+    /**
+     * Stage the complete batch before publishing files, then commit its metadata in
+     * one DataStore transaction. Existing files are never replaced, even if orphaned.
+     * An I/O failure removes only files created by this attempt.
+     */
+    suspend fun restoreAll(imported: List<Pair<TrackInfo, List<TrackPoint>>>): Int =
+        withContext(Dispatchers.IO) {
+            imported.forEach { requireTrackId(it.first.id) }
+            require(imported.map { it.first.id }.distinct().size == imported.size) { "Duplicate track IDs" }
+            val staged = StagedTrackFiles(File(context.filesDir, "tracks"))
+            var added = 0
+            try {
+                val currentIds = tracks.first().map { it.id }.toSet()
+                for ((info, points) in imported) {
+                    if (info.id !in currentIds) staged.stage(info.id, points)
+                }
+                // Do not interpret cancellation after a committed DataStore edit
+                // as a failed write and delete the files that edit now references.
+                withContext(NonCancellable) {
+                    context.trackStore.edit { p ->
+                        val current = decode(p[listKey] ?: "[]")
+                        val ids = current.map { it.id }.toSet()
+                        val fresh = imported.filter { it.first.id !in ids }
+                        staged.publish(fresh.map { it.first.id })
+                        p[listKey] = encode(current + fresh.map { it.first })
+                        added = fresh.size
                     }
-                )
-                p[listKey] = encode(current + info)
-                added = true
+                }
+                added
+            } catch (failure: Exception) {
+                staged.rollback(failure)
+                throw failure
+            } finally {
+                staged.close()
             }
         }
-        return added
-    }
 
     suspend fun rename(id: String, name: String) {
         if (name.isBlank()) return
@@ -303,17 +325,11 @@ class TrackRepository(private val context: Context) {
 
     companion object {
         fun pointsFile(context: Context, id: String): File =
-            File(File(context.filesDir, "tracks"), "$id.txt")
+            trackPointsFile(File(context.filesDir, "tracks"), id)
 
-        /** Append one point; called from the recorder service's worker thread. */
+        /** Append one point; a failed write must stop recording, never look successful. */
         fun appendPoint(context: Context, id: String, lat: Double, lon: Double, time: Long, alt: Double) {
-            runCatching {
-                val f = pointsFile(context, id)
-                f.parentFile?.mkdirs()
-                f.appendText(
-                    String.format(Locale.US, "%.7f %.7f %d %.1f\n", lat, lon, time, alt)
-                )
-            }
+            appendTrackPoint(pointsFile(context, id), TrackPoint(lat, lon, time, alt))
         }
 
         suspend fun readPoints(context: Context, id: String): List<TrackPoint> =
@@ -344,11 +360,12 @@ class TrackRepository(private val context: Context) {
             sb.append("  <trk>\n    <name>").append(escapeXml(name)).append("</name>\n    <trkseg>\n")
             for (p in points) {
                 val ele = if (p.alt.hasAltitude()) String.format(Locale.US, "<ele>%.1f</ele>", p.alt) else ""
+                val time = if (p.time > 0L) "<time>${sdf.format(Date(p.time))}</time>" else ""
                 sb.append(
                     String.format(
                         Locale.US,
-                        "      <trkpt lat=\"%.7f\" lon=\"%.7f\">%s<time>%s</time></trkpt>\n",
-                        p.lat, p.lon, ele, sdf.format(Date(p.time)),
+                        "      <trkpt lat=\"%.7f\" lon=\"%.7f\">%s%s</trkpt>\n",
+                        p.lat, p.lon, ele, time,
                     )
                 )
             }

@@ -78,6 +78,7 @@ fun PaywallScreen(
     val plans by billing.plans.collectAsStateWithLifecycle()
     val plansStatus by billing.plansStatus.collectAsStateWithLifecycle()
     val notice by billing.notice.collectAsStateWithLifecycle()
+    val acknowledgementNotice by billing.acknowledgementNotice.collectAsStateWithLifecycle()
     var selectedId by rememberSaveable { mutableStateOf(BillingManager.ANNUAL) }
     val selected = plans.firstOrNull { it.productId == selectedId } ?: plans.firstOrNull()
     val cs = MaterialTheme.colorScheme
@@ -226,7 +227,7 @@ fun PaywallScreen(
                 }
             }
 
-            notice?.let {
+            (acknowledgementNotice ?: notice)?.let {
                 Spacer(Modifier.height(10.dp))
                 Text(
                     it,
@@ -235,6 +236,12 @@ fun PaywallScreen(
                     textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                if (acknowledgementNotice != null) {
+                    TextButton(
+                        onClick = billing::retryAcknowledgements,
+                        modifier = Modifier.align(Alignment.CenterHorizontally),
+                    ) { Text("Retry purchase confirmation") }
+                }
             }
 
             Spacer(Modifier.height(12.dp))

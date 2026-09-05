@@ -9,6 +9,7 @@ import android.location.LocationManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import java.util.concurrent.Executors
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -37,9 +38,10 @@ class LocationTracker(context: Context) {
     // level (what the map's contours use). The geoid lookup does disk I/O the
     // first time, so it runs off the main thread and the fix is re-emitted when done.
     private val mslExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "msl-altitude").apply { isDaemon = true } }
+    private var closed = false
 
     private fun addMslAltitude(loc: Location) {
-        if (Build.VERSION.SDK_INT < 34 || !loc.hasAltitude()) return
+        if (closed || Build.VERSION.SDK_INT < 34 || !loc.hasAltitude()) return
         mslExecutor.execute {
             if (MslConverter.add(appContext, loc)) {
                 // Same fix, now with MSL fields: a copy so the state flow sees a new value
@@ -61,6 +63,7 @@ class LocationTracker(context: Context) {
     // framework still calls the legacy callbacks, which have no platform defaults there.
     private val listener = object : LocationListener {
         override fun onLocationChanged(loc: Location) {
+            if (closed) return
             _fix.update { current ->
                 val old = current.location
                 val accept = old == null ||
@@ -122,6 +125,7 @@ class LocationTracker(context: Context) {
      */
     @SuppressLint("MissingPermission")
     fun start() {
+        if (closed) return
         val looper = Looper.getMainLooper()
         if (!gpsRequested) {
             runCatching {
@@ -151,9 +155,16 @@ class LocationTracker(context: Context) {
             locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
         }.getOrDefault(false)
         runCatching {
-            val last = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-            _fix.update { it.copy(location = last ?: it.location, gpsEnabled = gpsEnabled) }
+            val now = SystemClock.elapsedRealtimeNanos()
+            val last = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+                .mapNotNull { provider -> runCatching { locationManager.getLastKnownLocation(provider) }.getOrNull() }
+                .filter { NavigationFixPolicy.isFresh(it.elapsedRealtimeNanos, now) }
+                .maxByOrNull { it.elapsedRealtimeNanos }
+            _fix.update {
+                val current = it.location
+                val seed = last?.takeIf { current == null || it.elapsedRealtimeNanos > current.elapsedRealtimeNanos }
+                it.copy(location = seed ?: current, gpsEnabled = gpsEnabled)
+            }
             last?.let { addMslAltitude(it) }
         }
     }
@@ -174,14 +185,22 @@ class LocationTracker(context: Context) {
         networkRequested = false
         gnssRegistered = false
     }
+
+    /** Release the altitude worker when an owner is destroyed rather than merely stopped. */
+    fun close() {
+        closed = true
+        stop()
+        mslExecutor.shutdownNow()
+    }
 }
 
 /** Kept in its own class so devices below Android 14 never load the converter type. */
 @androidx.annotation.RequiresApi(34)
-private object MslConverter {
+internal object MslConverter {
     private val converter = android.location.altitude.AltitudeConverter()
 
     /** True when [loc] now carries an MSL altitude. */
+    @Synchronized
     fun add(context: Context, loc: Location): Boolean {
         if (loc.hasMslAltitude()) return true
         return runCatching { converter.addMslAltitudeToLocation(context, loc) }.isSuccess && loc.hasMslAltitude()

@@ -20,13 +20,12 @@ import kotlin.math.sqrt
  *
  * Line of sight applies the standard earth-curvature + atmospheric-refraction
  * correction (effective earth radius x 4/3): terrain between the endpoints is
- * depressed by d1*d2 / (2 * Re), which is what makes ~1.7 m eyes see ~4.9 km
+ * raised above their chord by d1*d2 / (2 * Re), which makes ~1.7 m eyes see ~5.4 km
  * to a sea-level horizon.
  */
 object Terrain {
 
-    private const val EARTH_R = 6371008.8
-    private const val EFFECTIVE_R = EARTH_R * 4.0 / 3.0
+    private const val EARTH_R = TerrainSight.EARTH_R
 
     data class Profile(
         val distancesM: FloatArray,   // cumulative along-path distance per sample
@@ -95,7 +94,7 @@ object Terrain {
         suspend fun sampleAt(lat: Double, lon: Double, dist: Double) {
             dists.add(dist.toFloat())
             val e = Elevation.elevationAt(context, lat, lon)
-            if (e == null) {
+            if (e == null || !e.isFinite()) {
                 missing++
                 elevs.add(Float.NaN)
             } else {
@@ -131,17 +130,17 @@ object Terrain {
     }
 
     data class LosResult(
-        val visible: Boolean,
+        val status: SightStatus,
         val profile: Profile,
         val observerElev: Float,      // ground MSL at observer
         val targetElev: Float,        // ground MSL at target
         val observerHeight: Float,    // metres above ground
         val targetHeight: Float,
-        val blockIndex: Int,          // first blocking sample (-1 when visible)
+        val blockIndex: Int,          // first known blocking sample (-1 when none is known)
         val blockDistM: Float,
         val blockLat: Double,
         val blockLon: Double,
-        val clearObserverHeight: Float, // min observer height (m AGL) that would see the target
+        val clearObserverHeight: Float, // min observer height (m AGL); NaN when terrain is incomplete
         /** Smallest gap between the sight line and terrain (m); the margin of a VISIBLE result. */
         val minClearanceM: Float,
         /** Along-path distance (m) of that tightest point. */
@@ -152,24 +151,25 @@ object Terrain {
         val effectiveTerrain: FloatArray,
     )
 
-    const val CLS_NONE = 0
-    const val CLS_VISIBLE = 1
-    const val CLS_MARGINAL = 2
-    const val CLS_MASKED = 3
+    const val CLS_NONE = TerrainSight.CLS_NONE
+    const val CLS_VISIBLE = TerrainSight.CLS_VISIBLE
+    const val CLS_MARGINAL = TerrainSight.CLS_MARGINAL
+    const val CLS_MASKED = TerrainSight.CLS_MASKED
+    const val CLS_UNKNOWN = TerrainSight.CLS_UNKNOWN
 
     // Day palette: traffic-light. Night palette: red-family intensity ramp
     // (faint dark red = seen, mid = standing only, bright red = masked), so
     // the shade stays inside the night mode's red-light discipline instead of
     // washing dark adaptation with green and amber.
-    private val DAY_PALETTE = intArrayOf(0, 0x4600C853, 0x55FFD600, 0x50FF1744)
-    private val NIGHT_PALETTE = intArrayOf(0, 0x307F231D, 0x48C42D24, 0x60FF3B30)
+    private val DAY_PALETTE = intArrayOf(0, 0x4600C853, 0x55FFD600, 0x50FF1744, 0x66808080)
+    private val NIGHT_PALETTE = intArrayOf(0, 0x307F231D, 0x48C42D24, 0x60FF3B30, 0x60FF3B30)
 
     /**
      * A computed viewshed raster: what the observer can see out to [radiusM].
      * Cell classes: VISIBLE (even a low target is seen), MARGINAL (only a
      * standing man / vehicle-height target is seen — partial defilade),
-     * MASKED (full defilade for a 3 m target). Cells without elevation data
-     * stay transparent. Colors are applied at draw time via [bitmapFor], so
+     * MASKED (full defilade for a 3 m target). Missing terrain and cells whose
+     * visibility depends on it are UNKNOWN and hatched. Colors are applied via [bitmapFor], so
      * the same computed shade renders with the day or night palette.
      */
     data class Viewshed(
@@ -191,7 +191,11 @@ object Terrain {
             val c = cached
             if (c != null && cachedNight == night) return c
             val palette = if (night) NIGHT_PALETTE else DAY_PALETTE
-            val px = IntArray(classes.size) { palette[classes[it]] }
+            val px = IntArray(classes.size) { i ->
+                // Hatching distinguishes uncertainty from known masking in both palettes.
+                if (classes[i] == CLS_UNKNOWN && ((i % gridN + i / gridN) % 4 < 2)) 0
+                else palette[classes[i]]
+            }
             val bmp = Bitmap.createBitmap(px, gridN, gridN, Bitmap.Config.ARGB_8888)
             cached = bmp
             cachedNight = night
@@ -215,6 +219,7 @@ object Terrain {
     ): Viewshed? = withContext(Dispatchers.Default) {
         val obsGround = Elevation.elevationAt(context, obsLat, obsLon)
             ?: return@withContext null
+        if (!obsGround.isFinite()) return@withContext null
         val eye = obsGround + observerHeight
         val kx = cos(Math.toRadians(obsLat))
         val dLat = radiusM / 111319.49
@@ -234,7 +239,7 @@ object Terrain {
             val az = 2.0 * Math.PI * r / rays
             val sinA = sin(az)
             val cosA = cos(az)
-            var maxSlope = -1e9
+            val ray = TerrainSight.Ray(eye)
             var d = step
             for (s in 0 until samples) {
                 if (d > radiusM) break
@@ -243,22 +248,11 @@ object Terrain {
                 val px = (((plon - lonW) / (lonE - lonW)) * gridN).toInt()
                 val py = (((latN - plat) / (latN - latS)) * gridN).toInt()
                 val e = Elevation.elevationAt(context, plat, plon)
-                if (e == null) {
-                    missing++
-                } else {
-                    val te = e - d * d / (2.0 * EFFECTIVE_R)
-                    val slopeLow = (te + 0.5 - eye) / d
-                    val slopeStanding = (te + 3.0 - eye) / d
-                    val cls = when {
-                        slopeLow >= maxSlope -> CLS_VISIBLE
-                        slopeStanding >= maxSlope -> CLS_MARGINAL
-                        else -> CLS_MASKED
-                    }
-                    if (px in 0 until gridN && py in 0 until gridN) {
-                        classes[py * gridN + px] = cls
-                    }
-                    val slopeGround = (te - eye) / d
-                    if (slopeGround > maxSlope) maxSlope = slopeGround
+                if (e == null || !e.isFinite()) missing++
+                val cls = ray.sample(d, e)
+                if (px in 0 until gridN && py in 0 until gridN) {
+                    val index = py * gridN + px
+                    classes[index] = TerrainSight.mergeClasses(classes[index], cls)
                 }
                 d += step
             }
@@ -291,53 +285,15 @@ object Terrain {
             stepM = 20.0,
             maxSamples = 500,
         ) ?: return null
-        val n = prof.elevations.size
-        if (n < 2) return null
+        val analysis = TerrainSight.lineOfSight(
+            prof.distancesM, prof.elevations, observerHeight, targetHeight,
+        ) ?: return null
         val obsGround = prof.elevations.first()
         val tgtGround = prof.elevations.last()
-        if (obsGround.isNaN() || tgtGround.isNaN()) return null
-        val totalD = prof.totalM.toDouble()
-
-        // Curvature-corrected frame: depress terrain by d1*d2 / (2 Re)
-        val eff = FloatArray(n)
-        for (i in 0 until n) {
-            val d1 = prof.distancesM[i].toDouble()
-            val bulge = d1 * (totalD - d1) / (2.0 * EFFECTIVE_R)
-            eff[i] = if (prof.elevations[i].isNaN()) Float.NaN
-            else (prof.elevations[i] - bulge).toFloat()
-        }
-
-        val a = obsGround + observerHeight       // endpoints carry no bulge
-        val b = tgtGround + targetHeight
-        val sight = FloatArray(n)
-        val clearance = 0.5f
-        var blockIdx = -1
-        var required = 0f
-        var minGap = Float.POSITIVE_INFINITY
-        var minGapDist = 0f
-        for (i in 0 until n) {
-            val t = if (totalD == 0.0) 0f else (prof.distancesM[i] / prof.totalM)
-            sight[i] = a + (b - a) * t
-            if (i in 1 until n - 1 && !eff[i].isNaN()) {
-                val gap = sight[i] - eff[i]
-                if (gap < minGap) {
-                    minGap = gap
-                    minGapDist = prof.distancesM[i]
-                }
-                if (eff[i] + clearance > sight[i] && blockIdx == -1) {
-                    blockIdx = i
-                }
-                // observer height that would clear this sample (target end fixed)
-                if (t < 1f) {
-                    val need = ((eff[i] + clearance - b * t) / (1f - t)) - obsGround
-                    if (need > required) required = need
-                }
-            }
-        }
-
+        val blockIdx = analysis.blockIndex
         val blockT = if (blockIdx >= 0) prof.distancesM[blockIdx] / prof.totalM else 0f
         return LosResult(
-            visible = blockIdx == -1,
+            status = analysis.status,
             profile = prof,
             observerElev = obsGround,
             targetElev = tgtGround,
@@ -347,11 +303,11 @@ object Terrain {
             blockDistM = if (blockIdx >= 0) prof.distancesM[blockIdx] else 0f,
             blockLat = obsLat + (tgtLat - obsLat) * blockT,
             blockLon = obsLon + (tgtLon - obsLon) * blockT,
-            clearObserverHeight = max(required, 0f),
-            minClearanceM = if (minGap.isFinite()) minGap else Float.NaN,
-            minClearanceDistM = minGapDist,
-            sightLine = sight,
-            effectiveTerrain = eff,
+            clearObserverHeight = analysis.clearObserverHeight,
+            minClearanceM = analysis.minClearanceM,
+            minClearanceDistM = analysis.minClearanceDistM,
+            sightLine = analysis.sightLine,
+            effectiveTerrain = analysis.effectiveTerrain,
         )
     }
 }

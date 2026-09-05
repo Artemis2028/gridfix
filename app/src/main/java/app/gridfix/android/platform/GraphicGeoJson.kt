@@ -9,9 +9,10 @@ import java.util.Locale
  *
  * This is the interchange shape MapLibre consumes on both platforms (a GeoJSON
  * source plus line/fill/symbol layers) and the shape a future "import overlay"
- * feature would read. The geometry rule mirrors `InterchangeFiles.buildKml`
- * exactly, and GoldenVectors.graphicGeometry holds the same table for the Swift
- * port, so the two cannot answer differently for the same graphic.
+ * feature would read. These coordinates retain the stored control points;
+ * `InterchangeFiles.buildKml` additionally expands rings and sectors into sampled
+ * boundaries for apps that do not understand those controls. GoldenVectors holds
+ * the GeoJSON geometry table shared with the Swift port.
  *
  * Moves to `:core` verbatim once [TacGraphic] does.
  */

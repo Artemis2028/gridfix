@@ -1,12 +1,12 @@
 package app.gridfix.android.data
 
-import android.util.Xml
 import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
 import java.io.InputStream
-import java.text.SimpleDateFormat
-import java.util.Date
+import java.time.OffsetDateTime
+import java.time.Instant
+import java.time.format.DateTimeFormatter
 import java.util.Locale
-import java.util.TimeZone
 import java.util.zip.ZipInputStream
 
 /**
@@ -71,7 +71,7 @@ object InterchangeFiles {
         val tracks = ArrayList<ImportedTrack>()
         val lines = ArrayList<ImportedLine>()
 
-        val parser = Xml.newPullParser()
+        val parser = newParser()
         parser.setInput(stream, null)
 
         var wptLat = 0.0
@@ -80,13 +80,19 @@ object InterchangeFiles {
         var name = ""
         var trkName = ""
         var trkPts = ArrayList<TrackPoint>()
+        var trkSegments = ArrayList<List<TrackPoint>>()
         var inTrk = false
+        var trkDepth = -1
         var rteName = ""
         var rtePts = ArrayList<GeoVertex>()
         var inRte = false
-        var pendingTime = 0L
-        var pendingEle = NO_ALTITUDE
+        var pendingPoint: TrackPoint? = null
         var textBuf = ""
+
+        fun finishSegment() {
+            if (trkPts.isNotEmpty()) trkSegments.add(trkPts)
+            trkPts = ArrayList()
+        }
 
         var event = parser.eventType
         while (event != XmlPullParser.END_DOCUMENT) {
@@ -102,9 +108,12 @@ object InterchangeFiles {
                         }
                         "trk" -> {
                             inTrk = true
+                            trkDepth = parser.depth
                             trkName = ""
                             trkPts = ArrayList()
+                            trkSegments = ArrayList()
                         }
+                        "trkseg" -> if (inTrk) finishSegment()
                         "rte" -> {
                             inRte = true
                             rteName = ""
@@ -113,11 +122,8 @@ object InterchangeFiles {
                         "trkpt" -> {
                             val lat = coord(parser.getAttributeValue(null, "lat"), 90.0)
                             val lon = coord(parser.getAttributeValue(null, "lon"), 180.0)
-                            pendingTime = 0L
-                            pendingEle = NO_ALTITUDE
-                            if (!lat.isNaN() && !lon.isNaN() && inTrk) {
-                                trkPts.add(TrackPoint(lat, lon, 0L, 0.0))
-                            }
+                            pendingPoint = if (lat.isFinite() && lon.isFinite() && inTrk)
+                                TrackPoint(lat, lon, 0L, NO_ALTITUDE) else null
                         }
                         "rtept" -> {
                             val lat = coord(parser.getAttributeValue(null, "lat"), 90.0)
@@ -134,17 +140,18 @@ object InterchangeFiles {
                         "name" -> {
                             val t = textBuf.trim()
                             if (inWpt && name.isEmpty()) name = t
-                            else if (inTrk && trkName.isEmpty()) trkName = t
+                            else if (inTrk && parser.depth == trkDepth + 1 && trkName.isEmpty()) trkName = t
                             else if (inRte && rteName.isEmpty()) rteName = t
                         }
-                        "ele" -> pendingEle = textBuf.trim().toDoubleOrNull()?.takeIf { it.isFinite() } ?: NO_ALTITUDE
-                        "time" -> pendingTime = parseIsoTime(textBuf.trim())
+                        "ele" -> pendingPoint = pendingPoint?.copy(
+                            alt = textBuf.trim().toDoubleOrNull()?.takeIf { it.isFinite() } ?: NO_ALTITUDE,
+                        )
+                        "time" -> pendingPoint = pendingPoint?.copy(time = parseIsoTime(textBuf.trim()))
                         "trkpt" -> {
-                            if (inTrk && trkPts.isNotEmpty()) {
-                                val last = trkPts.removeAt(trkPts.size - 1)
-                                trkPts.add(last.copy(time = pendingTime, alt = pendingEle))
-                            }
+                            pendingPoint?.let { trkPts.add(it) }
+                            pendingPoint = null
                         }
+                        "trkseg" -> if (inTrk) finishSegment()
                         "wpt" -> {
                             if (inWpt && !wptLat.isNaN() && !wptLon.isNaN()) {
                                 wps.add(
@@ -161,12 +168,19 @@ object InterchangeFiles {
                             inWpt = false
                         }
                         "trk" -> {
-                            if (inTrk && trkPts.size >= 2) {
-                                tracks.add(
-                                    ImportedTrack(trkName.ifBlank { "Imported track" }, trkPts)
-                                )
+                            if (inTrk) {
+                                finishSegment()
+                                val baseName = trkName.ifBlank { "Imported track" }
+                                trkSegments.forEachIndexed { index, points ->
+                                    // Each GPX segment is a continuous recording. Keeping separate
+                                    // tracks prevents a GPS outage becoming a made-up connecting leg.
+                                    val segmentName = if (trkSegments.size == 1) baseName
+                                        else "$baseName — segment ${index + 1}"
+                                    tracks.add(ImportedTrack(segmentName, points))
+                                }
                             }
                             inTrk = false
+                            pendingPoint = null
                         }
                         "rte" -> {
                             if (inRte && rtePts.size >= 2) {
@@ -209,17 +223,16 @@ object InterchangeFiles {
             }
             sb.append("  </rte>\n")
         }
-        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
-        sdf.timeZone = TimeZone.getTimeZone("UTC")
         for ((info, pts) in tracks) {
             sb.append("  <trk><name>").append(escapeXml(info.name)).append("</name><trkseg>\n")
             for (p in pts) {
                 val ele = if (p.alt.hasAltitude()) String.format(Locale.US, "<ele>%.1f</ele>", p.alt) else ""
+                val time = if (p.time != 0L) "<time>${Instant.ofEpochMilli(p.time)}</time>" else ""
                 sb.append(
                     String.format(
                         Locale.US,
-                        "    <trkpt lat=\"%.7f\" lon=\"%.7f\">%s<time>%s</time></trkpt>\n",
-                        p.lat, p.lon, ele, sdf.format(Date(p.time)),
+                        "    <trkpt lat=\"%.7f\" lon=\"%.7f\">%s%s</trkpt>\n",
+                        p.lat, p.lon, ele, time,
                     )
                 )
             }
@@ -249,7 +262,7 @@ object InterchangeFiles {
         val lines = ArrayList<ImportedLine>()
         val areas = ArrayList<ImportedLine>()
 
-        val parser = Xml.newPullParser()
+        val parser = newParser()
         parser.setInput(stream, null)
 
         val folderStack = ArrayDeque<String>()
@@ -307,7 +320,7 @@ object InterchangeFiles {
                         "Placemark" -> {
                             if (inPlacemark) {
                                 val folder = folderStack.lastOrNull { it.isNotBlank() } ?: IMPORT_FOLDER
-                                val pts = parseKmlCoordinates(coordText)
+                                val pts = parseKmlCoordinates(coordText, geomType == "polygon")
                                 when {
                                     geomType == "point" && pts.isNotEmpty() -> wps.add(
                                         WaypointDraft(
@@ -338,7 +351,7 @@ object InterchangeFiles {
     }
 
     /** KML coordinate lists are "lon,lat[,alt]" tuples separated by whitespace. */
-    private fun parseKmlCoordinates(text: String): List<GeoVertex> =
+    private fun parseKmlCoordinates(text: String, polygon: Boolean): List<GeoVertex> =
         text.trim().split(Regex("\\s+")).mapNotNull { tuple ->
             val parts = tuple.split(",")
             if (parts.size < 2) return@mapNotNull null
@@ -347,7 +360,7 @@ object InterchangeFiles {
             if (lat in -90.0..90.0 && lon in -180.0..180.0) GeoVertex(lat, lon) else null
         }.let { pts ->
             // drop the duplicated closing vertex polygons carry
-            if (pts.size >= 2 && pts.first() == pts.last()) pts.dropLast(1) else pts
+            if (polygon && pts.size >= 2 && pts.first() == pts.last()) pts.dropLast(1) else pts
         }
 
     fun buildKml(
@@ -378,25 +391,27 @@ object InterchangeFiles {
         if (graphics.isNotEmpty()) {
             sb.append("<Folder><name>Graphics</name>\n")
             for (g in graphics) {
-                val closed = GraphicTypes.isArea(g.type) && g.points.size >= 3
+                val geometry = graphicExportGeometry(g) ?: continue
+                val points = geometry.points
+                val closed = geometry.area
                 sb.append("<Placemark><name>")
                     .append(escapeXml(GraphicTypes.labelPrefix(g.type) + g.name))
                     .append("</name>")
                 val coords = StringBuilder()
-                for (p in g.points) {
+                for (p in points) {
                     coords.append(String.format(Locale.US, "%.7f,%.7f,0 ", p.lon, p.lat))
                 }
-                if (closed && g.points.isNotEmpty()) {
+                if (closed && points.first() != points.last()) {
                     coords.append(
-                        String.format(Locale.US, "%.7f,%.7f,0", g.points[0].lon, g.points[0].lat)
+                        String.format(Locale.US, "%.7f,%.7f,0", points[0].lon, points[0].lat)
                     )
                 }
-                if (g.points.size == 1) {
+                if (points.size == 1) {
                     // Point graphics (TRP, checkpoint, text) export as placemarks
                     sb.append(
                         String.format(
                             Locale.US, "<Point><coordinates>%.7f,%.7f,0</coordinates></Point>",
-                            g.points[0].lon, g.points[0].lat,
+                            points[0].lon, points[0].lat,
                         )
                     )
                 } else if (closed) {
@@ -433,11 +448,12 @@ object InterchangeFiles {
     // ---------------- helpers ----------------
 
     private fun parseIsoTime(text: String): Long = runCatching {
-        val cleaned = text.replace(Regex("\\.\\d+"), "").removeSuffix("Z")
-        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
-        sdf.timeZone = TimeZone.getTimeZone("UTC")
-        sdf.parse(cleaned)?.time ?: 0L
+        OffsetDateTime.parse(text, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant().toEpochMilli()
     }.getOrDefault(0L)
+
+    private fun newParser(): XmlPullParser = XmlPullParserFactory.newInstance().apply {
+        isNamespaceAware = true
+    }.newPullParser()
 
     private fun escapeXml(s: String): String = s
         .replace("&", "&amp;")

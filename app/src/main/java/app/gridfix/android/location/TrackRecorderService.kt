@@ -35,6 +35,8 @@ data class ActiveTrack(
     val distanceM: Double,
 )
 
+data class RecordingFailure(val trackId: String, val message: String)
+
 /**
  * Foreground service that logs GPS points to the active track file while the
  * user moves — screen off included. Points are filtered to >= 5 m spacing.
@@ -46,6 +48,7 @@ class TrackRecorderService : Service() {
     private val locationManager by lazy {
         getSystemService(Context.LOCATION_SERVICE) as LocationManager
     }
+    private val recordingLock = Any()
     private var worker: HandlerThread? = null
     private var trackId: String? = null
     private var lastPoint: Location? = null
@@ -54,36 +57,45 @@ class TrackRecorderService : Service() {
     private var startedAt = 0L
 
     private val listener = object : LocationListener {
-        override fun onLocationChanged(loc: Location) {
-            val id = trackId ?: return
-            // Reject junk fixes outright, but never let the fix's own error become the
-            // step length: under canopy a 25 m CEP would demand a 25 m move before any
-            // point is kept, and a whole dogleg inside that circle would simply not exist.
-            // Spacing is a fixed 5 m, with a time fallback so a slow move still records.
-            if (loc.hasAccuracy() && loc.accuracy > MAX_ACCURACY_M) return
+        override fun onLocationChanged(loc: Location) = synchronized(recordingLock) {
+            val id = trackId ?: return@synchronized
+            if (!loc.hasAccuracy() || !loc.accuracy.isFinite() || loc.accuracy > MAX_ACCURACY_M) return@synchronized
             val last = lastPoint
+            var step = 0.0
             if (last != null) {
                 val d = loc.distanceTo(last)
                 val gap = loc.elapsedRealtimeNanos - last.elapsedRealtimeNanos
-                val stale = gap > MIN_INTERVAL_NANOS
-                if (d < MIN_STEP_M && !(stale && d > 1f)) return
-                distance += d
+                if (gap <= 0L) return@synchronized
+                if (d < MIN_STEP_M && !(gap > MIN_INTERVAL_NANOS && d > 1f)) return@synchronized
+                step = d.toDouble()
             }
-            lastPoint = loc
+            // This listener runs on the recorder worker, so the geoid lookup does
+            // not block the UI. Never label ellipsoid altitude as GPX/MSL height.
+            val altitude = if (Build.VERSION.SDK_INT >= 34 && loc.hasAltitude() &&
+                MslConverter.add(this@TrackRecorderService, loc)) loc.mslAltitudeMeters else NO_ALTITUDE
+            try {
+                TrackRepository.appendPoint(
+                    this@TrackRecorderService, id,
+                    loc.latitude, loc.longitude, loc.time, altitude,
+                )
+            } catch (failure: Exception) {
+                // Publish no unsaved point or distance, and reject queued callbacks.
+                trackId = null
+                _active.value = null
+                val message = "Recording stopped because a point could not be saved. Earlier saved points are kept. Check available storage and start a new recording."
+                _error.value = RecordingFailure(id, message)
+                Handler(Looper.getMainLooper()).post {
+                    stopRecording()
+                    val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    runCatching { manager.notify(ERROR_NOTIF_ID, buildNotification(message, failed = true)) }
+                    stopSelf()
+                }
+                return@synchronized
+            }
+            distance += step
+            lastPoint = Location(loc)
             points.add(loc.latitude to loc.longitude)
-            if (points.size > MAX_LIVE_POINTS) {
-                // keep the live polyline bounded; the file holds the full log
-                points = ArrayList(points.takeLast(MAX_LIVE_POINTS / 2))
-            }
-            TrackRepository.appendPoint(
-                this@TrackRecorderService, id,
-                loc.latitude, loc.longitude, loc.time,
-                // GPX <ele> is metres above mean sea level, and the map's contours are
-                // MSL too, so store the converted height when the phone can give one.
-                // NO_ALTITUDE when it cannot: writing 0.0 would plot the whole leg at
-                // sea level, which is a worse lie than leaving the elevation out.
-                loc.bestAltitude() ?: NO_ALTITUDE,
-            )
+            if (points.size > MAX_LIVE_POINTS) points = ArrayList(points.takeLast(MAX_LIVE_POINTS / 2))
             _active.value = ActiveTrack(id, startedAt, ArrayList(points), distance)
             updateNotification()
         }
@@ -94,6 +106,11 @@ class TrackRecorderService : Service() {
 
         override fun onProviderEnabled(provider: String) {}
         override fun onProviderDisabled(provider: String) {}
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -116,6 +133,8 @@ class TrackRecorderService : Service() {
                 distance = 0.0
                 points = ArrayList()
                 lastPoint = null
+                _error.value = null
+                (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(ERROR_NOTIF_ID)
                 _active.value = ActiveTrack(id, startedAt, emptyList(), 0.0)
 
                 createChannel()
@@ -133,8 +152,8 @@ class TrackRecorderService : Service() {
                     // ForegroundServiceStartNotAllowed / SecurityException: the app lost
                     // foreground or location permission between tap and start. Bail out
                     // without a half-started recording.
-                    trackId = null
-                    _active.value = null
+                    _error.value = RecordingFailure(id, "Recording could not start. Check location permission and try again while the app is open.")
+                    stopRecording()
                     stopSelf()
                     return START_NOT_STICKY
                 }
@@ -146,6 +165,8 @@ class TrackRecorderService : Service() {
                         LocationManager.GPS_PROVIDER, 2000L, 0f, listener, thread.looper
                     )
                 } catch (_: Exception) {
+                    _error.value = RecordingFailure(id, "Recording could not start. Check that GPS is enabled and location permission is granted.")
+                    stopRecording()
                     stopSelf()
                 }
             }
@@ -159,19 +180,23 @@ class TrackRecorderService : Service() {
 
     override fun onDestroy() {
         stopRecording()
+        if (instance === this) instance = null
         super.onDestroy()
     }
 
     private fun stopRecording() {
-        if (trackId == null) return
+        // Wait for an in-flight append before returning. Once the ID is cleared,
+        // queued worker callbacks cannot append after the UI finalizes the track.
+        synchronized(recordingLock) {
+            trackId = null
+            _active.value = null
+        }
         try {
             locationManager.removeUpdates(listener)
         } catch (_: SecurityException) {
         }
-        worker?.quitSafely()
+        worker?.quit()
         worker = null
-        trackId = null
-        _active.value = null
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
     }
 
@@ -186,7 +211,7 @@ class TrackRecorderService : Service() {
         }
     }
 
-    private fun buildNotification(text: String): android.app.Notification {
+    private fun buildNotification(text: String, failed: Boolean = false): android.app.Notification {
         val open = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
@@ -194,9 +219,10 @@ class TrackRecorderService : Service() {
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_rec)
-            .setContentTitle("MGRS GPS — recording track")
+            .setContentTitle(if (failed) "MGRS GPS — recording stopped" else "MGRS GPS — recording track")
             .setContentText(text)
-            .setOngoing(true)
+            .setOngoing(!failed)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setContentIntent(open)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
@@ -210,13 +236,15 @@ class TrackRecorderService : Service() {
         }
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         Handler(Looper.getMainLooper()).post {
-            runCatching { manager.notify(NOTIF_ID, buildNotification(text)) }
+            if (_active.value != null) runCatching { manager.notify(NOTIF_ID, buildNotification(text)) }
         }
     }
 
     companion object {
         private const val CHANNEL_ID = "gridfix_tracking"
         private const val NOTIF_ID = 41
+        private const val ERROR_NOTIF_ID = 42
+        @Volatile private var instance: TrackRecorderService? = null
         private const val ACTION_START = "app.gridfix.android.track.START"
         private const val ACTION_STOP = "app.gridfix.android.track.STOP"
         private const val EXTRA_TRACK_ID = "track_id"
@@ -233,6 +261,10 @@ class TrackRecorderService : Service() {
 
         private val _active = MutableStateFlow<ActiveTrack?>(null)
         val active: StateFlow<ActiveTrack?> = _active.asStateFlow()
+        private val _error = MutableStateFlow<RecordingFailure?>(null)
+        val error: StateFlow<RecordingFailure?> = _error.asStateFlow()
+
+        fun clearError() { _error.value = null }
 
         fun start(context: Context, trackId: String) {
             val i = Intent(context, TrackRecorderService::class.java)
@@ -243,9 +275,12 @@ class TrackRecorderService : Service() {
         }
 
         fun stop(context: Context) {
-            context.startService(
-                Intent(context, TrackRecorderService::class.java).setAction(ACTION_STOP)
-            )
+            // UI callers finalize the file immediately after this returns.
+            // Sending an asynchronous STOP intent alone races the worker callback.
+            instance?.let { service ->
+                service.stopRecording()
+                service.stopSelf()
+            }
         }
     }
 }

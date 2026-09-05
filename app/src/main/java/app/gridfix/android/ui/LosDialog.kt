@@ -41,6 +41,7 @@ import app.gridfix.android.coords.Coordinates
 import app.gridfix.android.data.AppSettings
 import app.gridfix.android.data.Waypoint
 import app.gridfix.android.map.Terrain
+import app.gridfix.android.map.SightStatus
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -140,7 +141,7 @@ fun ProfileChart(
 
 /**
  * Line-of-sight check across the cached terrain: pick an observer and a
- * target, get VISIBLE or MASKED with the blocking crest, a profile sketch,
+ * target, get VISIBLE, MASKED, or UNKNOWN with a profile sketch,
  * and the observer height that would clear the mask. Curvature and standard
  * refraction included.
  */
@@ -213,7 +214,7 @@ fun LosDialog(
                         waypoints.take(40).forEach { w ->
                             DropdownMenuItem(
                                 text = { Text(w.name) },
-                                onClick = { obsWp = w; obsMenu = false },
+                                onClick = { obsWp = w; obsMenu = false; result = null },
                             )
                         }
                     }
@@ -238,7 +239,7 @@ fun LosDialog(
                         waypoints.take(40).forEach { w ->
                             DropdownMenuItem(
                                 text = { Text(w.name) },
-                                onClick = { tgtWp = w; tgtMenu = false },
+                                onClick = { tgtWp = w; tgtMenu = false; result = null },
                             )
                         }
                     }
@@ -247,7 +248,7 @@ fun LosDialog(
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     OutlinedTextField(
                         value = obsH,
-                        onValueChange = { obsH = it.filter { c -> c.isDigit() }.take(3) },
+                        onValueChange = { obsH = it.filter { c -> c.isDigit() }.take(3); result = null },
                         label = { Text("Obs height m") },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -255,7 +256,7 @@ fun LosDialog(
                     )
                     OutlinedTextField(
                         value = tgtH,
-                        onValueChange = { tgtH = it.filter { c -> c.isDigit() }.take(3) },
+                        onValueChange = { tgtH = it.filter { c -> c.isDigit() }.take(3); result = null },
                         label = { Text("Tgt height m") },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -274,7 +275,7 @@ fun LosDialog(
                     }
                 }
                 Text(
-                    "Check = point-to-point answer here. Shade map = paint everything the observer can see: green seen, amber only a standing target, red masked.",
+                    "Check = point-to-point answer here. Shade map = green seen, amber only a standing target, red masked, hatched unknown. Missing terrain prevents confirming visibility beyond it.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -285,7 +286,7 @@ fun LosDialog(
 
                 result?.let { r ->
                     val dist = Coordinates.formatDistance(r.profile.totalM, settings.units)
-                    if (r.visible) {
+                    if (r.status == SightStatus.VISIBLE) {
                         // DEM cells are ~19 m and a few metres in error; a sight line that
                         // only just clears a crest deserves a warning, not a green light.
                         val marginal = !r.minClearanceM.isNaN() && r.minClearanceM < 5f
@@ -310,7 +311,7 @@ fun LosDialog(
                                 fontFamily = MonoFamily,
                             )
                         }
-                    } else {
+                    } else if (r.status == SightStatus.MASKED) {
                         Text(
                             "MASKED — $dist",
                             style = MaterialTheme.typography.titleMedium,
@@ -321,7 +322,7 @@ fun LosDialog(
                         Text(
                             String.format(
                                 Locale.US,
-                                "Blocked %s out (crest ≈ %.0f m MSL)\n%s",
+                                "Known obstruction %s out (crest ≈ %.0f m MSL)\n%s",
                                 Coordinates.formatDistance(r.blockDistM, settings.units),
                                 r.profile.elevations.getOrElse(r.blockIndex) { Float.NaN },
                                 Coordinates.mgrs(r.blockLat, r.blockLon, 8)?.full ?: "",
@@ -340,6 +341,18 @@ fun LosDialog(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
+                    } else {
+                        Text(
+                            "UNKNOWN — $dist",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontFamily = MonoFamily,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            "Missing terrain could conceal an obstruction. Visibility cannot be confirmed.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
                     }
                     ProfileChart(
                         distances = r.profile.distancesM,
@@ -354,7 +367,7 @@ fun LosDialog(
                         String.format(
                             Locale.US,
                             "Obs %.0f m + %s m AGL → Tgt %.0f m + %s m AGL · curvature + refraction applied",
-                            r.observerElev, obsH.ifBlank { "2" }, r.targetElev, tgtH.ifBlank { "2" },
+                            r.observerElev, r.observerHeight.toInt(), r.targetElev, r.targetHeight.toInt(),
                         ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -384,6 +397,7 @@ fun LosDialog(
                     val t = targetPoint() ?: return@TextButton
                     computing = true
                     error = null
+                    result = null
                     scope.launch {
                         val r = Terrain.lineOfSight(
                             context,

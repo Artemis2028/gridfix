@@ -12,8 +12,8 @@ android {
         applicationId = "app.gridfix.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 57
-        versionName = "0.9.29"
+        versionCode = 58
+        versionName = "0.9.30"
         // MapTiler API key from the CI secret; empty in builds without it (community-tile fallback)
         buildConfigField("String", "MAPTILER_KEY", "\"" + (System.getenv("MAPTILER_KEY") ?: "") + "\"")
     }
@@ -105,4 +105,5 @@ dependencies {
     // isReturnDefaultValues, so a JVM test cannot parse its own output
     // without the real artifact on the test classpath ahead of it.
     testImplementation("org.json:json:20240303")
+    testImplementation("net.sf.kxml:kxml2:2.3.0")
 }

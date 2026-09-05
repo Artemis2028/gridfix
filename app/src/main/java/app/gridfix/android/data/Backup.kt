@@ -2,14 +2,15 @@ package app.gridfix.android.data
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
-import java.util.Locale
+import java.nio.file.Files
 import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 /**
@@ -97,22 +98,64 @@ object Backup {
             )
         })
 
-        val zip = ZipOutputStream(out)
-        zip.putNextEntry(ZipEntry("gridfix-backup.json"))
-        zip.write(root.toString(2).toByteArray())
-        zip.closeEntry()
-        for (t in tracks) {
-            val pts = TrackRepository.readPoints(context, t.id)
-            if (pts.isEmpty()) continue
-            zip.putNextEntry(ZipEntry("tracks/${t.id}.txt"))
-            zip.write(
-                pts.joinToString("") {
-                    String.format(Locale.US, "%.7f %.7f %d %.1f\n", it.lat, it.lon, it.time, it.alt)
-                }.toByteArray()
-            )
-            zip.closeEntry()
+        require(listOf(waypoints.size, folders.size, graphics.size, tracks.size, courseHistory.size).all { it <= MAX_RECORDS }) {
+            "Backup exceeds the supported record count"
         }
-        zip.finish()
+        requireUniqueIds(waypoints.map { it.id }, "waypoint")
+        requireUniqueIds(graphics.map { it.id }, "graphic")
+        requireUniqueIds(tracks.map { it.id }, "track")
+        waypoints.forEach {
+            requireCoordinates(it.lat, it.lon)
+            require(it.rotation.isFinite()) { "Invalid waypoint rotation" }
+        }
+        require(graphics.sumOf { it.points.size.toLong() } <= MAX_POINTS) { "Too many graphic vertices" }
+        graphics.forEach { graphic ->
+            require(graphic.points.size >= GraphicTypes.minPoints(graphic.type)) { "Invalid graphic vertex count" }
+            graphic.points.forEach { requireCoordinates(it.lat, it.lon) }
+        }
+        validateSettings(settings)
+        courseHistory.forEach { validateCourseResult(it) }
+        val manifest = root.toString(2).toByteArray(Charsets.UTF_8)
+        val budget = BackupExportBudget().also { it.add("gridfix-backup.json", manifest.size.toLong()) }
+        // Snapshot/stage the files before writing to the user's document provider.
+        // This also bounds a recording that keeps growing during the backup.
+        val staging = Files.createTempDirectory(context.cacheDir.toPath(), "backup-").toFile()
+        val files = ArrayList<Pair<String, File>>()
+        var pointCount = 0
+        try {
+            for (track in tracks) {
+                requireTrackId(track.id)
+                require(track.distanceM.isFinite() && track.distanceM >= 0 && track.pointCount >= 0) { "Invalid track metadata" }
+                val points = TrackRepository.readPoints(context, track.id)
+                require(points.isNotEmpty() || track.pointCount == 0) { "Missing points for track ${track.name}" }
+                if (points.isEmpty()) continue
+                pointCount += points.size
+                require(pointCount <= MAX_POINTS) { "Backup exceeds the supported $MAX_POINTS track points" }
+                val file = File(staging, "${track.id}.txt")
+                file.bufferedWriter().use { writer ->
+                    for (point in points) {
+                        requireCoordinates(point.lat, point.lon)
+                        require(point.time >= 0 && point.alt.isFinite()) { "Invalid point in track ${track.name}" }
+                        writer.write(trackPointLine(point))
+                    }
+                }
+                val entry = "tracks/${track.id}.txt"
+                budget.add(entry, file.length())
+                files.add(entry to file)
+            }
+            val zip = ZipOutputStream(out)
+            zip.putNextEntry(ZipEntry("gridfix-backup.json"))
+            zip.write(manifest)
+            zip.closeEntry()
+            for ((entry, file) in files) {
+                zip.putNextEntry(ZipEntry(entry))
+                file.inputStream().use { it.copyTo(zip) }
+                zip.closeEntry()
+            }
+            zip.finish()
+        } finally {
+            staging.deleteRecursively()
+        }
     }
 
     data class RestoreResult(
@@ -121,6 +164,7 @@ object Backup {
         val tracks: Int,
         val course: Int,
         val settingsApplied: Boolean,
+        val failure: String? = null,
     ) {
         fun summary(): String {
             val parts = mutableListOf<String>()
@@ -129,6 +173,10 @@ object Backup {
             if (tracks > 0) parts.add("$tracks tracks")
             if (course > 0) parts.add("$course course results")
             if (settingsApplied) parts.add("settings")
+            if (failure != null) {
+                val progress = if (parts.isEmpty()) "No records were added." else "Already restored: ${parts.joinToString(", ")}."
+                return "Restore incomplete — $failure. $progress Existing records were not overwritten. After resolving the problem, retry the same backup to add the remaining records."
+            }
             return if (parts.isEmpty()) "Nothing new to restore — everything was already here"
             else "Restored " + parts.joinToString(", ")
         }
@@ -142,31 +190,50 @@ object Backup {
         settingsRepo: SettingsRepository,
         courseRepo: CourseRepository,
     ): RestoreResult = withContext(Dispatchers.IO) {
-        val entries = HashMap<String, ByteArray>()
-        val zin = ZipInputStream(input)
-        var e: ZipEntry? = zin.nextEntry
-        while (e != null) {
-            val wanted = e.name == "gridfix-backup.json" || e.name.startsWith("tracks/")
-            if (!e.isDirectory && wanted) {
-                val out = java.io.ByteArrayOutputStream()
-                val buf = ByteArray(16 * 1024)
-                var total = 0L
-                var tooBig = false
-                while (true) {
-                    val n = zin.read(buf)
-                    if (n < 0) break
-                    total += n
-                    if (total > 64L * 1024 * 1024) { tooBig = true; break }
-                    out.write(buf, 0, n)
+        // No repository is touched until the entire archive and every record pass validation.
+        val plan = parse(input)
+        var result = RestoreResult(0, 0, 0, 0, false)
+        // Individual stores are atomic; the app does not have one database spanning
+        // all stores. Report completed work explicitly if a later store write fails.
+        withContext(NonCancellable) {
+            try {
+                result = result.copy(tracks = trackRepo.restoreAll(plan.tracks))
+                result = result.copy(waypoints = waypointRepo.restore(plan.waypoints, plan.folders))
+                result = result.copy(graphics = graphicsRepo.restore(plan.graphics))
+                result = result.copy(course = courseRepo.restoreHistory(plan.course))
+                plan.settings?.let {
+                    settingsRepo.applyAll(it)
+                    result = result.copy(settingsApplied = true)
                 }
-                if (!tooBig) entries[e.name] = out.toByteArray()
+                result
+            } catch (failure: Exception) {
+                result.copy(failure = failure.message ?: "could not save the restored data")
             }
-            zin.closeEntry()
-            e = zin.nextEntry
         }
+    }
+
+    internal data class RestorePlan(
+        val waypoints: List<Waypoint>,
+        val folders: List<FolderInfo>,
+        val graphics: List<TacGraphic>,
+        val tracks: List<Pair<TrackInfo, List<TrackPoint>>>,
+        val settings: AppSettings?,
+        val course: List<CourseResult>,
+    )
+
+    internal fun parse(input: InputStream): RestorePlan {
+        val entries = readBackupEntries(input)
         val rootBytes = entries["gridfix-backup.json"]
             ?: throw IllegalArgumentException("not an MGRS GPS backup")
-        val root = JSONObject(String(rootBytes))
+        val root = JSONObject(String(rootBytes, Charsets.UTF_8))
+        require(root.getString("app") in setOf("GridFix", "MGRS GPS") && root.getInt("version") == VERSION) {
+            "Unsupported backup format or version"
+        }
+        for (key in listOf("waypoints", "folders", "graphics", "tracks", "courseHistory")) {
+            require(!root.has(key) || root.get(key) is JSONArray) { "Invalid $key section" }
+            require((root.optJSONArray(key)?.length() ?: 0) <= MAX_RECORDS) { "Too many $key records" }
+        }
+        require(!root.has("settings") || root.get("settings") is JSONObject) { "Invalid settings section" }
 
         val wps = ArrayList<Waypoint>()
         root.optJSONArray("waypoints")?.let { a ->
@@ -196,13 +263,20 @@ object Backup {
                 folderInfos.add(FolderInfo(canonicalFolder(o.getString("name")), o.optBoolean("visible", true)))
             }
         }
-        val addedWp = waypointRepo.restore(wps, folderInfos)
+        requireUniqueIds(wps.map { it.id }, "waypoint")
+        wps.forEach {
+            requireCoordinates(it.lat, it.lon)
+            require(it.rotation.isFinite()) { "Invalid waypoint rotation" }
+        }
 
         val gfx = ArrayList<TacGraphic>()
+        var graphicPointCount = 0
         root.optJSONArray("graphics")?.let { a ->
             for (i in 0 until a.length()) {
                 val o = a.getJSONObject(i)
                 val ptsArr = o.getJSONArray("points")
+                graphicPointCount += ptsArr.length()
+                require(graphicPointCount <= MAX_POINTS) { "Too many graphic vertices" }
                 val pts = ArrayList<GeoVertex>()
                 for (j in 0 until ptsArr.length()) {
                     val v = ptsArr.getJSONArray(j)
@@ -221,9 +295,14 @@ object Backup {
                 )
             }
         }
-        val addedG = graphicsRepo.restore(gfx)
+        requireUniqueIds(gfx.map { it.id }, "graphic")
+        gfx.forEach { graphic ->
+            require(graphic.points.size in GraphicTypes.minPoints(graphic.type)..MAX_POINTS) { "Invalid graphic vertex count" }
+            graphic.points.forEach { requireCoordinates(it.lat, it.lon) }
+        }
 
-        var addedT = 0
+        val restoredTracks = ArrayList<Pair<TrackInfo, List<TrackPoint>>>()
+        var pointCount = 0
         root.optJSONArray("tracks")?.let { a ->
             for (i in 0 until a.length()) {
                 val o = a.getJSONObject(i)
@@ -235,25 +314,39 @@ object Backup {
                     folder = canonicalFolder(o.optString("folder", DEFAULT_FOLDER)),
                     visible = o.optBoolean("visible", true),
                 )
-                val ptBytes = entries["tracks/${info.id}.txt"] ?: continue
-                val pts = String(ptBytes).lines().mapNotNull { line ->
-                    val parts = line.trim().split(" ")
-                    if (parts.size < 3) return@mapNotNull null
-                    runCatching {
-                        TrackPoint(
+                requireTrackId(info.id)
+                require(info.distanceM.isFinite() && info.distanceM >= 0 && info.pointCount >= 0) { "Invalid track metadata" }
+                val ptBytes = entries["tracks/${info.id}.txt"]
+                require(ptBytes != null || info.pointCount == 0) { "Missing points for track ${info.name}" }
+                val pts = ArrayList<TrackPoint>()
+                if (ptBytes != null) {
+                    String(ptBytes, Charsets.UTF_8).lineSequence().forEach { line ->
+                        if (line.isBlank()) return@forEach
+                        val parts = line.trim().split(Regex("\\s+"))
+                        require(parts.size in 3..4) { "Malformed point in track ${info.name}" }
+                        val point = TrackPoint(
                             lat = parts[0].toDouble(), lon = parts[1].toDouble(),
-                            time = parts[2].toLong(),
-                            alt = parts.getOrNull(3)?.toDouble() ?: NO_ALTITUDE,
+                            time = parts[2].toLong(), alt = parts.getOrNull(3)?.toDouble() ?: NO_ALTITUDE,
                         )
-                    }.getOrNull()
+                        requireCoordinates(point.lat, point.lon)
+                        require(point.time >= 0 && point.alt.isFinite()) { "Invalid point in track ${info.name}" }
+                        require(++pointCount <= MAX_POINTS) { "Too many backup track points" }
+                        pts.add(point)
+                    }
                 }
-                if (trackRepo.restore(info, pts)) addedT++
+                var distance = 0.0
+                for (j in 1 until pts.size) distance += app.gridfix.android.coords.Geodesy.distanceAndBearing(
+                    pts[j - 1].lat, pts[j - 1].lon, pts[j].lat, pts[j].lon,
+                )[0]
+                restoredTracks.add(info.copy(pointCount = pts.size, distanceM = distance) to pts)
             }
         }
 
-        var settingsApplied = false
-        root.optJSONObject("settings")?.let { s ->
-            settingsRepo.applyAll(
+        requireUniqueIds(restoredTracks.map { it.first.id }, "track")
+        val expectedTrackEntries = restoredTracks.map { "tracks/${it.first.id}.txt" }.toSet()
+        require(entries.keys.none { it.startsWith("tracks/") && it !in expectedTrackEntries }) { "Track file is missing from the manifest" }
+
+        val restoredSettings = root.optJSONObject("settings")?.let { s ->
                 AppSettings(
                     nightMode = s.optBoolean("nightMode", false),
                     keepScreenOn = s.optBoolean("keepScreenOn", true),
@@ -265,11 +358,9 @@ object Backup {
                     pacePer100m = s.optInt("pacePer100m", 65),
                     face = s.optInt("face", 1),
                     orientation = s.optInt("orientation", 0),
-                    declinationOverride = if (s.isNull("declinationOverride")) null else s.optDouble("declinationOverride").toFloat(),
+                    declinationOverride = if (!s.has("declinationOverride") || s.isNull("declinationOverride")) null else s.getDouble("declinationOverride").toFloat(),
                     disclaimerAccepted = s.optBoolean("disclaimerAccepted", false),
-                )
-            )
-            settingsApplied = true
+                ).also { validateSettings(it) }
         }
 
         val results = ArrayList<CourseResult>()
@@ -277,6 +368,7 @@ object Backup {
             for (i in 0 until a.length()) {
                 val o = a.getJSONObject(i)
                 val splits = o.getJSONArray("splits")
+                require(splits.length() <= MAX_RECORDS) { "Too many course splits" }
                 results.add(
                     CourseResult(
                         name = o.getString("name"), points = o.getInt("points"),
@@ -288,8 +380,32 @@ object Backup {
                 )
             }
         }
-        val addedC = courseRepo.restoreHistory(results)
+        results.forEach { validateCourseResult(it) }
+        return RestorePlan(wps, folderInfos, gfx, restoredTracks, restoredSettings, results)
+    }
 
-        RestoreResult(addedWp, addedG, addedT, addedC, settingsApplied)
+    private const val MAX_RECORDS = BackupLimits.RECORDS
+    private const val MAX_POINTS = BackupLimits.POINTS
+
+    private fun validateCourseResult(result: CourseResult) {
+        require(result.points >= 0 && result.startedAt >= 0 && result.totalMillis >= 0 &&
+            result.splitsMillis.size <= MAX_RECORDS && result.splitsMillis.all { it >= 0 }) { "Invalid course result" }
+    }
+
+    private fun requireCoordinates(lat: Double, lon: Double) {
+        require(lat.isFinite() && lon.isFinite() && lat in -90.0..90.0 && lon in -180.0..180.0) { "Invalid coordinates in backup" }
+    }
+
+    private fun requireUniqueIds(ids: List<String>, kind: String) {
+        require(ids.all { it.isNotBlank() && it.length <= 256 } && ids.distinct().size == ids.size) { "Duplicate or invalid $kind IDs" }
+    }
+
+    private fun validateSettings(s: AppSettings) {
+        require(s.mgrsDigits in setOf(4, 6, 8, 10) && s.latLonFormat in 0..2 && s.units in 0..2 &&
+            s.angleUnit in 0..1 && s.northRef in 0..2 && s.pacePer100m in 1..1000 &&
+            s.face in 0..2 && s.orientation in 0..3 &&
+            (s.declinationOverride == null || s.declinationOverride.isFinite() && s.declinationOverride in -180f..180f)) {
+            "Invalid settings in backup"
+        }
     }
 }

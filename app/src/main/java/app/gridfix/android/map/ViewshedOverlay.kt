@@ -15,7 +15,8 @@ import kotlin.math.hypot
  * green where the observer sees the ground, amber where only a standing
  * target would show (partial defilade), red where a 3 m target is hidden.
  * Night palette: a red-only intensity ramp — the brighter the red, the
- * better masked — so the shade sits inside red-light discipline. The bitmap
+ * better masked — so the shade sits inside red-light discipline. Hatching
+ * marks unknown visibility where terrain is missing on a ray. The bitmap
  * is placed with an affine corner fit, so it stays glued under pan, zoom,
  * and rotation.
  */
@@ -25,7 +26,8 @@ class ViewshedOverlay : Overlay() {
     var nightMode = false
 
     private val nightAccent = Color.rgb(196, 45, 36)
-    private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    // Preserve discrete classes and the unknown hatching when scaled.
+    private val bmpPaint = Paint()
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 3f

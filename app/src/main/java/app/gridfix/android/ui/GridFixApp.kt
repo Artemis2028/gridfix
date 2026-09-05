@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
@@ -57,6 +58,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.ScaffoldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -73,6 +75,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
@@ -103,7 +107,7 @@ import app.gridfix.android.data.DataPackage
 import app.gridfix.android.data.DEFAULT_FOLDER
 import app.gridfix.android.data.GeoVertex
 import app.gridfix.android.data.GraphicsRepository
-import app.gridfix.android.data.simplifyTrack
+import app.gridfix.android.data.simplifyTrackToBudget
 import app.gridfix.android.data.InterchangeFiles
 import app.gridfix.android.data.KIND_UNIT
 import app.gridfix.android.data.SettingsRepository
@@ -114,11 +118,14 @@ import app.gridfix.android.location.Declination
 import app.gridfix.android.location.TrackRecorderService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.withContext
 import org.osmdroid.util.GeoPoint
 import kotlin.random.Random
 import java.io.File
 import app.gridfix.android.location.LocationTracker
+import app.gridfix.android.location.isUsableForNavigation
+import app.gridfix.android.location.PocketGuideService
 import app.gridfix.android.ui.screens.MapScreen
 import app.gridfix.android.ui.screens.NavigateScreen
 import app.gridfix.android.ui.screens.PositionScreen
@@ -161,11 +168,12 @@ fun GridFixApp() {
     val context = LocalContext.current
     val repo = remember { SettingsRepository(context.applicationContext) }
     val settings by repo.settings.collectAsStateWithLifecycle(initialValue = AppSettings())
-    val billing = remember { BillingManager(context.applicationContext) }
-    val entitlement by billing.state.collectAsStateWithLifecycle()
-    var paywallPreview by remember { mutableStateOf(false) }
     val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
+    val billing = remember(lifecycleOwner) { BillingManager(context.applicationContext) }
+    val entitlement by billing.state.collectAsStateWithLifecycle()
+    val acknowledgementNotice by billing.acknowledgementNotice.collectAsStateWithLifecycle()
+    var paywallPreview by remember { mutableStateOf(false) }
+    DisposableEffect(lifecycleOwner, billing) {
         billing.start()
         // Re-check on every return to the foreground: purchases made in the Play
         // Store app, pending purchases completing, and lapsed subscriptions.
@@ -185,6 +193,7 @@ fun GridFixApp() {
     val graphicsRepo = remember { GraphicsRepository(context.applicationContext) }
     val graphics by graphicsRepo.graphics.collectAsStateWithLifecycle(initialValue = emptyList())
     val trackRepo = remember { TrackRepository(context.applicationContext) }
+    val recordingFailure by TrackRecorderService.error.collectAsStateWithLifecycle()
     val tracks by trackRepo.tracks.collectAsStateWithLifecycle(initialValue = emptyList())
     var viewedTrackId by remember { mutableStateOf<String?>(null) }
     var mapFocus by remember { mutableStateOf<Pair<Double, Double>?>(null) }
@@ -220,6 +229,22 @@ fun GridFixApp() {
         }
     }
     val scope = rememberCoroutineScope()
+    LaunchedEffect(waypointRepo) {
+        waypointRepo.waypoints.collect { saved ->
+            val guidedId = PocketGuideService.active.value?.targetId
+            if (guidedId != null && saved.none { it.id == guidedId }) PocketGuideService.stop(context)
+        }
+    }
+    LaunchedEffect(entitlement) {
+        if (!BuildConfig.DEBUG && entitlement == BillingManager.State.LOCKED) PocketGuideService.stop(context)
+    }
+    LaunchedEffect(recordingFailure?.trackId) {
+        recordingFailure?.let { failure ->
+            // Point persistence stopped first; derive the summary only from the
+            // saved file. If metadata storage also fails, orphan recovery retries.
+            runCatching { trackRepo.finishTrack(failure.trackId, null, System.currentTimeMillis()) }
+        }
+    }
     val recordGate = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
 
     // The app had no way to tell the operator that anything had failed. A
@@ -239,18 +264,23 @@ fun GridFixApp() {
     val startRecording: (Boolean) -> Unit = { silentNotifications ->
         if (recordGate.compareAndSet(false, true)) {
             scope.launch {
-                val id = trackRepo.startTrack(System.currentTimeMillis())
-                val started = runCatching {
+                var createdId: String? = null
+                val started = try {
+                    val id = trackRepo.startTrack(System.currentTimeMillis())
+                    createdId = id
                     TrackRecorderService.start(context.applicationContext, id)
-                }.isSuccess
-                recordGate.set(false)
+                    true
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    createdId?.let { id -> runCatching { trackRepo.discard(id) } }
+                    false
+                } finally {
+                    recordGate.set(false)
+                }
                 if (!started) {
-                    // Android 12+ refuses a foreground service started from the
-                    // background. The track row is thrown away so the list does
-                    // not fill with empty recordings.
-                    trackRepo.discard(id)
                     snackbarHostState.showSnackbar(
-                        "Could not start recording. Open MGRS GPS and try again."
+                        "Could not start recording. Check available storage and location permission, then try again."
                     )
                 } else if (silentNotifications) {
                     snackbarHostState.showSnackbar(
@@ -291,7 +321,11 @@ fun GridFixApp() {
     }
     // "Approximate" (coarse-only) is not enough for a GPS grid readout: the GPS
     // provider refuses it. Only a precise grant counts; coarse-only gets a hint.
-    var approximateOnly by remember { mutableStateOf(false) }
+    var approximateOnly by remember {
+        mutableStateOf(!hasPermission && ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_COARSE_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED)
+    }
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { result ->
@@ -308,6 +342,9 @@ fun GridFixApp() {
         )
     }
     val tracker = remember { LocationTracker(context.applicationContext) }
+    DisposableEffect(tracker) {
+        onDispose { tracker.close() }
+    }
     LaunchedEffect(Unit) {
         runCatching { trackRepo.finalizeOrphans(TrackRecorderService.active.value?.trackId) }
     }
@@ -318,9 +355,24 @@ fun GridFixApp() {
     // means a trip to the system settings and back re-runs start(), which now picks up
     // whichever providers are enabled by then. The compass has always done this; the
     // tracker should have too.
-    LifecycleStartEffect(hasPermission) {
-        if (hasPermission) tracker.start()
+    LifecycleStartEffect(tracker) {
+        // Settings grants do not invoke the permission launcher callback. Read both
+        // permissions on every foreground entry before starting the provider.
+        hasPermission = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_FINE_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED
+        approximateOnly = !hasPermission && ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_COARSE_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (hasPermission) tracker.start() else tracker.stop()
         onStopOrDispose { tracker.stop() }
+    }
+    LaunchedEffect(hasPermission) {
+        if (hasPermission && lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            tracker.start()
+        } else {
+            tracker.stop()
+        }
     }
     val fix by tracker.fix.collectAsStateWithLifecycle()
 
@@ -401,13 +453,24 @@ fun GridFixApp() {
     }
 
     GridFixTheme(nightMode = settings.nightMode) {
+        recordingFailure?.let { failure ->
+            AlertDialog(
+                onDismissRequest = { /* Acknowledge explicitly so the failure is seen. */ },
+                title = { Text("Track recording stopped") },
+                text = { Text(failure.message) },
+                confirmButton = {
+                    TextButton(onClick = { TrackRecorderService.clearError() }) { Text("OK") }
+                },
+            )
+        }
         // Offered before every other gate, because a crash on the disclaimer or the
         // paywall is exactly the one worth hearing about, and those screens return early.
         // It is a Dialog, so it floats over whatever is underneath.
         var crashReport by remember { mutableStateOf(CrashLog.pending(context)) }
+        val clipboard = LocalClipboardManager.current
         crashReport?.let { report ->
             AlertDialog(
-                onDismissRequest = { CrashLog.clear(context); crashReport = null },
+                onDismissRequest = { crashReport = null },
                 title = { Text("MGRS GPS closed unexpectedly") },
                 text = {
                     Text(
@@ -418,14 +481,21 @@ fun GridFixApp() {
                 },
                 confirmButton = {
                     TextButton(onClick = {
-                        sendCrashReport(context, report)
-                        CrashLog.clear(context)
-                        crashReport = null
+                        if (sendCrashReport(context, report)) {
+                            CrashLog.clear(context)
+                            crashReport = null
+                        }
                     }) { Text("Send report") }
                 },
                 dismissButton = {
-                    TextButton(onClick = { CrashLog.clear(context); crashReport = null }) {
-                        Text("Discard")
+                    Row {
+                        TextButton(onClick = {
+                            clipboard.setText(AnnotatedString(report))
+                            android.widget.Toast.makeText(context, "Report copied; saved copy kept", android.widget.Toast.LENGTH_SHORT).show()
+                        }) { Text("Copy") }
+                        TextButton(onClick = { CrashLog.clear(context); crashReport = null }) {
+                            Text("Discard")
+                        }
                     }
                 },
             )
@@ -568,7 +638,18 @@ fun GridFixApp() {
                 }
             },
         ) { innerPadding ->
-            Row(Modifier.fillMaxSize().padding(innerPadding)) {
+            Column(Modifier.fillMaxSize().padding(innerPadding)) {
+            acknowledgementNotice?.let { notice ->
+                Surface(color = MaterialTheme.colorScheme.errorContainer) {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        Text(notice, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer)
+                        TextButton(onClick = { billing.retryAcknowledgements() }) { Text("Retry") }
+                    }
+                }
+            }
+            Row(Modifier.fillMaxWidth().weight(1f)) {
             if (landscape) {
                 val rule = MaterialTheme.colorScheme.outline
                 // The rail is now the whole of the app's chrome sideways: destinations,
@@ -753,15 +834,19 @@ fun GridFixApp() {
                         onRecordStart = beginRecording,
                         onRecordStop = { name, discard ->
                             val id = TrackRecorderService.active.value?.trackId
-                            TrackRecorderService.stop(context.applicationContext)
-                            if (id != null) {
-                                scope.launch {
-                                    kotlinx.coroutines.delay(400)
-                                    if (discard) {
-                                        trackRepo.discard(id)
-                                    } else {
-                                        trackRepo.finishTrack(id, name, System.currentTimeMillis())
+                            scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) {
+                                        TrackRecorderService.stop(context.applicationContext)
                                     }
+                                    if (id != null) {
+                                        if (discard) trackRepo.discard(id)
+                                        else trackRepo.finishTrack(id, name, System.currentTimeMillis())
+                                    }
+                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    snackbarHostState.showSnackbar("Recording stopped, but its saved track could not be updated. Check storage and reopen the app to recover it.")
                                 }
                             }
                         },
@@ -875,22 +960,15 @@ fun GridFixApp() {
                                 val pts = TrackRepository.readPoints(context, t.id)
                                 if (pts.size >= 2) {
                                     val reversed = pts.reversed()
-                                    // Keep the shape, not every twentieth fix: a uniform
-                                    // stride cuts the corner off every switchback and
-                                    // ridgeline, which is exactly what you are following
-                                    // back. Douglas-Peucker at 20 m keeps the turns and
-                                    // drops the straights, then cap at the vertex limit.
-                                    val dec = ArrayList(
-                                        simplifyTrack(reversed.map { GeoVertex(it.lat, it.lon) }, 20.0)
+                                    // Spend the point budget across the whole track;
+                                    // retaining the final point is essential to get home.
+                                    val dec = simplifyTrackToBudget(
+                                        reversed.map { GeoVertex(it.lat, it.lon) }, 20.0, 64,
                                     )
-                                    val last = reversed.last()
-                                    if (dec.last().lat != last.lat || dec.last().lon != last.lon) {
-                                        dec.add(GeoVertex(last.lat, last.lon))
-                                    }
                                     waypointRepo.addFolder(t.folder)
                                     graphicsRepo.add(
                                         ("Back " + t.name).take(20), "route",
-                                        dec.take(64), t.folder, "none",
+                                        dec, t.folder, "none",
                                         System.currentTimeMillis(),
                                     )
                                     mapFocus = dec.first().lat to dec.first().lon
@@ -1006,7 +1084,9 @@ fun GridFixApp() {
                         onBackup = { uri, onDone ->
                             scope.launch {
                                 runCatching {
-                                    context.contentResolver.openOutputStream(uri)?.use { os ->
+                                    val output = context.contentResolver.openOutputStream(uri)
+                                        ?: error("Couldn't open the backup destination")
+                                    output.use { os ->
                                         Backup.export(
                                             context, os,
                                             waypoints, folders, graphics, settings,
@@ -1030,12 +1110,13 @@ fun GridFixApp() {
                                         )
                                     }
                                     onDone(result?.summary() ?: "Couldn't open that file")
-                                }.getOrElse { onDone("Restore failed — is this an MGRS GPS backup zip?") }
+                                }.getOrElse { onDone("Restore failed — ${it.message ?: "couldn't read the backup"}") }
                             }
                         },
                     )
                 }
                 composable("reference") { ReferenceScreen() }
+            }
             }
             }
         }
@@ -1046,7 +1127,7 @@ fun GridFixApp() {
                 waypoints = waypoints,
                 folders = folders,
                 history = courseHistory,
-                hasFix = fix.location != null,
+                hasFix = fix.location?.isUsableForNavigation() == true,
                 onStartFolder = { f ->
                     scope.launch {
                         val ids = waypoints.filter { it.folder == f }.map { it.id }
@@ -1127,11 +1208,14 @@ fun GridFixApp() {
         LaunchedEffect(
             fix.location?.latitude,
             fix.location?.longitude,
+            fix.location?.elapsedRealtimeNanos,
+            fix.location?.accuracy,
             activeCourse?.nextIndex,
             activeCourse?.name,
         ) {
             val c = activeCourse ?: return@LaunchedEffect
             val loc = fix.location ?: return@LaunchedEffect
+            if (!loc.isUsableForNavigation()) return@LaunchedEffect
             if (c.done) return@LaunchedEffect
             val target = waypoints.firstOrNull { it.id == c.waypointIds[c.nextIndex] }
                 ?: return@LaunchedEffect

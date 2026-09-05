@@ -86,7 +86,7 @@ fun sendFeedback(context: Context) {
  * launch after a crash, and only when they tap Send - the trace has been sitting in
  * app-private storage until this moment.
  */
-fun sendCrashReport(context: Context, report: String) {
+fun sendCrashReport(context: Context, report: String): Boolean {
     val uri = Uri.parse(
         "mailto:" + Uri.encode(AppInfo.SUPPORT_EMAIL) +
             "?subject=" + Uri.encode("MGRS GPS crash " + BuildConfig.VERSION_NAME) +
@@ -104,4 +104,5 @@ fun sendCrashReport(context: Context, report: String) {
     if (!opened) {
         Toast.makeText(context, "No mail app — write to " + AppInfo.SUPPORT_EMAIL, Toast.LENGTH_LONG).show()
     }
+    return opened
 }
