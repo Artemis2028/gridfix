@@ -1,4 +1,4 @@
-# key	dim	func — materialized at CI from 'Nato Icons.zip' into drawable-nodpi as nato_<aff>_<key>.png
+# key	dim	func — the source row for each committed drawable-nodpi/nato_<aff>_<key>.png (func = MIL-STD-2525B code in 'Nato Icons.zip'); SymbolAssetsTest keeps this, NatoSymbols.extended and the PNGs in step
 inf_abn	g	ucia
 inf_ifv	g	ucii
 inf_light	g	ucil

@@ -45,10 +45,17 @@ object NatoSymbols {
     )
 
     /**
-     * Extended symbol tree (M5): functions materialized at CI time from the
-     * bundled MIL-STD-2525B icon pack per app/symbol-manifest.tsv. Reachable
-     * through search in the unit picker; `functions` above stays the common
-     * quick grid.
+     * Extended symbol tree (M5), listed in the unit picker after `functions`.
+     * Every key here has its four affiliation PNGs committed in drawable-nodpi
+     * (app/symbol-manifest.tsv records the MIL-STD-2525B code each came from).
+     *
+     * They were not always committed. From 0.8.0 the build pulled them out of an
+     * icon pack in the repo root on every run; 0.9.16 deleted the pack and made
+     * that step conditional on "fewer than 112 symbols present" - which the 112
+     * common ones satisfied, so it never ran again and 96 picker entries drew the
+     * flag fallback for fourteen builds before anyone opened the grid. Symbols are
+     * source now, and SymbolAssetsTest fails the build if a picker entry has no
+     * PNG behind it.
      */
     val extended: List<Pair<String, String>> = listOf(
         "inf_abn" to "Airborne infantry",
@@ -191,7 +198,7 @@ object NatoSymbols {
     }
 
     // Symbol PNGs are looked up by name so the curated set can grow without a
-    // hand-written map (112 as of the v0.7.8 doctrine pack). Ids are cached.
+    // hand-written map (496 = 124 functions x 4 affiliations). Ids are cached.
     private val idCache = HashMap<String, Int>()
 
     fun resId(context: Context, key: String): Int? {
