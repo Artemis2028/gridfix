@@ -1258,7 +1258,7 @@ private fun WaypointCard(
                     .background(MaterialTheme.colorScheme.surfaceVariant),
                 contentAlignment = Alignment.Center,
             ) {
-                WaypointMarker(symbol = w.symbol, affiliation = w.affiliation, size = 36.dp, echelon = w.echelon, night = settings.nightMode, rotation = w.rotation)
+                WaypointMarker(symbol = w.symbol, affiliation = w.affiliation, size = 36.dp, echelon = w.echelon, night = settings.nightMode, rotation = w.rotation, metadata = w.metadata)
             }
             Spacer(Modifier.size(12.dp))
             Column(Modifier.weight(1f)) {

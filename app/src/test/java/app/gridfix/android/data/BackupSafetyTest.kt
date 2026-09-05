@@ -10,6 +10,19 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
 class BackupSafetyTest {
+    @Test fun backupRestoresMilGpsMetadataWithoutChangingAffiliation() {
+        val metadata = WaypointMetadata("red", 3200, 35.0, 123456789L)
+        val root = manifest()
+        root.getJSONArray("waypoints").getJSONObject(0).put("metadata", metadata.toJson())
+        val restored = Backup.parse(backup(root)).waypoints.single()
+        assertEquals(metadata, restored.metadata)
+        assertEquals("none", restored.affiliation)
+    }
+
+    @Test fun oldBackupsRestoreWithEmptyOptionalMetadata() {
+        assertEquals(WaypointMetadata(), Backup.parse(backup(manifest())).waypoints.single().metadata)
+    }
+
     private val id = "f4ebbead-09c6-4c52-9391-7c430510f281"
 
     private fun manifest() = JSONObject().put("app", "GridFix").put("version", 1)

@@ -31,6 +31,8 @@ import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.sin
 import app.gridfix.android.ui.theme.MonoFamily
+import app.gridfix.android.data.MilGpsSymbols
+import app.gridfix.android.data.WaypointMetadata
 
 /** MIL-STD-2525-style affiliation colors. */
 object Affiliations {
@@ -84,7 +86,13 @@ fun WaypointMarker(
     echelon: String = "",
     night: Boolean = false,
     rotation: Float = 0f,
+    metadata: WaypointMetadata = WaypointMetadata(),
 ) {
+    val importedColor = MilGpsSymbols.argb(metadata.color)?.let { Color(it) }
+    MilGpsSymbols.decode(metadata.milgpsSymbolCode)?.let { imported ->
+        MilGpsMarker(imported, if (night) NightRed else importedColor ?: MaterialTheme.colorScheme.primary, modifier, size)
+        return
+    }
     if (NatoSymbols.isNato(symbol)) {
         val context = LocalContext.current
         val res = NatoSymbols.resId(context, symbol)
@@ -109,7 +117,7 @@ fun WaypointMarker(
     }
 
     val color = if (night) NightRed
-    else Affiliations.color(affiliation, MaterialTheme.colorScheme.primary)
+    else importedColor ?: Affiliations.color(affiliation, MaterialTheme.colorScheme.primary)
     val isShape = WaypointSymbols.isShape(symbol)
     val isTask = WaypointSymbols.isTask(symbol)
     val taskLetter = if (isTask) WaypointSymbols.taskLetter(symbol) else null

@@ -50,6 +50,7 @@ import app.gridfix.android.data.KIND_UNIT
 import app.gridfix.android.data.KIND_WP
 import app.gridfix.android.data.Waypoint
 import app.gridfix.android.data.WaypointDraft
+import app.gridfix.android.data.WaypointMetadata
 import app.gridfix.android.data.reservedFolderHint
 import org.osmdroid.util.GeoPoint
 import java.util.Locale
@@ -193,6 +194,11 @@ fun WaypointDialog(
     var designation by remember(initial) { mutableStateOf(initial?.designation ?: "") }
     var kind by remember(initial) { mutableStateOf(initial?.kind ?: KIND_WP) }
     var rotation by remember(initial) { mutableStateOf(initial?.rotation ?: 0f) }
+    var metadata by remember(initial) { mutableStateOf(initial?.metadata ?: WaypointMetadata()) }
+    fun chooseNativeSymbol(key: String) {
+        symbol = key
+        metadata = metadata.copy(color = null, milgpsSymbolCode = null)
+    }
     // 0 = preset position, 1 = MGRS entry, 2 = project from a known point
     var posMode by remember(initial) { mutableStateOf(if (initial == null && presetLat != null) 0 else 1) }
     var projBaseId by remember(initial) { mutableStateOf<String?>(null) }
@@ -274,6 +280,7 @@ fun WaypointDialog(
                         selected = kind == KIND_UNIT,
                         onClick = {
                             kind = KIND_UNIT
+                            metadata = metadata.copy(color = null, milgpsSymbolCode = null)
                             if (!symbol.startsWith("nato_")) symbol = "nato_f_unit"
                         },
                         label = { Text("Unit") },
@@ -297,6 +304,10 @@ fun WaypointDialog(
                 )
 
                 if (kind == KIND_WP) {
+                    if (metadata.color != null || metadata.milgpsSymbolCode != null) {
+                        MilGpsMarkerEditor(metadata, night) { metadata = it }
+                    }
+                    WaypointMetadataText(metadata)
                     Text("Affiliation", style = MaterialTheme.typography.labelLarge)
                     Row(
                         modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -305,7 +316,10 @@ fun WaypointDialog(
                         Affiliations.all.forEach { key ->
                             FilterChip(
                                 selected = key == affiliation,
-                                onClick = { affiliation = key },
+                                onClick = {
+                                    affiliation = key
+                                    if (key != "none") metadata = metadata.copy(color = null, milgpsSymbolCode = null)
+                                },
                                 label = { Text(Affiliations.label(key)) },
                             )
                         }
@@ -318,7 +332,7 @@ fun WaypointDialog(
                         affiliation = affiliation,
                         labelFor = { WaypointSymbols.label(it) },
                         night = night,
-                    ) { symbol = it }
+                    ) { chooseNativeSymbol(it) }
 
                     Text("Tactical task", style = MaterialTheme.typography.labelLarge)
                     SymbolRow(
@@ -327,7 +341,7 @@ fun WaypointDialog(
                         affiliation = affiliation,
                         labelFor = { WaypointSymbols.taskLabel(it) },
                         night = night,
-                    ) { symbol = it }
+                    ) { chooseNativeSymbol(it) }
 
                     if (WaypointSymbols.isTask(symbol) && WaypointSymbols.taskLetter(symbol) == null) {
                         Text(
@@ -666,6 +680,7 @@ fun WaypointDialog(
                         WaypointDraft(
                             finalName, lat, lon, finalFolder, symbol, finalAffiliation,
                             finalEchelon, finalDesignation, kind, finalRotation,
+                            metadata = metadata,
                         )
                     )
                 }

@@ -4,7 +4,7 @@ An offline-first MGRS land-navigation app for Android. Built for people who are
 taught to navigate with a map, a compass and a pace count, and who want the grid
 in their pocket to agree with the one on the sheet.
 
-**Status: 0.9.30 release candidate** — in closed testing on Google Play. 1.0 is the store launch.
+**Status: 0.9.31 release candidate** — earlier builds are in closed testing on Google Play. 1.0 is the store launch.
 
 Package `app.gridfix.android` · repository `gridfix` (the original working name;
 the product is **MGRS GPS** everywhere a user can see it).
@@ -22,6 +22,8 @@ the product is **MGRS GPS** everywhere a user can see it).
   ruler, elevation, line of sight, viewshed and contour lines.
 - **Waypoints** — folders that toggle on and off as one overlay, tracks, routes,
   route cards, practice courses, GPX / KML / ATAK import and export, backups.
+  MilGPS GPX imports retain marker color, shape/character, elevation and recording
+  time through storage, backup and GPX export. Marker colors do not set affiliation.
 - **Field tools** — resection and intersection, sun and moon times, declination
   diagram, pace count, strip-map PDFs.
 

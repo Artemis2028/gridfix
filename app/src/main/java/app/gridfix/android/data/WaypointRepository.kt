@@ -68,6 +68,7 @@ data class Waypoint(
      * backup written before 0.9.26 reads back visible.
      */
     val visible: Boolean = true,
+    val metadata: WaypointMetadata = WaypointMetadata(),
 )
 
 const val KIND_WP = "wp"
@@ -85,6 +86,8 @@ data class WaypointDraft(
     val designation: String = "",
     val kind: String = KIND_WP,
     val rotation: Float = 0f,
+    /** Null on ordinary edits means retain the existing interchange metadata. */
+    val metadata: WaypointMetadata? = null,
 )
 
 /** A waypoint folder ("overlay"): can exist empty, and can be toggled visible/hidden. */
@@ -194,6 +197,7 @@ class WaypointRepository(private val context: Context) {
                 designation = draft.designation,
                 kind = draft.kind,
                 rotation = draft.rotation,
+                metadata = draft.metadata ?: WaypointMetadata(),
             )
             p[listKey] = encode(current + wp)
             p[foldersKey] = encodeFolders(
@@ -230,6 +234,7 @@ class WaypointRepository(private val context: Context) {
                     designation = draft.designation,
                     kind = draft.kind,
                     rotation = draft.rotation,
+                    metadata = draft.metadata ?: WaypointMetadata(),
                 )
             }
             p[listKey] = encode(current + added)
@@ -280,6 +285,7 @@ class WaypointRepository(private val context: Context) {
                         designation = draft.designation,
                         kind = draft.kind,
                         rotation = draft.rotation,
+                        metadata = draft.metadata ?: it.metadata,
                     ) else it
                 }
             )
@@ -365,6 +371,7 @@ class WaypointRepository(private val context: Context) {
                         ),
                         rotation = o.optDouble("rotation", 0.0).toFloat(),
                         visible = o.optBoolean("visible", true),
+                        metadata = WaypointMetadata.fromJson(o.optJSONObject("metadata")),
                     )
                 }.getOrNull()?.let { add(it) }
             }
@@ -428,6 +435,7 @@ class WaypointRepository(private val context: Context) {
                     .put("kind", w.kind)
                     .put("rotation", w.rotation.toDouble())
                     .put("visible", w.visible)
+                    .put("metadata", w.metadata.toJson())
             )
         }
         return arr.toString()

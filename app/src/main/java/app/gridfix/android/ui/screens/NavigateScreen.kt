@@ -395,6 +395,7 @@ private fun TargetSelector(
                     size = 32.dp,
                     echelon = target?.echelon ?: "",
                     night = settings.nightMode,
+                    metadata = target?.metadata ?: app.gridfix.android.data.WaypointMetadata(),
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(target?.name ?: "Select target", style = MaterialTheme.typography.titleLarge, maxLines = 1)
@@ -405,7 +406,7 @@ private fun TargetSelector(
                     DropdownMenuItem(
                         text = { Text(w.name) },
                         leadingIcon = {
-                            WaypointMarker(symbol = w.symbol, affiliation = w.affiliation, size = 26.dp, echelon = w.echelon, night = settings.nightMode)
+                            WaypointMarker(symbol = w.symbol, affiliation = w.affiliation, size = 26.dp, echelon = w.echelon, night = settings.nightMode, metadata = w.metadata)
                         },
                         onClick = {
                             onSelect(w.id)

@@ -3,6 +3,7 @@ package app.gridfix.android.data
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.InputStream
+import java.math.BigDecimal
 import java.time.OffsetDateTime
 import java.time.Instant
 import java.time.format.DateTimeFormatter
@@ -16,6 +17,10 @@ import java.util.zip.ZipInputStream
  * no external dependencies.
  */
 object InterchangeFiles {
+    private const val GPX_NAMESPACE = "http://www.topografix.com/GPX/1/1"
+    private const val MILGPS_NAMESPACE = "https://milgps.com/gpx/v1"
+    private fun isGpxNamespace(namespace: String?): Boolean = namespace.isNullOrEmpty() ||
+        namespace == GPX_NAMESPACE || namespace == "http://www.topografix.com/GPX/1/0"
 
     /**
      * A coordinate attribute as a finite, in-range double, else NaN (rejects "NaN",
@@ -77,6 +82,9 @@ object InterchangeFiles {
         var wptLat = 0.0
         var wptLon = 0.0
         var inWpt = false
+        var wptDepth = -1
+        var wptExtensionsDepth = -1
+        var metadata = WaypointMetadata()
         var name = ""
         var trkName = ""
         var trkPts = ArrayList<TrackPoint>()
@@ -87,6 +95,7 @@ object InterchangeFiles {
         var rtePts = ArrayList<GeoVertex>()
         var inRte = false
         var pendingPoint: TrackPoint? = null
+        var pointDepth = -1
         var textBuf = ""
 
         fun finishSegment() {
@@ -99,12 +108,19 @@ object InterchangeFiles {
             when (event) {
                 XmlPullParser.START_TAG -> {
                     textBuf = ""
-                    when (parser.name) {
-                        "wpt" -> {
+                    val isGpx = isGpxNamespace(parser.namespace)
+                    when (if (isGpx) parser.name else "") {
+                        "wpt" -> if (parser.depth == 2) {
                             inWpt = true
+                            wptDepth = parser.depth
+                            wptExtensionsDepth = -1
+                            metadata = WaypointMetadata()
                             name = ""
                             wptLat = coord(parser.getAttributeValue(null, "lat"), 90.0)
                             wptLon = coord(parser.getAttributeValue(null, "lon"), 180.0)
+                        }
+                        "extensions" -> if (inWpt && parser.depth == wptDepth + 1) {
+                            wptExtensionsDepth = parser.depth
                         }
                         "trk" -> {
                             inTrk = true
@@ -120,6 +136,7 @@ object InterchangeFiles {
                             rtePts = ArrayList()
                         }
                         "trkpt" -> {
+                            pointDepth = parser.depth
                             val lat = coord(parser.getAttributeValue(null, "lat"), 90.0)
                             val lon = coord(parser.getAttributeValue(null, "lon"), 180.0)
                             pendingPoint = if (lat.isFinite() && lon.isFinite() && inTrk)
@@ -136,23 +153,38 @@ object InterchangeFiles {
                 }
                 XmlPullParser.TEXT -> textBuf += parser.text ?: ""
                 XmlPullParser.END_TAG -> {
-                    when (parser.name) {
+                    val isGpx = isGpxNamespace(parser.namespace)
+                    if (inWpt && wptExtensionsDepth == wptDepth + 1 &&
+                        parser.depth == wptExtensionsDepth + 1 && parser.namespace == MILGPS_NAMESPACE
+                    ) {
+                        when (parser.name) {
+                            "color" -> metadata = metadata.copy(color = textBuf.trim().lowercase(Locale.ROOT).ifBlank { null })
+                            "symbolcode" -> metadata = metadata.copy(milgpsSymbolCode = textBuf.trim().toIntOrNull())
+                        }
+                    }
+                    when (if (isGpx) parser.name else "") {
                         "name" -> {
                             val t = textBuf.trim()
-                            if (inWpt && name.isEmpty()) name = t
+                            if (inWpt && parser.depth == wptDepth + 1 && name.isEmpty()) name = t
                             else if (inTrk && parser.depth == trkDepth + 1 && trkName.isEmpty()) trkName = t
                             else if (inRte && rteName.isEmpty()) rteName = t
                         }
-                        "ele" -> pendingPoint = pendingPoint?.copy(
-                            alt = textBuf.trim().toDoubleOrNull()?.takeIf { it.isFinite() } ?: NO_ALTITUDE,
-                        )
-                        "time" -> pendingPoint = pendingPoint?.copy(time = parseIsoTime(textBuf.trim()))
+                        "ele" -> {
+                            val altitude = textBuf.trim().toDoubleOrNull()?.takeIf { it.isFinite() }
+                            if (inWpt && parser.depth == wptDepth + 1) metadata = metadata.copy(elevationMeters = altitude)
+                            else if (parser.depth == pointDepth + 1) pendingPoint = pendingPoint?.copy(alt = altitude ?: NO_ALTITUDE)
+                        }
+                        "time" -> {
+                            if (inWpt && parser.depth == wptDepth + 1) metadata = metadata.copy(timestampMillis = parseIsoTimeOrNull(textBuf.trim()))
+                            else if (parser.depth == pointDepth + 1) pendingPoint = pendingPoint?.copy(time = parseIsoTime(textBuf.trim()))
+                        }
+                        "extensions" -> if (parser.depth == wptExtensionsDepth) wptExtensionsDepth = -1
                         "trkpt" -> {
                             pendingPoint?.let { trkPts.add(it) }
                             pendingPoint = null
                         }
                         "trkseg" -> if (inTrk) finishSegment()
-                        "wpt" -> {
+                        "wpt" -> if (parser.depth == wptDepth) {
                             if (inWpt && !wptLat.isNaN() && !wptLon.isNaN()) {
                                 wps.add(
                                     WaypointDraft(
@@ -162,10 +194,13 @@ object InterchangeFiles {
                                         folder = IMPORT_FOLDER,
                                         symbol = "flag",
                                         affiliation = "none",
+                                        metadata = metadata,
                                     )
                                 )
                             }
                             inWpt = false
+                            wptDepth = -1
+                            wptExtensionsDepth = -1
                         }
                         "trk" -> {
                             if (inTrk) {
@@ -205,14 +240,26 @@ object InterchangeFiles {
     ): String {
         val sb = StringBuilder()
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-        sb.append("<gpx version=\"1.1\" creator=\"MGRS GPS\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n")
+        sb.append("<gpx version=\"1.1\" creator=\"MGRS GPS\" xmlns=\"$GPX_NAMESPACE\" xmlns:milgps=\"$MILGPS_NAMESPACE\">\n")
         for (w in waypoints) {
             sb.append(
                 String.format(
-                    Locale.US, "  <wpt lat=\"%.7f\" lon=\"%.7f\"><name>%s</name></wpt>\n",
-                    w.lat, w.lon, escapeXml(w.name),
+                    Locale.US, "  <wpt lat=\"%.7f\" lon=\"%.7f\">", w.lat, w.lon,
                 )
             )
+            val m = w.metadata
+            m.elevationMeters?.takeIf { it.isFinite() }?.let {
+                sb.append("<ele>").append(BigDecimal.valueOf(it).toPlainString()).append("</ele>")
+            }
+            m.timestampMillis?.let { sb.append("<time>${Instant.ofEpochMilli(it)}</time>") }
+            sb.append("<name>").append(escapeXml(w.name)).append("</name>")
+            if (m.color != null || m.milgpsSymbolCode != null) {
+                sb.append("<extensions>")
+                m.milgpsSymbolCode?.let { sb.append("<milgps:symbolcode>$it</milgps:symbolcode>") }
+                m.color?.let { sb.append("<milgps:color>").append(escapeXml(it)).append("</milgps:color>") }
+                sb.append("</extensions>")
+            }
+            sb.append("</wpt>\n")
         }
         for (r in routes) {
             sb.append("  <rte><name>").append(escapeXml(r.name)).append("</name>\n")
@@ -447,9 +494,11 @@ object InterchangeFiles {
 
     // ---------------- helpers ----------------
 
-    private fun parseIsoTime(text: String): Long = runCatching {
+    private fun parseIsoTimeOrNull(text: String): Long? = runCatching {
         OffsetDateTime.parse(text, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant().toEpochMilli()
-    }.getOrDefault(0L)
+    }.getOrNull()
+
+    private fun parseIsoTime(text: String): Long = parseIsoTimeOrNull(text) ?: 0L
 
     private fun newParser(): XmlPullParser = XmlPullParserFactory.newInstance().apply {
         isNamespaceAware = true

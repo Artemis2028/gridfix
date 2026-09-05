@@ -48,6 +48,7 @@ object Backup {
                     .put("echelon", w.echelon).put("designation", w.designation)
                     .put("kind", w.kind).put("rotation", w.rotation.toDouble())
                     .put("visible", w.visible)
+                    .put("metadata", w.metadata.toJson())
             )
         })
         root.put("folders", JSONArray().also { a ->
@@ -252,6 +253,7 @@ object Backup {
                         kind = o.optString("kind", KIND_WP),
                         rotation = o.optDouble("rotation", 0.0).toFloat(),
                         visible = o.optBoolean("visible", true),
+                        metadata = WaypointMetadata.fromJson(o.optJSONObject("metadata")),
                     )
                 )
             }

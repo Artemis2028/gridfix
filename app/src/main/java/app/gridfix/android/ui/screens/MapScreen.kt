@@ -810,6 +810,7 @@ fun MapScreen(
                                     echelon = w.echelon,
                                     night = settings.nightMode,
                                     rotation = w.rotation,
+                                    metadata = w.metadata,
                                 )
                             }
                             if (showNames) {
@@ -2203,7 +2204,7 @@ fun MapScreen(
             onDismissRequest = { infoWp = null },
             title = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    WaypointMarker(symbol = w.symbol, affiliation = w.affiliation, size = 30.dp, echelon = w.echelon, night = settings.nightMode, rotation = w.rotation)
+                    WaypointMarker(symbol = w.symbol, affiliation = w.affiliation, size = 30.dp, echelon = w.echelon, night = settings.nightMode, rotation = w.rotation, metadata = w.metadata)
                     Spacer(Modifier.width(10.dp))
                     Text(w.name)
                 }
@@ -2228,6 +2229,7 @@ fun MapScreen(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    app.gridfix.android.ui.WaypointMetadataText(w.metadata)
                     if (loc != null) {
                         val nav = Coordinates.navInfo(loc.latitude, loc.longitude, w.lat, w.lon)
                         Text(
