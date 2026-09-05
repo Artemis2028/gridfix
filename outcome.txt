@@ -1,0 +1,10 @@
+outcome=success
+build=success
+tests=success
+release=success
+publish=success
+run=68
+sha=40d5900431c4d95b43a98976308a78fad16b27d9
+trigger_sha=217dc4a0c19916df7281833965af1cb90459c71b
+aab_mapping=46545640
+finished=2026-09-05T16:27:40Z
