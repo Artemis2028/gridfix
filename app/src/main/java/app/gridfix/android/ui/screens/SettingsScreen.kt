@@ -266,8 +266,9 @@ fun SettingsScreen(
                 "Elevation data: Terrarium tiles via AWS Open Data (Mapzen) — " +
                 "SRTM, USGS 3DEP/NED, GMTED2010, ETOPO1.\n" +
                 "Fonts: Saira Semi Condensed, Fira Mono, Antonio (SIL Open Font License).\n\n" +
-                "Map data: OpenStreetMap contributors (ODbL), OpenTopoMap (CC-BY-SA), " +
-                "USGS, MapTiler.\n" +
+                "Basemaps: Powered by Esri — © Esri, TomTom, Garmin, Maxar, Earthstar Geographics, " +
+                "NASA, USGS, © OpenStreetMap contributors (ODbL); used under the ArcGIS Location " +
+                "Platform agreement. USGS Topo and USGS Imagery: USGS The National Map (public domain).\n" +
                 "Map engine: osmdroid; QR codes: ZXing (Apache 2.0).\n\n" +
                 "MGRS GPS is a training and recreation aid, not a primary means of navigation.",
             style = MaterialTheme.typography.bodySmall,

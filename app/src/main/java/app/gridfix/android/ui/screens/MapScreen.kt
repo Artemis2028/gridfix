@@ -1504,7 +1504,8 @@ fun MapScreen(
                         Text(
                             "Offline: this basemap's terms allow the browse cache only — " +
                                 "pan the area at the zooms you need and it stays on the phone " +
-                                "(600 MB). Area download is available on USGS Topo.",
+                                "(600 MB). Area download is available on the USGS Topo and " +
+                                "USGS Imagery basemaps.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -1564,7 +1565,9 @@ fun MapScreen(
                         if (tooBig) {
                             "The current view needs about $tiles tiles at zoom $zMin–$zMax, which is too much for one download. Zoom in and try again."
                         } else {
-                            "Save the visible area for offline use at zoom $zMin–$zMax — about $tiles tiles (≈${(tiles * 20) / 1024} MB) from the ${layer.label} basemap. Cached tiles are also kept automatically as you browse."
+                            "Save the visible area for offline use at zoom $zMin–$zMax — about $tiles tiles " +
+                                "(≈${(tiles.toLong() * layer.bytesPerTile) / (1024 * 1024)} MB) from the ${layer.label} basemap. " +
+                                "Downloaded tiles never expire; they are only removed if the 600 MB map cache fills with newer downloads."
                         }
                     )
                 },
@@ -1575,14 +1578,20 @@ fun MapScreen(
                             downloadOpen = false
                             downloadStatus = "Starting download…"
                             try {
+                                // Pin the expiry of everything fetched during the download
+                                // (USGS is public domain, so a ten-year TTL is fine), then
+                                // restore header-driven expiry for ordinary browsing.
+                                MapSetup.pinDownloadExpiry(true)
                                 CacheManager(map).downloadAreaAsyncNoUI(
                                     context, bbox, zMin, zMax,
                                     object : CacheManager.CacheManagerCallback {
                                         override fun onTaskComplete() {
+                                            MapSetup.pinDownloadExpiry(false)
                                             downloadStatus = "Offline area saved"
                                         }
 
                                         override fun onTaskFailed(errors: Int) {
+                                            MapSetup.pinDownloadExpiry(false)
                                             downloadStatus = "Download done, $errors tiles failed"
                                         }
 
@@ -1603,6 +1612,7 @@ fun MapScreen(
                                     },
                                 )
                             } catch (e: Exception) {
+                                MapSetup.pinDownloadExpiry(false)
                                 downloadStatus = "Download failed to start"
                             }
                         },

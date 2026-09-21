@@ -12,10 +12,10 @@ android {
         applicationId = "app.gridfix.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 60
-        versionName = "0.9.32"
-        // MapTiler API key from the CI secret; empty in builds without it (community-tile fallback)
-        buildConfigField("String", "MAPTILER_KEY", "\"" + (System.getenv("MAPTILER_KEY") ?: "") + "\"")
+        versionCode = 61
+        versionName = "1.0.0"
+        // ArcGIS Location Platform API key from the CI secret; empty in builds without it (community-tile fallback)
+        buildConfigField("String", "ESRI_KEY", "\"" + (System.getenv("ESRI_KEY") ?: "") + "\"")
     }
 
     // Play upload key: CI decodes the keystore secret to a file and exports

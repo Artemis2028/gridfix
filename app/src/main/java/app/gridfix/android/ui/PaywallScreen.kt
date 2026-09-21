@@ -131,7 +131,7 @@ fun PaywallScreen(
             Spacer(Modifier.height(22.dp))
 
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Benefit("Offline maps: download USGS topo by area, or bring your own MBTiles")
+                Benefit("Offline maps: download USGS topo or imagery by area, or bring your own MBTiles")
                 Benefit("MGRS grid overlay, 4- to 10-digit, anywhere on earth")
                 Benefit("Terrain: line of sight, viewshed, contours, elevation")
                 Benefit("Tracks, routes, route cards, GPX / KML / ATAK export")

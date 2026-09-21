@@ -20,6 +20,7 @@ data class BaseLayerDescriptor(
     val attribution: String,
     val maxDownloadZoom: Int,
     val bulkDownload: Boolean = false,
+    val bytesPerTile: Int = 20 * 1024,
 )
 
 /** Calibrated image quad: roadmap A (photo-map) and C (GeoTIFF) share this. */
@@ -62,6 +63,7 @@ fun MapSetup.descriptors(): List<BaseLayerDescriptor> =
             attribution = it.attribution,
             maxDownloadZoom = it.maxDownloadZoom,
             bulkDownload = it.bulkDownload,
+            bytesPerTile = it.bytesPerTile,
         )
     }
 

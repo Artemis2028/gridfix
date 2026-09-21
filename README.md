@@ -4,7 +4,7 @@ An offline-first MGRS land-navigation app for Android. Built for people who are
 taught to navigate with a map, a compass and a pace count, and who want the grid
 in their pocket to agree with the one on the sheet.
 
-**Status: 0.9.31 release candidate** — earlier builds are in closed testing on Google Play. 1.0 is the store launch.
+**Status: 1.0.0** — the Google Play launch build. Closed testing and the production-access review are complete.
 
 Package `app.gridfix.android` · repository `gridfix` (the original working name;
 the product is **MGRS GPS** everywhere a user can see it).
@@ -17,9 +17,10 @@ the product is **MGRS GPS** everywhere a user can see it).
   NETWORK) with the finest MGRS precision that fix actually supports.
 - **Navigate** — azimuth, back azimuth, distance and time to a waypoint, with an
   eyes-free haptic guide and an arrival buzz.
-- **Map** — MGRS grid overlay down to 10 m, offline basemaps (browse cache, USGS
-  area download, or your own MBTiles), NATO symbols, tactical control measures,
-  ruler, elevation, line of sight, viewshed and contour lines.
+- **Map** — MGRS grid overlay down to 10 m, Esri streets / topographic / satellite
+  / hillshade basemaps, USGS topo and NAIP imagery over the US, offline basemaps
+  (browse cache, USGS area download, or your own MBTiles), NATO symbols, tactical
+  control measures, ruler, elevation, line of sight, viewshed and contour lines.
 - **Waypoints** — folders that toggle on and off as one overlay, tracks, routes,
   route cards, practice courses, GPX / KML / ATAK import and export, backups.
   MilGPS GPX imports retain marker color, shape/character, elevation and recording
@@ -43,10 +44,12 @@ elevation data vary by country, and contours are modelled rather than surveyed.
 
 JDK 17. The Android SDK comes from `ANDROID_HOME` or `local.properties`.
 
-Map tiles fall back to community sources when no key is present. To build with
-MapTiler basemaps, set `MAPTILER_KEY` in the environment before building; the
-key is compiled into `BuildConfig` and should be restricted by package name and
-signing certificate in the MapTiler dashboard, since anything in an APK is public.
+Map tiles fall back to community sources in debug builds when no key is present.
+To build with the Esri basemaps, set `ESRI_KEY` (an ArcGIS Location Platform API
+key with only the Basemaps privileges) in the environment before building. The
+key is compiled into `BuildConfig`; anything in an APK is public, so keep the key's
+privileges minimal and watch its usage in the ArcGIS dashboard. A release build
+without the key offers the public-domain USGS layers only.
 
 Release builds are minified by R8 and need signing config in the environment
 (`GRIDFIX_KS`, `GRIDFIX_KS_PASS`). CI publishes `mapping.txt` with every build so
@@ -72,8 +75,10 @@ records which payload has landed). Edit the Kotlin in git, not in the workflow.
 ## Third-party
 
 MGRS conversion by the NGA MGRS library (MIT). Map engine osmdroid (Apache 2.0).
-QR codes by ZXing (Apache 2.0). Map data © OpenStreetMap contributors (ODbL),
-OpenTopoMap (CC-BY-SA), USGS, MapTiler. Elevation from Terrarium tiles via AWS
+QR codes by ZXing (Apache 2.0). Basemaps powered by Esri — © Esri, TomTom, Garmin,
+Maxar, Earthstar Geographics, NASA, USGS, © OpenStreetMap contributors (ODbL) — used
+under the ArcGIS Location Platform agreement. USGS Topo and USGS Imagery from USGS
+The National Map (public domain). Elevation from Terrarium tiles via AWS
 Open Data (SRTM, USGS 3DEP/NED, GMTED2010, ETOPO1). Fonts: Saira Semi Condensed,
 Fira Mono and Antonio (SIL Open Font License).
 

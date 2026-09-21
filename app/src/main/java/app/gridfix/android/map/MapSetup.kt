@@ -25,6 +25,8 @@ data class BaseLayer(
      * public-domain USGS does; the others allow the ordinary browse cache only.
      */
     val bulkDownload: Boolean = false,
+    /** Typical compressed tile size, for the download-size estimate only. */
+    val bytesPerTile: Int = 20 * 1024,
 )
 
 object MapSetup {
@@ -45,150 +47,168 @@ object MapSetup {
             userAgentValue = AppInfo.userAgent(BuildConfig.VERSION_NAME)
             tileFileSystemCacheMaxBytes = 600L * 1024 * 1024
             tileFileSystemCacheTrimBytes = 500L * 1024 * 1024
-            // Keep serving cached tiles long after their nominal expiry — offline-first.
-            expirationExtendedDuration = 30L * 24 * 60 * 60 * 1000
+            // The browse cache honours each provider's own Cache-Control header
+            // (Esri's Location Platform terms, 3.1(d)(6)(A), allow caching only
+            // "as permitted by the caching headers"). osmdroid still draws an
+            // expired tile while offline; it only asks the server again once it can.
+            // Deliberate USGS area downloads are pinned with [pinDownloadExpiry].
+            expirationExtendedDuration = 0L
+            expirationOverrideDuration = null
         }
     }
 
-    private val esriWorldImagery = object : OnlineTileSourceBase(
-        "EsriWorldImagery",
-        0,
-        19,
-        256,
-        "",
-        arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/"),
-        "Esri, Maxar, Earthstar Geographics",
-    ) {
+    /**
+     * Ten years. Applied for the duration of a USGS area download so those tiles
+     * never expire and are the last thing the cache trim would evict (it deletes
+     * in expiry order). Only public-domain layers are bulk-downloadable, so no
+     * commercial tile is ever pinned this way.
+     */
+    private const val DOWNLOAD_TTL_MS = 10L * 365 * 24 * 60 * 60 * 1000
+
+    fun pinDownloadExpiry(on: Boolean) {
+        Configuration.getInstance().expirationOverrideDuration = if (on) DOWNLOAD_TTL_MS else null
+    }
+
+    /** {z}/{y}/{x} ArcGIS tile scheme, optionally with a `?token=` suffix. */
+    private fun arcgisSource(
+        name: String,
+        base: String,
+        maxZoom: Int,
+        tileSize: Int,
+        attribution: String,
+        token: String = "",
+    ) = object : OnlineTileSourceBase(name, 0, maxZoom, tileSize, "", arrayOf(base), attribution) {
         override fun getTileURLString(pMapTileIndex: Long): String =
             baseUrl +
                 MapTileIndex.getZoom(pMapTileIndex) + "/" +
                 MapTileIndex.getY(pMapTileIndex) + "/" +
-                MapTileIndex.getX(pMapTileIndex)
+                MapTileIndex.getX(pMapTileIndex) +
+                (if (token.isEmpty()) "" else "?token=$token")
     }
 
-    private val usgsTopo = object : OnlineTileSourceBase(
+    // ---- USGS The National Map (public domain; the only layers offered for area download) ----
+
+    private const val USGS_ATTR = "USGS The National Map"
+
+    private val usgsTopo = arcgisSource(
         "USGSTopo",
-        0,
-        16,
-        256,
-        "",
-        arrayOf("https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/"),
-        "USGS The National Map",
-    ) {
-        override fun getTileURLString(pMapTileIndex: Long): String =
-            baseUrl +
-                MapTileIndex.getZoom(pMapTileIndex) + "/" +
-                MapTileIndex.getY(pMapTileIndex) + "/" +
-                MapTileIndex.getX(pMapTileIndex)
+        "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/",
+        16, 256, USGS_ATTR,
+    )
+
+    /** NAIP orthoimagery over the US, served to zoom 16 (~2.4 m/px). */
+    private val usgsImagery = arcgisSource(
+        "USGSImagery",
+        "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/",
+        16, 256, USGS_ATTR,
+    )
+
+    // ---- Esri ArcGIS Location Platform (keyed; the key is injected at build time from a CI secret) ----
+    //
+    // Terms: ArcGIS Location Platform Agreement (E204, Nov 2025). Revenue-generating
+    // apps are permitted (3.1(c)(1)); an attribution statement naming Esri and its
+    // licensors must be affixed to basemap output (3.1(d)(4)); caching only as the
+    // HTTP headers allow (3.1(d)(6)(A)) — see [init]. Static basemap tiles are 512 px;
+    // osmdroid normalises the on-screen size when tiles are scaled to DPI.
+
+    private const val ESRI_STATIC =
+        "https://static-map-tiles-api.arcgis.com/arcgis/rest/services/static-basemap-tiles-service/v1/"
+    private const val ESRI_IMAGE = "https://ibasemaps-api.arcgis.com/arcgis/rest/services/"
+    private const val ESRI_STREETS_ATTR = "Powered by Esri · © Esri, TomTom, Garmin, OpenStreetMap contributors"
+    private const val ESRI_IMAGERY_ATTR = "Powered by Esri · Esri, Maxar, Earthstar Geographics"
+    private const val ESRI_HILLSHADE_ATTR = "Powered by Esri · Esri, USGS, NASA"
+
+    /** True on builds made with the ESRI_KEY secret present. */
+    val hasEsri: Boolean get() = BuildConfig.ESRI_KEY.isNotBlank()
+
+    private val esriStreets by lazy {
+        arcgisSource("EsriStreets", ESRI_STATIC + "arcgis/streets/static/tile/", 22, 512, ESRI_STREETS_ATTR, BuildConfig.ESRI_KEY)
+    }
+    private val esriOutdoor by lazy {
+        arcgisSource("EsriOutdoor", ESRI_STATIC + "arcgis/outdoor/static/tile/", 22, 512, ESRI_STREETS_ATTR, BuildConfig.ESRI_KEY)
+    }
+    private val esriImagery by lazy {
+        arcgisSource("EsriWorldImagery", ESRI_IMAGE + "World_Imagery/MapServer/tile/", 19, 256, ESRI_IMAGERY_ATTR, BuildConfig.ESRI_KEY)
+    }
+    private val esriHillshade by lazy {
+        arcgisSource("EsriHillshade", ESRI_IMAGE + "Elevation/World_Hillshade/MapServer/tile/", 16, 256, ESRI_HILLSHADE_ATTR, BuildConfig.ESRI_KEY)
     }
 
-    private val esriHillshade = object : OnlineTileSourceBase(
+    // ---- Community fallback (DEBUG builds without the key only) ----
+
+    private val communityImagery = arcgisSource(
+        "EsriWorldImagery",
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/",
+        19, 256, "Esri, Maxar, Earthstar Geographics",
+    )
+    private val communityHillshade = arcgisSource(
         "EsriHillshade",
-        0,
-        16,
-        256,
-        "",
-        arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/"),
-        "Esri, USGS, NASA",
-    ) {
-        override fun getTileURLString(pMapTileIndex: Long): String =
-            baseUrl +
-                MapTileIndex.getZoom(pMapTileIndex) + "/" +
-                MapTileIndex.getY(pMapTileIndex) + "/" +
-                MapTileIndex.getX(pMapTileIndex)
-    }
+        "https://server.arcgisonline.com/ArcGIS/rest/services/Elevation/World_Hillshade/MapServer/tile/",
+        16, 256, "Esri, USGS, NASA",
+    )
 
-    // ---- MapTiler (keyed provider; the key is injected at build time from a CI secret) ----
-
-    private const val MT_ATTR = "© MapTiler © OpenStreetMap contributors"
-
-    /** True on builds made with the MAPTILER_KEY secret present. */
-    val hasMapTiler: Boolean get() = BuildConfig.MAPTILER_KEY.isNotBlank()
-
-    private fun mapTilerStyle(name: String, styleId: String, maxZoom: Int) = object : OnlineTileSourceBase(
-        name,
-        0,
-        maxZoom,
-        256,
-        ".png",
-        arrayOf("https://api.maptiler.com/maps/" + styleId + "/256/"),
-        MT_ATTR,
-    ) {
-        override fun getTileURLString(pMapTileIndex: Long): String =
-            baseUrl +
-                MapTileIndex.getZoom(pMapTileIndex) + "/" +
-                MapTileIndex.getX(pMapTileIndex) + "/" +
-                MapTileIndex.getY(pMapTileIndex) + ".png?key=" + BuildConfig.MAPTILER_KEY
-    }
-
-    private val mapTilerStreets by lazy { mapTilerStyle("MapTilerStreets", "streets-v2", 20) }
-    private val mapTilerTopo by lazy { mapTilerStyle("MapTilerTopo", "topo-v2", 20) }
-
-    private val mapTilerSatellite = object : OnlineTileSourceBase(
-        "MapTilerSatellite",
-        0,
-        20,
-        256,
-        ".jpg",
-        arrayOf("https://api.maptiler.com/tiles/satellite-v2/"),
-        "© MapTiler",
-    ) {
-        override fun getTileURLString(pMapTileIndex: Long): String =
-            baseUrl +
-                MapTileIndex.getZoom(pMapTileIndex) + "/" +
-                MapTileIndex.getX(pMapTileIndex) + "/" +
-                MapTileIndex.getY(pMapTileIndex) + ".jpg?key=" + BuildConfig.MAPTILER_KEY
-    }
+    private val usgsLayers = listOf(
+        BaseLayer(
+            key = "usgs",
+            label = "USGS Topo (US only)",
+            source = usgsTopo,
+            attribution = USGS_ATTR,
+            maxDownloadZoom = 15,
+            bulkDownload = true,
+            bytesPerTile = 32 * 1024,
+        ),
+        BaseLayer(
+            key = "usgs_img",
+            label = "USGS Imagery (US only)",
+            source = usgsImagery,
+            attribution = USGS_ATTR,
+            maxDownloadZoom = 16,
+            bulkDownload = true,
+            bytesPerTile = 24 * 1024,
+        ),
+    )
 
     /**
-     * Base layers. With a MapTiler key (every store build) the Streets, Topo and
-     * Satellite layers come from MapTiler under its commercial terms; without one
-     * (a developer build missing the secret) the app falls back to the public
-     * community servers so the map still works.
+     * Base layers. With an Esri key (every store build) Streets, Topographic,
+     * Satellite and Hillshade come from ArcGIS Location Platform under its
+     * agreement; the two USGS layers are public domain and are the only ones
+     * offered for area download. Without a key (a developer build missing the
+     * secret) the app falls back to the public community servers so the map
+     * still works.
      *
      * That fallback is DEBUG-ONLY. The OpenStreetMap Foundation's tile servers are
      * a volunteer-funded resource with a usage policy that a paid app has no
-     * business leaning on, and the same goes for the community ArcGIS endpoints.
-     * A release build that somehow shipped without a key gets USGS topo, which is
-     * public domain and is also the only layer we offer for area download.
+     * business leaning on, and the same goes for the unkeyed ArcGIS endpoints.
+     * A release build that somehow shipped without a key gets the USGS layers only.
      */
-    private val allLayers: List<BaseLayer> = if (hasMapTiler) listOf(
+    private val allLayers: List<BaseLayer> = if (hasEsri) listOf(
         BaseLayer(
             key = "streets",
             label = "Streets",
-            source = mapTilerStreets,
-            attribution = MT_ATTR,
+            source = esriStreets,
+            attribution = ESRI_STREETS_ATTR,
             maxDownloadZoom = 16,
         ),
         BaseLayer(
             key = "topo",
             label = "Topographic",
-            source = mapTilerTopo,
-            attribution = MT_ATTR,
+            source = esriOutdoor,
+            attribution = ESRI_STREETS_ATTR,
             maxDownloadZoom = 15,
         ),
         BaseLayer(
             key = "sat",
             label = "Satellite",
-            source = mapTilerSatellite,
-            attribution = "© MapTiler",
+            source = esriImagery,
+            attribution = ESRI_IMAGERY_ATTR,
             maxDownloadZoom = 17,
         ),
-        BaseLayer(
-            key = "usgs",
-            label = "USGS Topo (US only)",
-            source = usgsTopo,
-            attribution = "USGS The National Map",
-            maxDownloadZoom = 15,
-            bulkDownload = true,
-        ),
-        BaseLayer(
-            key = "hillshade",
-            label = "Hillshade",
-            source = esriHillshade,
-            attribution = "Esri, USGS, NASA",
-            maxDownloadZoom = 14,
-        ),
+    ) + usgsLayers + BaseLayer(
+        key = "hillshade",
+        label = "Hillshade",
+        source = esriHillshade,
+        attribution = ESRI_HILLSHADE_ATTR,
+        maxDownloadZoom = 14,
     ) else listOf(
         BaseLayer(
             key = "streets",
@@ -207,33 +227,24 @@ object MapSetup {
         BaseLayer(
             key = "sat",
             label = "Satellite",
-            source = esriWorldImagery,
+            source = communityImagery,
             attribution = "Esri, Maxar, Earthstar Geographics",
             maxDownloadZoom = 17,
         ),
-        BaseLayer(
-            key = "usgs",
-            label = "USGS Topo (US only)",
-            source = usgsTopo,
-            attribution = "USGS The National Map",
-            maxDownloadZoom = 15,
-            bulkDownload = true,
-        ),
-        BaseLayer(
-            key = "hillshade",
-            label = "Hillshade",
-            source = esriHillshade,
-            attribution = "Esri, USGS, NASA",
-            maxDownloadZoom = 14,
-        ),
+    ) + usgsLayers + BaseLayer(
+        key = "hillshade",
+        label = "Hillshade",
+        source = communityHillshade,
+        attribution = "Esri, USGS, NASA",
+        maxDownloadZoom = 14,
     )
 
     /**
-     * The layers the app actually offers. In a release build with no MapTiler key
-     * that is USGS topo alone rather than the community servers.
+     * The layers the app actually offers. In a release build with no Esri key
+     * that is the USGS layers alone rather than the community servers.
      */
     val baseLayers: List<BaseLayer> =
-        if (hasMapTiler || BuildConfig.DEBUG) allLayers
+        if (hasEsri || BuildConfig.DEBUG) allLayers
         else allLayers.filter { it.bulkDownload }.ifEmpty { allLayers.take(1) }
 
     fun layerFor(key: String): BaseLayer =
@@ -244,7 +255,7 @@ object MapSetup {
         File(context.filesDir, "mbtiles").apply { mkdirs() }
 
     /** The hillshade tile source, reused by the hybrid shadow overlay. */
-    val hillshadeSource: ITileSource get() = esriHillshade
+    val hillshadeSource: ITileSource get() = if (hasEsri) esriHillshade else communityHillshade
 
     /**
      * Hybrid-terrain blend: hillshade tiles become shadow-only — white turns
