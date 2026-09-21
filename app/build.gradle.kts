@@ -12,8 +12,8 @@ android {
         applicationId = "app.gridfix.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 63
-        versionName = "1.0.2"
+        versionCode = 64
+        versionName = "1.0.3"
         // ArcGIS Location Platform API key from the CI secret; empty in builds without it (community-tile fallback)
         buildConfigField("String", "ESRI_KEY", "\"" + (System.getenv("ESRI_KEY") ?: "") + "\"")
     }

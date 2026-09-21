@@ -102,6 +102,7 @@ import app.gridfix.android.billing.BillingManager
 import app.gridfix.android.data.AppSettings
 import app.gridfix.android.data.Backup
 import app.gridfix.android.data.CourseRepository
+import app.gridfix.android.data.CourseNavigationPolicy
 import app.gridfix.android.data.NavigationTarget
 import app.gridfix.android.data.CourseResult
 import app.gridfix.android.data.DataPackage
@@ -110,6 +111,7 @@ import app.gridfix.android.data.GeoVertex
 import app.gridfix.android.data.GraphicsRepository
 import app.gridfix.android.data.simplifyTrackToBudget
 import app.gridfix.android.data.InterchangeFiles
+import app.gridfix.android.data.ImportCoordinator
 import app.gridfix.android.data.KIND_UNIT
 import app.gridfix.android.data.SettingsRepository
 import app.gridfix.android.data.TrackRepository
@@ -120,6 +122,7 @@ import app.gridfix.android.location.TrackRecorderService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
@@ -211,7 +214,6 @@ fun GridFixApp() {
     val courseHistory by courseRepo.history.collectAsStateWithLifecycle(initialValue = emptyList())
     var courseOpen by remember { mutableStateOf(false) }
     var courseSummary by remember { mutableStateOf<CourseResult?>(null) }
-    var summaryPending by remember { mutableStateOf(false) }
 
     // Automatic names: "Armor Brigade 1" for units, "Support by fire 1" for task symbols
     val unitNameFor: (String, String) -> String = { symbol, echelon ->
@@ -235,6 +237,7 @@ fun GridFixApp() {
     // to that point, never to whichever visible one happens to come first.
     val navigableWaypoints = NavigationTarget.navigable(waypoints, folders, selectedId)
     val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
     val navigationSelections = remember { java.util.concurrent.atomic.AtomicLong(0L) }
     // Read authoritative flows even when Navigate is not composed or the activity
     // is stopped. Their first emissions must arrive before deciding a target was
@@ -250,19 +253,72 @@ fun GridFixApp() {
             else PocketGuideService.update(context, target, update.declinationOverride, update.expectedTargetId)
         }
     }
-    suspend fun selectNavigationTarget(id: String) {
+    suspend fun selectNavigationTarget(id: String, notifyUser: Boolean = true) {
         val selection = navigationSelections.incrementAndGet()
         val previousGuide = PocketGuideService.active.value
-        waypointRepo.select(id)
+        val saved = waypointRepo.waypoints.first()
+        val course = courseRepo.active.first()
+        val policy = CourseNavigationPolicy.resolve(course, saved.map { it.id }.toSet())
+        if (policy.locked && policy.targetId == null) {
+            if (notifyUser) scope.launch {
+                snackbarHostState.showSnackbar("Course blocked by a missing checkpoint. Restore the checkpoint or end the course.")
+            }
+            return
+        }
+        val resolvedId = if (policy.locked) policy.targetId else id
+        val target = saved.firstOrNull { it.id == resolvedId } ?: return
+        if (selection != navigationSelections.get()) return
+        waypointRepo.select(target.id)
         if (previousGuide != null) {
-            val target = waypointRepo.waypoints.first().firstOrNull { it.id == id } ?: return
             val preferences = repo.settings.first()
+            val latestWaypoints = waypointRepo.waypoints.first()
+            val latestCourse = courseRepo.active.first()
+            val latestPolicy = CourseNavigationPolicy.resolve(latestCourse, latestWaypoints.map { it.id }.toSet())
+            val latestTarget = latestWaypoints.firstOrNull { it.id == target.id } ?: return
             // A slower read for B must not undo a newer selection C. A stopped or
             // explicitly restarted guide is a different run and must be left alone.
             if (selection != navigationSelections.get() ||
-                PocketGuideService.active.value?.runId != previousGuide.runId
+                PocketGuideService.active.value?.runId != previousGuide.runId ||
+                latestCourse?.runId != course?.runId ||
+                (latestPolicy.locked && latestPolicy.targetId != target.id)
             ) return
-            PocketGuideService.update(context, target, preferences.declinationOverride, previousGuide.targetId, retarget = true)
+            PocketGuideService.update(context, latestTarget, preferences.declinationOverride, previousGuide.targetId, retarget = true)
+        }
+        if (notifyUser && policy.locked && id != target.id) {
+            scope.launch {
+                snackbarHostState.showSnackbar("Course navigation is locked to checkpoint ${course!!.nextIndex + 1}. End the course to choose another target.")
+            }
+        }
+    }
+    // Validate stored data, including while the screen is stopped. A guide
+    // started during a stale UI frame must also stop if the course is blocked.
+    LaunchedEffect(waypointRepo, courseRepo) {
+        combine(
+            waypointRepo.waypoints,
+            courseRepo.active,
+            PocketGuideService.active.map { it?.runId to it?.targetId }.distinctUntilChanged(),
+        ) { saved, course, _ -> saved to course }.collect { (saved, course) ->
+            if (course == null) return@collect
+            val validated = courseRepo.validateWaypoints(course.runId, saved.map { it.id }.toSet())
+                ?: return@collect
+            if (validated.done) {
+                if (courseRepo.finish(validated.runId)) {
+                    courseSummary = courseRepo.history.first().firstOrNull {
+                        it.name == validated.name && it.startedAt == validated.startedAt
+                    }
+                }
+            } else if (validated.paused) {
+                val latestCourse = courseRepo.active.first()
+                if (latestCourse?.runId == validated.runId && latestCourse.paused) {
+                    PocketGuideService.active.value?.let { PocketGuideService.stop(context, it.targetId) }
+                }
+            } else {
+                val targetId = validated.waypointIds[validated.nextIndex]
+                val guide = PocketGuideService.active.value
+                if (waypointRepo.selectedId.first() != targetId || (guide != null && guide.targetId != targetId)) {
+                    selectNavigationTarget(targetId, notifyUser = false)
+                }
+            }
         }
     }
     LaunchedEffect(entitlement) {
@@ -280,8 +336,6 @@ fun GridFixApp() {
     // The app had no way to tell the operator that anything had failed. A
     // recording that silently does not start is the worst version of that:
     // the button responds, nothing records, and the patrol is not on the map.
-    val snackbarHostState = remember { SnackbarHostState() }
-
     /**
      * Start recording, and say so when it does not work.
      *
@@ -799,6 +853,12 @@ fun GridFixApp() {
                         waypoints = navigableWaypoints,
                         selectedId = selectedId,
                         onSelect = { id -> scope.launch { selectNavigationTarget(id) } },
+                        courseLocked = activeCourse?.let { !it.done } == true,
+                        coursePaused = activeCourse?.paused == true,
+                        courseNotice = activeCourse?.takeIf { !it.done }?.let { c ->
+                            if (c.paused) "Course blocked — ${c.pauseReason} Restore the missing checkpoint or end the course. Elapsed time continues."
+                            else "Course navigation locked to checkpoint ${c.nextIndex + 1}/${c.waypointIds.size}."
+                        },
                     )
                 }
                 composable("map") {
@@ -863,7 +923,8 @@ fun GridFixApp() {
                         onFocusConsumed = { mapFocus = null },
                         unitNameFor = unitNameFor,
                         courseStatus = activeCourse?.takeIf { !it.done }?.let { c ->
-                            "CP ${c.nextIndex + 1}/${c.waypointIds.size} — course running"
+                            if (c.paused) "Course blocked — ${c.pauseReason}"
+                            else "CP ${c.nextIndex + 1}/${c.waypointIds.size} — course running"
                         },
                         onOpenCourse = { courseOpen = true },
                     )
@@ -1003,23 +1064,21 @@ fun GridFixApp() {
                         unitNameFor = unitNameFor,
                         onImport = { data, onDone ->
                             scope.launch {
-                                runCatching {
-                                    val now = System.currentTimeMillis()
-                                    waypointRepo.addAll(data.waypoints, now)
-                                    for (l in data.lines) {
-                                        val f = waypointRepo.addFolder(l.folder)
-                                        graphicsRepo.add(l.name, "route", l.points, f, "none", now)
+                                try {
+                                    val knownFolders = waypointRepo.folders.first().map { it.name } +
+                                        graphicsRepo.graphics.first().map { it.folder } +
+                                        trackRepo.tracks.first().map { it.folder }
+                                    val plan = withContext(Dispatchers.Default) {
+                                        ImportCoordinator.prepare(data, System.currentTimeMillis(), knownFolders)
                                     }
-                                    for (a in data.areas) {
-                                        val f = waypointRepo.addFolder(a.folder)
-                                        graphicsRepo.add(a.name, "aa", a.points, f, "none", now)
-                                    }
-                                    for (t in data.tracks) {
-                                        trackRepo.importTrack(t.name, t.points, now)
-                                    }
-                                    onDone(data.summary())
-                                }.getOrElse {
-                                    onDone("Import failed — " + (it.message ?: "the file has bad data"))
+                                    val result = ImportCoordinator.persist(
+                                        plan, trackRepo::restoreAll, waypointRepo::restore, graphicsRepo::restore,
+                                    )
+                                    onDone(result.summary())
+                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                    throw cancelled
+                                } catch (failure: Exception) {
+                                    onDone("Import rejected — ${failure.message ?: "the file has bad data"}. Nothing was added.")
                                 }
                             }
                         },
@@ -1143,7 +1202,7 @@ fun GridFixApp() {
                 hasFix = fix.location?.isUsableForNavigation() == true,
                 onStartFolder = { f ->
                     scope.launch {
-                        val ids = waypoints.filter { it.folder == f }.map { it.id }
+                        val ids = waypointRepo.waypoints.first().filter { it.folder == f }.map { it.id }
                         if (ids.size >= 2) {
                             courseRepo.start(f, ids, System.currentTimeMillis())
                             ids.firstOrNull()?.let { selectNavigationTarget(it) }
@@ -1200,7 +1259,7 @@ fun GridFixApp() {
                     }
                 },
                 onAbandon = {
-                    scope.launch { courseRepo.abandon() }
+                    activeCourse?.runId?.let { runId -> scope.launch { courseRepo.abandon(runId) } }
                     courseOpen = false
                 },
                 onDismiss = { courseOpen = false },
@@ -1212,10 +1271,10 @@ fun GridFixApp() {
 
         // Course engine: lock Navigate onto the current point; auto-advance and
         // buzz when the fix closes inside 25 m (accuracy permitting).
-        LaunchedEffect(activeCourse?.nextIndex, activeCourse?.name) {
+        LaunchedEffect(activeCourse?.runId, activeCourse?.nextIndex, activeCourse?.paused, selectedId) {
             val c = activeCourse ?: return@LaunchedEffect
-            if (!c.done) {
-                c.waypointIds.getOrNull(c.nextIndex)?.let { selectNavigationTarget(it) }
+            if (!c.done && !c.paused) {
+                c.waypointIds.getOrNull(c.nextIndex)?.takeIf { it != selectedId }?.let { selectNavigationTarget(it, notifyUser = false) }
             }
         }
         LaunchedEffect(
@@ -1224,31 +1283,27 @@ fun GridFixApp() {
             fix.location?.elapsedRealtimeNanos,
             fix.location?.accuracy,
             activeCourse?.nextIndex,
-            activeCourse?.name,
+            activeCourse?.runId,
+            activeCourse?.paused,
+            waypoints,
         ) {
-            val c = activeCourse ?: return@LaunchedEffect
             val loc = fix.location ?: return@LaunchedEffect
             if (!loc.isUsableForNavigation()) return@LaunchedEffect
-            if (c.done) return@LaunchedEffect
-            val target = waypoints.firstOrNull { it.id == c.waypointIds[c.nextIndex] }
+            val c = courseRepo.active.first() ?: return@LaunchedEffect
+            val saved = waypointRepo.waypoints.first()
+            val validated = courseRepo.validateWaypoints(c.runId, saved.map { it.id }.toSet())
+                ?: return@LaunchedEffect
+            if (validated.done || validated.paused || !loc.isUsableForNavigation()) return@LaunchedEffect
+            val target = saved.firstOrNull { it.id == validated.waypointIds[validated.nextIndex] }
                 ?: return@LaunchedEffect
             val nav = Coordinates.navInfo(loc.latitude, loc.longitude, target.lat, target.lon)
             // "Inside 25 m" has to mean it: the fix's own error must fit inside the ring,
             // and a fix with no accuracy estimate at all cannot score a point.
             val acc = if (loc.hasAccuracy()) loc.accuracy else Float.POSITIVE_INFINITY
             if (nav.distanceMeters + acc < 25f) {
-                courseRepo.markFound(System.currentTimeMillis())
-                buzz(context)
-                if (c.foundAt.size + 1 >= c.waypointIds.size) {
-                    courseRepo.finish()
-                    summaryPending = true
-                }
-            }
-        }
-        LaunchedEffect(courseHistory, summaryPending) {
-            if (summaryPending && courseHistory.isNotEmpty()) {
-                courseSummary = courseHistory.first()
-                summaryPending = false
+                if (courseRepo.markFound(validated.runId, target.id, System.currentTimeMillis())) buzz(context)
+                // The stored-state observer finalizes completion, even if this
+                // effect is cancelled immediately after the score is committed.
             }
         }
     }

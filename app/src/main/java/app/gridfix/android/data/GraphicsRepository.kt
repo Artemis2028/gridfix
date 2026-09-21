@@ -1,6 +1,8 @@
 package app.gridfix.android.data
 
 import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
@@ -132,11 +134,13 @@ object GraphicTypes {
     }
 }
 
-class GraphicsRepository(private val context: Context) {
+class GraphicsRepository internal constructor(private val store: DataStore<Preferences>) {
+
+    constructor(context: Context) : this(context.graphicsStore)
 
     private val listKey = stringPreferencesKey("list")
 
-    val graphics: Flow<List<TacGraphic>> = context.graphicsStore.data.map { p ->
+    val graphics: Flow<List<TacGraphic>> = store.data.map { p ->
         decode(p[listKey] ?: "[]")
     }
 
@@ -159,7 +163,7 @@ class GraphicsRepository(private val context: Context) {
             createdAt = nowMillis,
             echelon = echelon,
         )
-        context.graphicsStore.edit { p ->
+        store.edit { p ->
             p[listKey] = encode(decode(p[listKey] ?: "[]") + g)
         }
         return g.id
@@ -172,7 +176,7 @@ class GraphicsRepository(private val context: Context) {
         affiliation: String,
         echelon: String = "",
     ) {
-        context.graphicsStore.edit { p ->
+        store.edit { p ->
             p[listKey] = encode(
                 decode(p[listKey] ?: "[]").map {
                     if (it.id == id) it.copy(
@@ -189,7 +193,7 @@ class GraphicsRepository(private val context: Context) {
     /** Merge a backup by id — already-present graphics are skipped. Returns added count. */
     suspend fun restore(imported: List<TacGraphic>): Int {
         var added = 0
-        context.graphicsStore.edit { p ->
+        store.edit { p ->
             val current = decode(p[listKey] ?: "[]")
             val ids = current.map { it.id }.toSet()
             val fresh = imported.filter { it.id !in ids }
@@ -201,7 +205,7 @@ class GraphicsRepository(private val context: Context) {
 
     /** Replace a graphic's vertices — the map's edit-points mode saves through this. */
     suspend fun updatePoints(id: String, points: List<GeoVertex>) {
-        context.graphicsStore.edit { p ->
+        store.edit { p ->
             p[listKey] = encode(
                 decode(p[listKey] ?: "[]").map {
                     if (it.id == id) it.copy(points = points) else it
@@ -211,7 +215,7 @@ class GraphicsRepository(private val context: Context) {
     }
 
     suspend fun delete(id: String) {
-        context.graphicsStore.edit { p ->
+        store.edit { p ->
             p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id == id })
         }
     }
@@ -221,7 +225,7 @@ class GraphicsRepository(private val context: Context) {
      * folder's eye. The list still shows it, marked hidden.
      */
     suspend fun setVisible(id: String, visible: Boolean) {
-        context.graphicsStore.edit { p ->
+        store.edit { p ->
             p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.id == id) it.copy(visible = visible) else it })
         }
     }
@@ -237,7 +241,7 @@ class GraphicsRepository(private val context: Context) {
      */
     suspend fun toggleVisible(ids: Set<String>) {
         if (ids.isEmpty()) return
-        context.graphicsStore.edit { p ->
+        store.edit { p ->
             p[listKey] = encode(
                 decode(p[listKey] ?: "[]").map { if (it.id in ids) it.copy(visible = !it.visible) else it }
             )
@@ -247,7 +251,7 @@ class GraphicsRepository(private val context: Context) {
     /** Delete every id in [ids] in one transaction. */
     suspend fun deleteAll(ids: Set<String>) {
         if (ids.isEmpty()) return
-        context.graphicsStore.edit { p ->
+        store.edit { p ->
             p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id in ids })
         }
     }
@@ -256,14 +260,14 @@ class GraphicsRepository(private val context: Context) {
     suspend fun renameFolder(from: String, to: String) {
         val target = canonicalFolder(to)
         if (from == target) return
-        context.graphicsStore.edit { p ->
+        store.edit { p ->
             p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.folder == from) it.copy(folder = target) else it })
         }
     }
 
     /** Remove every graphic in [folder] — "clear the sketch" in one go. */
     suspend fun deleteFolder(folder: String) {
-        context.graphicsStore.edit { p ->
+        store.edit { p ->
             p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.folder == folder })
         }
     }

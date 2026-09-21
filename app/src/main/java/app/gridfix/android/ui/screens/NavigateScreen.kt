@@ -97,6 +97,9 @@ fun NavigateScreen(
     waypoints: List<Waypoint>,
     selectedId: String?,
     onSelect: (String) -> Unit,
+    courseLocked: Boolean = false,
+    coursePaused: Boolean = false,
+    courseNotice: String? = null,
 ) {
     val context = LocalContext.current
     val compass = remember { CompassTracker(context.applicationContext) }
@@ -122,7 +125,7 @@ fun NavigateScreen(
     val loc = fix.location?.takeIf { it.isUsableForNavigation(nowNanos) }
     // A selected ID that is no longer offered (deleted, or replaced by the course
     // engine) shows "Select target" — it is never silently swapped for another point.
-    val target = NavigationTarget.resolve(waypoints, selectedId)
+    val target = NavigationTarget.resolve(waypoints, selectedId).takeUnless { coursePaused }
 
     // Magnetic declination: the manual G-M angle if one is set, else the phone's
     // World Magnetic Model, refreshed when we move ~10 km
@@ -159,6 +162,7 @@ fun NavigateScreen(
     val hapticGuide = guideState != null
     var notificationWarning by remember { mutableStateOf<String?>(null) }
     fun startGuide() {
+        if (coursePaused) return
         target?.let { PocketGuideService.start(context, it, settings.declinationOverride) }
     }
     val notificationRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -167,7 +171,7 @@ fun NavigateScreen(
     }
     val toggleGuide: () -> Unit = {
         if (hapticGuide) PocketGuideService.stop(context)
-        else if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+        else if (!coursePaused && Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             notificationRequest.launch(Manifest.permission.POST_NOTIFICATIONS)
         } else startGuide()
     }
@@ -196,7 +200,7 @@ fun NavigateScreen(
         ((nav.bearingTrue - headingTrue + 540f) % 360f) - 180f
     } else null
 
-    if (waypoints.isEmpty()) {
+    if (waypoints.isEmpty() && !courseLocked && !coursePaused && !hapticGuide) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -298,7 +302,7 @@ fun NavigateScreen(
                     }
                     Spacer(Modifier.width(20.dp))
                     Column(Modifier.weight(1f)) {
-                        TargetSelector(target, waypoints, settings, subtle, onSelect)
+                        TargetSelector(target, waypoints, settings, subtle, onSelect, enabled = !courseLocked)
                         Spacer(Modifier.height(6.dp))
                         CompositionLocalProvider(LocalDensity provides faceDensity) {
                             DistanceHero(distanceText, palette, numeralSize = 56.sp, numeralLine = 60.sp, unitSize = 16.sp, display = settings.face == Face.GLANCE)
@@ -320,14 +324,15 @@ fun NavigateScreen(
                             FilterChip(
                                 selected = hapticGuide,
                                 onClick = toggleGuide,
+                                enabled = hapticGuide || (!coursePaused && target != null),
                                 label = { Text(if (hapticGuide) "HAPTIC GUIDE ON" else "HAPTIC GUIDE") },
                             )
                         }
                     }
                 }
-                NavigateHints(loc, compassData, hapticGuide, listOfNotNull(guideState?.status, guideError, notificationWarning).joinToString("\n").ifEmpty { null }, subtle)
+                NavigateHints(loc, compassData, hapticGuide, listOfNotNull(courseNotice, guideState?.status, guideError, notificationWarning).joinToString("\n").ifEmpty { null }, subtle)
             } else {
-                TargetSelector(target, waypoints, settings, subtle, onSelect, centered = true)
+                TargetSelector(target, waypoints, settings, subtle, onSelect, centered = true, enabled = !courseLocked)
 
                 Spacer(Modifier.height(12.dp))
 
@@ -362,9 +367,10 @@ fun NavigateScreen(
                 FilterChip(
                     selected = hapticGuide,
                     onClick = toggleGuide,
+                    enabled = hapticGuide || (!coursePaused && target != null),
                     label = { Text(if (hapticGuide) "HAPTIC GUIDE ON" else "HAPTIC GUIDE") },
                 )
-                NavigateHints(loc, compassData, hapticGuide, listOfNotNull(guideState?.status, guideError, notificationWarning).joinToString("\n").ifEmpty { null }, subtle)
+                NavigateHints(loc, compassData, hapticGuide, listOfNotNull(courseNotice, guideState?.status, guideError, notificationWarning).joinToString("\n").ifEmpty { null }, subtle)
             }
         }
     }
@@ -379,12 +385,16 @@ private fun TargetSelector(
     subtle: androidx.compose.ui.graphics.Color,
     onSelect: (String) -> Unit,
     centered: Boolean = false,
+    enabled: Boolean = true,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(enabled) {
+        if (!enabled) menuOpen = false
+    }
     Column(horizontalAlignment = if (centered) Alignment.CenterHorizontally else Alignment.Start) {
         Box {
             Row(
-                modifier = Modifier.clickable { menuOpen = true },
+                modifier = Modifier.clickable(enabled = enabled) { menuOpen = true },
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 WaypointMarker(
@@ -397,11 +407,12 @@ private fun TargetSelector(
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(target?.name ?: "Select target", style = MaterialTheme.typography.titleLarge, maxLines = 1)
-                Icon(Icons.Outlined.ArrowDropDown, contentDescription = "Change target", tint = subtle)
+                if (enabled) Icon(Icons.Outlined.ArrowDropDown, contentDescription = "Change target", tint = subtle)
             }
-            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            DropdownMenu(expanded = menuOpen && enabled, onDismissRequest = { menuOpen = false }) {
                 waypoints.forEach { w ->
                     DropdownMenuItem(
+                        enabled = enabled,
                         text = { Text(w.name) },
                         leadingIcon = {
                             WaypointMarker(symbol = w.symbol, affiliation = w.affiliation, size = 26.dp, echelon = w.echelon, night = settings.nightMode, metadata = w.metadata)

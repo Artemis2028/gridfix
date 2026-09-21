@@ -102,38 +102,11 @@ class TrackRepository(private val context: Context) {
 
     /** Create a finished track from imported points (GPX trk import). */
     suspend fun importTrack(name: String, points: List<TrackPoint>, nowMillis: Long): String {
-        val id = UUID.randomUUID().toString()
-        withContext(Dispatchers.IO) {
-            val f = pointsFile(context, id)
-            f.parentFile?.mkdirs()
-            f.bufferedWriter().use { out ->
-                for (p in points) {
-                    out.write(
-                        String.format(Locale.US, "%.7f %.7f %d %.1f\n", p.lat, p.lon, p.time, p.alt)
-                    )
-                }
-            }
-        }
-        var dist = 0.0
-        for (i in 1 until points.size) {
-            dist += Geodesy.distanceAndBearing(
-                points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon
-            )[0]
-        }
-        val start = points.firstOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
-        val end = points.lastOrNull()?.time?.takeIf { it > 0 } ?: nowMillis
-        val info = TrackInfo(
-            id = id,
-            name = name.trim().ifBlank { "Imported track" },
-            startedAt = start,
-            endedAt = end,
-            distanceM = dist,
-            pointCount = points.size,
-        )
-        context.trackStore.edit { p ->
-            p[listKey] = encode(decode(p[listKey] ?: "[]") + info)
-        }
-        return id
+        val prepared = prepareImportedTrack(name, points, nowMillis)
+        // Reuse the complete, synced staging and atomic publication path. An
+        // interrupted import must not leave a partial final point-log filename.
+        restoreAll(listOf(prepared))
+        return prepared.first.id
     }
 
     /** Restore one track from a backup, keeping its id; skipped when already present. */
@@ -358,22 +331,27 @@ class TrackRepository(private val context: Context) {
         }
 
         suspend fun readPoints(context: Context, id: String): List<TrackPoint> =
-            withContext(Dispatchers.IO) {
-                val f = pointsFile(context, id)
-                if (!f.exists()) return@withContext emptyList()
-                f.readLines().mapNotNull { line ->
-                    val parts = line.trim().split(" ")
-                    if (parts.size < 3) return@mapNotNull null
-                    runCatching {
-                        TrackPoint(
-                            lat = parts[0].toDouble(),
-                            lon = parts[1].toDouble(),
-                            time = parts[2].toLong(),
-                            alt = parts.getOrNull(3)?.toDouble() ?: NO_ALTITUDE,
-                        )
-                    }.getOrNull()
-                }
+            withContext(Dispatchers.IO) { readPoints(pointsFile(context, id)) }
+
+        /** Read local legacy logs without rewriting them; archive validation stays strict. */
+        internal fun readPoints(file: File): List<TrackPoint> {
+            if (!file.exists()) return emptyList()
+            return file.readLines().mapNotNull { line ->
+                val parts = line.trim().split(" ")
+                if (parts.size < 3) return@mapNotNull null
+                runCatching {
+                    TrackPoint(
+                        lat = parts[0].toDouble(),
+                        lon = parts[1].toDouble(),
+                        // Older GPX imports wrote pre-epoch dates verbatim. Treat
+                        // those as unknown when reading, so a backup can include
+                        // the track without changing the original point log.
+                        time = parts[2].toLong().coerceAtLeast(0L),
+                        alt = parts.getOrNull(3)?.toDouble() ?: NO_ALTITUDE,
+                    )
+                }.getOrNull()
             }
+        }
 
         /** Minimal GPX 1.1 document for one track. */
         fun buildGpx(name: String, points: List<TrackPoint>): String {

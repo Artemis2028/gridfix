@@ -270,8 +270,16 @@ class WaypointRepository internal constructor(private val store: DataStore<Prefe
         store.edit { p ->
             val current = decode(p[listKey] ?: "[]")
             val storedFolder = matchFolder(knownNames(p), folder)
-            val ownedByIndex = current.filter { it.sourceRouteId == routeId && it.sourceRoutePointIndex != null }
-                .associateBy { it.sourceRoutePointIndex }
+            // Older restores could create several UUIDs for the same route
+            // vertex. Keep the selected one authoritative; otherwise use the
+            // first stored record rather than letting a later backup replace it.
+            val selected = p[selectedKey]
+            val ownedByIndex = LinkedHashMap<Int, Waypoint>()
+            for (waypoint in current) {
+                if (waypoint.sourceRouteId != routeId) continue
+                val index = waypoint.sourceRoutePointIndex?.takeIf { it >= 0 } ?: continue
+                if (index !in ownedByIndex || waypoint.id == selected) ownedByIndex[index] = waypoint
+            }
             val generated = points.mapIndexed { index, point ->
                 val previous = ownedByIndex[index]
                 (previous ?: Waypoint(
@@ -289,7 +297,17 @@ class WaypointRepository internal constructor(private val store: DataStore<Prefe
                     sourceRoutePointIndex = index,
                 )
             }
-            val updated = current.filterNot { it.sourceRouteId == routeId } + generated
+            val retained = current.mapNotNull { waypoint ->
+                when {
+                    waypoint.sourceRouteId != routeId -> waypoint
+                    waypoint.sourceRoutePointIndex?.let { ownedByIndex[it]?.id } == waypoint.id -> null
+                    // Preserve duplicate/incomplete legacy records as standalone
+                    // points. Their UUIDs may still be referenced by a course;
+                    // discarding them would silently break those references.
+                    else -> waypoint.copy(sourceRouteId = null, sourceRoutePointIndex = null)
+                }
+            }
+            val updated = retained + generated
             p[listKey] = encode(updated)
             retainSelectionAfterRemoval(p, updated)
             p[foldersKey] = encodeFolders(
@@ -301,16 +319,26 @@ class WaypointRepository internal constructor(private val store: DataStore<Prefe
     }
 
     /**
-     * Merge a backup: waypoints keep their original ids and ids already on the
-     * device are skipped, so restoring twice never duplicates. Folder entries
-     * merge by name (existing visibility wins). Returns how many were added.
+     * Merge a backup without replacing current records. A generated vertex is
+     * also identified by (route ID, vertex index), because regenerating a deleted
+     * point assigns a new UUID. Existing UUIDs/vertices win; the first accepted
+     * record wins within the incoming batch. This preserves live selections and
+     * course references and makes retries idempotent. Folder entries merge by
+     * name (existing visibility wins). Returns the number actually added.
      */
     suspend fun restore(imported: List<Waypoint>, importedFolders: List<FolderInfo>): Int {
         var added = 0
         store.edit { p ->
             val current = decode(p[listKey] ?: "[]")
-            val ids = current.map { it.id }.toSet()
-            val fresh = imported.filter { it.id !in ids }
+            val ids = current.mapTo(HashSet()) { it.id }
+            val ownedVertices = current.mapNotNullTo(HashSet()) { it.routeVertexKey() }
+            val fresh = ArrayList<Waypoint>()
+            for (waypoint in imported) {
+                if (!ids.add(waypoint.id)) continue
+                val vertex = waypoint.routeVertexKey()
+                if (vertex != null && !ownedVertices.add(vertex)) continue
+                fresh.add(waypoint)
+            }
             added = fresh.size
             p[listKey] = encode(current + fresh)
             val merged = decodeFolders(p[foldersKey] ?: "[]").toMutableList()
@@ -411,8 +439,11 @@ class WaypointRepository internal constructor(private val store: DataStore<Prefe
         }
     }
 
+    /** A stale UI selection must not undo a deletion or replace a live target. */
     suspend fun select(id: String) {
-        store.edit { p -> p[selectedKey] = id }
+        store.edit { p ->
+            if (decode(p[listKey] ?: "[]").any { it.id == id }) p[selectedKey] = id
+        }
     }
 
     // One damaged record must not take the whole list with it: skip it, keep the rest.
@@ -492,6 +523,13 @@ class WaypointRepository internal constructor(private val store: DataStore<Prefe
 
     private fun encode(list: List<Waypoint>): String =
         JSONArray().also { a -> list.forEach { a.put(it.toWaypointJson()) } }.toString()
+}
+
+/** Incomplete legacy ownership does not establish identity for a route vertex. */
+private fun Waypoint.routeVertexKey(): Pair<String, Int>? {
+    val routeId = sourceRouteId?.takeIf { it.isNotBlank() } ?: return null
+    val index = sourceRoutePointIndex?.takeIf { it >= 0 } ?: return null
+    return routeId to index
 }
 
 /** Shared by the datastore and backup writer so route ownership survives both. */

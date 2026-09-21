@@ -24,55 +24,45 @@ import java.util.zip.ZipOutputStream
  */
 object DataPackage {
 
-    private const val MAX_ENTRY_BYTES = 32L * 1024 * 1024
-
-    /** Read one zip entry into memory, or null when it is larger than we are willing to hold. */
-    private fun readCapped(zin: ZipInputStream): ByteArray? {
-        val out = java.io.ByteArrayOutputStream()
-        val buf = ByteArray(16 * 1024)
-        var total = 0L
-        while (true) {
-            val n = zin.read(buf)
-            if (n < 0) break
-            total += n
-            if (total > MAX_ENTRY_BYTES) return null
-            out.write(buf, 0, n)
-        }
-        return out.toByteArray()
-    }
-
     // ---------------- Import ----------------
 
-    fun parse(stream: InputStream): InterchangeFiles.ImportedData {
-        val wps = ArrayList<WaypointDraft>()
-        var lines = listOf<InterchangeFiles.ImportedLine>()
-        var areas = listOf<InterchangeFiles.ImportedLine>()
-        var tracks = listOf<InterchangeFiles.ImportedTrack>()
+    fun parse(stream: InputStream): InterchangeFiles.ImportedData = parse(stream, ImportArchiveBudget())
 
-        val zin = ZipInputStream(stream)
-        var entry: ZipEntry? = zin.nextEntry
-        while (entry != null) {
-            val name = entry.name
-            val lower = name.lowercase(Locale.US)
-            val wanted = lower.endsWith(".cot") || lower.endsWith(".gpx") ||
-                lower.endsWith(".kml") || lower.endsWith(".kmz")
-            val bytes = if (!entry.isDirectory && wanted) readCapped(zin) else null
-            if (bytes != null) {
-                when {
-                    lower.endsWith(".cot") ->
-                        parseCot(ByteArrayInputStream(bytes))?.let { wps.add(it) }
-                    lower.endsWith(".gpx") || lower.endsWith(".kml") || lower.endsWith(".kmz") -> {
-                        InterchangeFiles.parse(name, ByteArrayInputStream(bytes))?.let { d ->
-                            wps.addAll(d.waypoints)
-                            lines = lines + d.lines
-                            areas = areas + d.areas
-                            tracks = tracks + d.tracks
+    internal fun parse(stream: InputStream, budget: ImportArchiveBudget): InterchangeFiles.ImportedData {
+        val wps = ArrayList<WaypointDraft>()
+        val lines = ArrayList<InterchangeFiles.ImportedLine>()
+        val areas = ArrayList<InterchangeFiles.ImportedLine>()
+        val tracks = ArrayList<InterchangeFiles.ImportedTrack>()
+
+        ZipInputStream(stream).use { zin ->
+            while (true) {
+                val entry = zin.nextEntry ?: break
+                val name = entry.name
+                val lower = name.lowercase(Locale.US)
+                val wanted = !entry.isDirectory && (lower.endsWith(".cot") || lower.endsWith(".gpx") ||
+                    lower.endsWith(".kml") || lower.endsWith(".kmz"))
+                // Never return a partial package after silently dropping a supported
+                // file. Ignored entries also consume the decompression budget.
+                val bytes = budget.readEntry(zin, entry, name, wanted)
+                if (bytes != null) {
+                    when {
+                        lower.endsWith(".cot") ->
+                            parseCot(ByteArrayInputStream(bytes))?.let { wps.add(it) }
+                        else -> {
+                            val data = if (lower.endsWith(".kmz")) {
+                                InterchangeFiles.parseKmz(ByteArrayInputStream(bytes), budget, name)
+                            } else InterchangeFiles.parse(name, ByteArrayInputStream(bytes))
+                            data?.let { d ->
+                                wps.addAll(d.waypoints)
+                                lines.addAll(d.lines)
+                                areas.addAll(d.areas)
+                                tracks.addAll(d.tracks)
+                            }
                         }
                     }
                 }
+                zin.closeEntry()
             }
-            zin.closeEntry()
-            entry = zin.nextEntry
         }
         return InterchangeFiles.ImportedData(
             waypoints = wps,

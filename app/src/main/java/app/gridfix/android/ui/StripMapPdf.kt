@@ -8,11 +8,11 @@ import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
 import app.gridfix.android.data.AppSettings
 import app.gridfix.android.data.TacGraphic
+import app.gridfix.android.data.routeCardLegs
+import app.gridfix.android.data.routeSketchCoordinates
 import java.io.File
 import java.util.Locale
-import kotlin.math.cos
 import kotlin.math.max
-import kotlin.math.roundToInt
 import app.gridfix.android.location.Declination
 
 /**
@@ -28,16 +28,6 @@ object StripMapPdf {
     private const val PAGE_H = 842
     private const val MARGIN = 40f
 
-    private data class PdfLeg(
-        val index: Int,
-        val azimuth: String,
-        val back: String,
-        val dist: String,
-        val paces: Int,
-        val toGrid: String,
-        val meters: Float,
-    )
-
     fun build(context: Context, route: TacGraphic, settings: AppSettings): File? = runCatching {
         val coords = app.gridfix.android.coords.Coordinates
         val refLetter = when (settings.northRef) {
@@ -48,34 +38,9 @@ object StripMapPdf {
         val pts = route.points
         if (pts.size < 2) return null
 
-        val legs = buildList {
-            for (i in 0 until pts.size - 1) {
-                val a = pts[i]
-                val b = pts[i + 1]
-                val nav = coords.navInfo(a.lat, a.lon, b.lat, b.lon)
-                val midLat = (a.lat + b.lat) / 2.0
-                val midLon = (a.lon + b.lon) / 2.0
-                val dec = Declination.at(settings, midLat, midLon)
-                fun toRef(t: Float): Float = when (settings.northRef) {
-                    1 -> (t - dec + 360f) % 360f
-                    2 -> (t - coords.gridConvergence(midLat, midLon).toFloat() + 360f) % 360f
-                    else -> t
-                }
-                add(
-                    PdfLeg(
-                        index = i + 1,
-                        azimuth = coords.formatAngle(toRef(nav.bearingTrue), settings.angleUnit),
-                        back = coords.formatAngle(toRef((nav.bearingTrue + 180f) % 360f), settings.angleUnit),
-                        dist = coords.formatDistance(nav.distanceMeters, settings.units),
-                        paces = (nav.distanceMeters / 100f * settings.pacePer100m).roundToInt(),
-                        toGrid = coords.mgrs(b.lat, b.lon, 8)?.full ?: "—",
-                        meters = nav.distanceMeters,
-                    )
-                )
-            }
-        }
+        val legs = routeCardLegs(pts, settings) { lat, lon -> Declination.model(lat, lon) }
         val startGrid = coords.mgrs(pts[0].lat, pts[0].lon, 8)?.full ?: "—"
-        val totalM = legs.sumOf { it.meters.toDouble() }.toFloat()
+        val totalM = legs.sumOf { it.distanceMeters.toDouble() }.toFloat()
         val totalPaces = legs.sumOf { it.paces }
 
         val title = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -129,11 +94,11 @@ object StripMapPdf {
         val boxH = 280f
         canvas.drawRect(MARGIN, y, MARGIN + boxW, y + boxH, thin)
         run {
-            // Equirectangular plot with cos(lat) x-scale — true-north up
-            val latC = pts.map { it.lat }.average()
-            val kx = cos(Math.toRadians(latC))
-            val xs = pts.map { it.lon * kx }
-            val ys = pts.map { it.lat }
+            // Unwrapped equirectangular plot: a short dateline crossing stays
+            // short and keeps its east/west direction, with true north up.
+            val sketch = routeSketchCoordinates(pts)
+            val xs = sketch.map { it.x }
+            val ys = sketch.map { it.y }
             val minX = xs.min()
             val maxX = xs.max()
             val minY = ys.min()
@@ -234,8 +199,8 @@ object StripMapPdf {
             }
             canvas.drawText("${l.index}", colX[0], y, body)
             canvas.drawText(l.azimuth, colX[1], y, body)
-            canvas.drawText(l.back, colX[2], y, body)
-            canvas.drawText(l.dist, colX[3], y, body)
+            canvas.drawText(l.backAzimuth, colX[2], y, body)
+            canvas.drawText(l.distance, colX[3], y, body)
             canvas.drawText("${l.paces}", colX[4], y, body)
             canvas.drawText(l.toGrid, colX[5], y, body)
             y += 13f
@@ -249,7 +214,7 @@ object StripMapPdf {
         )
         y += 18f
         canvas.drawText(
-            "Training aid — verify azimuths and grids against your map before stepping off.",
+            "AZ: from leg start. BACK: from leg end. Verify bearings and grids before stepping off.",
             MARGIN, y, small,
         )
 

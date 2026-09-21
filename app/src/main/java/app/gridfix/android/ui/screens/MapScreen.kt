@@ -173,18 +173,7 @@ private fun toScreenPoint(
 
 /** Perimeter (m) and enclosed area (m²) of a polygon, computed on the UTM plane. */
 private fun polygonStats(points: List<GeoVertex>): Pair<Double, Double> {
-    if (points.size < 2) return 0.0 to 0.0
-    val zone = (((points[0].lon + 180.0) / 6.0).toInt() + 1).coerceIn(1, 60)
-    val north = points[0].lat >= 0.0
-    val en = points.map { Coordinates.utmForZone(it.lat, it.lon, zone, north) }
-    var perim = 0.0
-    var area2 = 0.0
-    for (i in en.indices) {
-        val j = (i + 1) % en.size
-        perim += hypot(en[j][0] - en[i][0], en[j][1] - en[i][1])
-        area2 += en[i][0] * en[j][1] - en[j][0] * en[i][1]
-    }
-    return perim to kotlin.math.abs(area2) / 2.0
+    return app.gridfix.android.data.routePolygonMetrics(points)
 }
 
 private fun formatArea(m2: Double): String = when {

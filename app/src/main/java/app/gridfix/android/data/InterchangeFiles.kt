@@ -62,7 +62,7 @@ object InterchangeFiles {
         return when {
             lower.endsWith(".gpx") -> parseGpx(stream)
             lower.endsWith(".kml") -> parseKml(stream)
-            lower.endsWith(".kmz") -> parseKmz(stream)
+            lower.endsWith(".kmz") -> parseKmz(stream, ImportArchiveBudget(), fileName)
             // ATAK mission data packages (and generic zips of the above)
             lower.endsWith(".zip") || lower.endsWith(".dpk") -> DataPackage.parse(stream)
             else -> null
@@ -291,17 +291,20 @@ object InterchangeFiles {
 
     // ---------------- KML / KMZ ----------------
 
-    fun parseKmz(stream: InputStream): ImportedData {
+    fun parseKmz(stream: InputStream): ImportedData = parseKmz(stream, ImportArchiveBudget(), "KMZ")
+
+    internal fun parseKmz(stream: InputStream, budget: ImportArchiveBudget, fileName: String): ImportedData {
+        var result: ImportedData? = null
         ZipInputStream(stream).use { zip ->
-            var entry = zip.nextEntry
-            while (entry != null) {
-                if (!entry.isDirectory && entry.name.lowercase(Locale.US).endsWith(".kml")) {
-                    return parseKml(zip)
-                }
-                entry = zip.nextEntry
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                val wanted = result == null && !entry.isDirectory && entry.name.lowercase(Locale.US).endsWith(".kml")
+                val bytes = budget.readEntry(zip, entry, "$fileName!/${entry.name}", wanted)
+                if (bytes != null) result = parseKml(bytes.inputStream())
+                zip.closeEntry()
             }
         }
-        return ImportedData()
+        return result ?: ImportedData()
     }
 
     fun parseKml(stream: InputStream): ImportedData {
@@ -543,7 +546,8 @@ object InterchangeFiles {
         OffsetDateTime.parse(text, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant().toEpochMilli()
     }.getOrNull()
 
-    private fun parseIsoTime(text: String): Long = parseIsoTimeOrNull(text) ?: 0L
+    // Backup and the track log reserve zero for unknown and reject negative times.
+    private fun parseIsoTime(text: String): Long = parseIsoTimeOrNull(text)?.coerceAtLeast(0L) ?: 0L
 
     private fun newParser(): XmlPullParser = XmlPullParserFactory.newInstance().apply {
         isNamespaceAware = true

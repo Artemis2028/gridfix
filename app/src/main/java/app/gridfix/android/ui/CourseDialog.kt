@@ -180,9 +180,23 @@ private fun CourseProgress(
     val target = waypoints.firstOrNull { it.id == active.waypointIds.getOrNull(active.nextIndex) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Course — ${active.name}") },
+        title = { Text("${if (active.paused) "Course paused" else "Course"} — ${active.name}") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                if (active.paused) {
+                    Text(
+                        active.pauseReason.orEmpty(),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Text(
+                        "Scoring and navigation are paused. Restore the missing checkpoints from a backup, or end this course. Elapsed time continues.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
                 Text(
                     "CP ${active.nextIndex + 1} of ${active.waypointIds.size}",
                     style = MaterialTheme.typography.headlineSmall,
@@ -216,15 +230,17 @@ private fun CourseProgress(
                         prev = t
                     }
                 }
-                Text(
-                    "Navigate is locked to the current point — it advances by itself when you get inside 25 m.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                if (!active.paused) {
+                    Text(
+                        "Navigate is locked to the current point — it advances by itself when you get inside 25 m.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Continue") }
+            TextButton(onClick = onDismiss) { Text(if (active.paused) "Close" else "Continue") }
         },
         dismissButton = {
             TextButton(onClick = onAbandon) { Text("End course") }

@@ -102,6 +102,7 @@ import app.gridfix.android.ui.NatoSymbols
 import app.gridfix.android.ui.RouteCardDialog
 import app.gridfix.android.ui.WaypointDialog
 import app.gridfix.android.ui.WaypointMarker
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -178,21 +179,26 @@ fun WaypointsScreen(
         if (uri != null) {
             scope.launch {
                 var display = "file"
-                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                    val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                    if (idx >= 0 && cursor.moveToFirst()) cursor.getString(idx)?.let { display = it }
-                }
-                val data = withContext(Dispatchers.IO) {
-                    runCatching {
-                        context.contentResolver.openInputStream(uri)?.use { stream ->
-                            InterchangeFiles.parse(display, stream)
+                try {
+                    val data = withContext(Dispatchers.IO) {
+                        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                            val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                            if (idx >= 0 && cursor.moveToFirst()) cursor.getString(idx)?.let { display = it }
                         }
-                    }.getOrNull()
-                }
-                when {
-                    data == null -> ioMessage = "Couldn't read $display — GPX, KML, KMZ, or ATAK zip expected"
-                    data.isEmpty -> ioMessage = "Nothing importable in $display"
-                    else -> onImport(data) { summary -> ioMessage = summary }
+                        val stream = context.contentResolver.openInputStream(uri)
+                            ?: throw java.io.IOException("Couldn't open $display")
+                        stream.use { InterchangeFiles.parse(display, it) }
+                    }
+                    when {
+                        data == null -> ioMessage = "Import failed — GPX, KML, KMZ, or ATAK zip expected for $display"
+                        data.isEmpty -> ioMessage = "Nothing importable in $display"
+                        else -> onImport(data) { summary -> ioMessage = summary }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    val detail = failure.message?.takeIf { it.isNotBlank() } ?: "Couldn't read $display"
+                    ioMessage = "Import failed — $detail"
                 }
             }
         }

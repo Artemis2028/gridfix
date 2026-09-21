@@ -27,19 +27,9 @@ import app.gridfix.android.ui.theme.MonoFamily
 import app.gridfix.android.coords.Coordinates
 import app.gridfix.android.data.AppSettings
 import app.gridfix.android.data.TacGraphic
+import app.gridfix.android.data.routeCardLegs
 import java.util.Locale
-import kotlin.math.roundToInt
 import app.gridfix.android.location.Declination
-
-private data class Leg(
-    val index: Int,
-    val azimuth: String,
-    val backAzimuth: String,
-    val distance: String,
-    val paces: Int,
-    val toGrid: String,
-    val distanceMeters: Float,
-)
 
 /**
  * Route card for a route graphic: per-leg azimuth (in the chosen north
@@ -61,36 +51,9 @@ fun RouteCardDialog(
         else -> "T"
     }
 
-    val legs = remember(route.id, settings.northRef, settings.angleUnit, settings.units, settings.pacePer100m) {
-        buildList {
-            val pts = route.points
-            for (i in 0 until pts.size - 1) {
-                val a = pts[i]
-                val b = pts[i + 1]
-                val nav = Coordinates.navInfo(a.lat, a.lon, b.lat, b.lon)
-                val midLat = (a.lat + b.lat) / 2.0
-                val midLon = (a.lon + b.lon) / 2.0
-                val declination = Declination.at(settings, midLat, midLon)
-                fun toRef(angleTrue: Float): Float = when (settings.northRef) {
-                    1 -> (angleTrue - declination + 360f) % 360f
-                    2 -> (angleTrue - Coordinates.gridConvergence(midLat, midLon).toFloat() + 360f) % 360f
-                    else -> angleTrue
-                }
-                add(
-                    Leg(
-                        index = i + 1,
-                        azimuth = Coordinates.formatAngle(toRef(nav.bearingTrue), settings.angleUnit),
-                        backAzimuth = Coordinates.formatAngle(
-                            toRef((nav.bearingTrue + 180f) % 360f), settings.angleUnit
-                        ),
-                        distance = Coordinates.formatDistance(nav.distanceMeters, settings.units),
-                        paces = (nav.distanceMeters / 100f * settings.pacePer100m).roundToInt(),
-                        toGrid = Coordinates.mgrs(b.lat, b.lon, 8)?.full ?: "—",
-                        distanceMeters = nav.distanceMeters,
-                    )
-                )
-            }
-        }
+    val legs = remember(route.id, route.points, settings.northRef, settings.angleUnit, settings.units,
+        settings.pacePer100m, settings.declinationOverride) {
+        routeCardLegs(route.points, settings) { lat, lon -> Declination.model(lat, lon) }
     }
     val totalMeters = legs.sumOf { it.distanceMeters.toDouble() }.toFloat()
     val totalPaces = legs.sumOf { it.paces }
@@ -118,6 +81,7 @@ fun RouteCardDialog(
                 Coordinates.formatDistance(totalMeters, settings.units), totalPaces,
             )
         )
+        sb.append("Azimuth from leg start; back-azimuth from leg end.\n")
         sb.append("(north ").append(refLetter)
             .append(" · pace ").append(settings.pacePer100m).append("/100m · ")
             .append(Coordinates.dtg(System.currentTimeMillis())).append(")")
@@ -140,10 +104,10 @@ fun RouteCardDialog(
                 )
 
                 // Elevation profile along the route, from the cached terrain data
-                var profile by remember(route.id) {
+                var profile by remember(route.id, route.points) {
                     androidx.compose.runtime.mutableStateOf<app.gridfix.android.map.Terrain.Profile?>(null)
                 }
-                androidx.compose.runtime.LaunchedEffect(route.id) {
+                androidx.compose.runtime.LaunchedEffect(route.id, route.points) {
                     profile = app.gridfix.android.map.Terrain.profile(context, route.points)
                 }
                 profile?.let { pr ->
@@ -219,7 +183,8 @@ fun RouteCardDialog(
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "North: $refLetter · pace ${settings.pacePer100m}/100 m",
+                    "North: $refLetter · pace ${settings.pacePer100m}/100 m\n" +
+                        "Azimuth from leg start; back-azimuth from leg end.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

@@ -1,59 +1,86 @@
-# Review repairs for 1.0.2
+# Review repairs for 1.0.3
 
-Base: `2a039f16447feb53c8e01c46cc27b7ece158022b` (1.0.1).
+Base: `e196f6b4d3f171835da32d7185cfb3a6635e3532` (validated 1.0.2).
 
 ## Behavior changes
 
-| Area | Result |
+| Finding | Result |
 | --- | --- |
-| Deleted navigation targets | Single, batch, and folder deletion leave no target until explicit selection. Adding, importing, restoring, or restarting cannot silently choose a replacement. |
-| Route waypoints | Each generated point records its owning route and vertex index. Regeneration replaces only that route's points in one transaction and preserves surviving vertex IDs. Manual points and older points without ownership remain untouched. |
-| Pocket guide | Synchronization waits for stored waypoints and settings. Activity startup placeholders cannot stop a surviving guide or reset its declination. Explicit target and course changes still update a running guide. |
-| Billing | A connection that never answers expires after ten seconds. Retry creates a fresh attempt; obsolete callbacks and timers cannot change the replacement attempt. |
-| KML | Mixed and nested MultiGeometry children retain their own geometry and coordinates. Unsupported polygon holes and excessive nesting fail explicitly. |
-| Track restore | Complete, synced staging files are atomically linked into place without replacing an existing destination. Identical completed files from interrupted batches can be reattached on retry. |
-| Field tools | Ray solvers reject nonfinite or unsupported inputs. Azimuth fields preserve entered text and show errors for invalid degree/mil values. |
-| UTM | UTM and grid convergence use NGA's zone selector, including exact Norway/Svalbard boundaries. |
-| Terrain | Great-circle sampling follows the short arc across the dateline; elevation and contour tile coverage wrap consistently. |
-| Elevation downloads | Areas over 400 tiles are rejected before downloading. Smaller requests report expected, cached, and failed tile counts; partial coverage is never reported as complete. |
+| F1: restored route ownership collisions | Restore deduplicates both UUIDs and route/vertex ownership. Current records win. Regeneration preserves the selected owner and retains older duplicate UUIDs as standalone points. Stale selection requests cannot reselect a deleted UUID. |
+| F2: course navigation lock | Every navigation entry point resolves to the active checkpoint. Target pickers are disabled during a course, and a running pocket guide follows the same checkpoint. Course run and checkpoint guards reject obsolete scoring callbacks. |
+| F3: missing course checkpoints | Removing any remaining checkpoint blocks scoring and stops guidance. The UI identifies missing checkpoint numbers and offers restoration or ending the course. Restoring the original IDs resumes progress; elapsed time continues while blocked. Completed runs are finalized from stored state even if the scoring effect is cancelled. |
+| F4: reordered billing responses | Product queries own their callbacks and deadlines. An older empty/error response cannot replace a successful newer Retry on the same BillingClient. A late response can recover its own timed-out query only if no replacement query exists. |
+| F5: dateline projection | Forced-zone UTM wraps longitude differences around the central meridian; inverse results use canonical longitudes. Nearby polygon vertices and bearing rays can cross the dateline on one projection plane. |
+| F6: route cards and PDF sketches | Screen, text, and PDF share leg calculations. Forward bearings use the start's north reference; return bearings use the end's reference and the reverse geodesic. Sketches unwrap each leg's longitude to preserve direction across the dateline. |
+| F7: historical GPX track times | Track timestamps before 1970 become unknown (`0`), matching the backup format. Reads of previously saved logs also normalize negative times without modifying the source files. Waypoint historical metadata remains intact. Direct track imports validate all points before persistence. |
+| F8: oversized data-package entries | Oversized entries reject the whole parse before persistence, with the entry name and limit shown to the user. Nested KMZ and ignored entries share limits of 32 MiB per entry, 128 MiB total decompressed bytes, and 2,048 entries. |
+| F9: failed import retries | A validated plan assigns stable IDs to unchanged parsed data. Track files are staged before metadata publication; subsequent waypoint and graphic phases report confirmed progress. Retrying adds missing records and preserves already-imported edits. |
 
-## Review correction
+## Compatibility and recovery
 
-The earlier NaN-paste crash scenario was not reachable through the existing field
-widget: its character filter removed the pasted letters. The math functions did
-accept invalid nonfinite inputs from callers. The changes harden those functions
-and replace silent text rewriting with explicit UI validation; they do not claim
-to reproduce that earlier UI crash scenario.
+Backup fields for route ownership remain optional. Legacy points are never assigned
+ownership by their names. When legacy records already share an owner/vertex pair,
+regeneration retains the selected record as the generated point and clears ownership
+on the others without deleting their UUIDs.
 
-## Compatibility
+A backup's old route UUID is skipped if a current generated UUID already owns that
+vertex. A course referencing the old UUID stays blocked; it does not silently adopt
+the replacement. Restore the original missing checkpoint before regenerating that
+vertex, or end the course and start another. Deleting an already visited checkpoint
+does not block the remaining course.
 
-Waypoint backup additions are optional; older backups still load. Legacy route
-points are not assigned ownership by matching their names, because a manual point
-can have the same name. Regenerating an old route may therefore leave its old
-unowned points alongside newly owned points; users can remove the old set after
-checking it.
+Import identity depends on parsed content and record order, not the import time or
+current folder spelling. Reimporting an unchanged file preserves existing edits;
+deleting a previously imported record and importing again recreates that missing
+record. Changed or reordered parsed content is a different import. Identical entries
+within one file remain distinct. Imports made by older versions used random IDs, so
+this version cannot reliably deduplicate them against the original file.
 
-Restoration still refuses to overwrite a different existing track file. This
-includes truncated final files left by older app versions: their ownership cannot
-be safely inferred. The new publication method prevents creating partial final
-files going forward; it does not silently repair or delete pre-existing conflicts.
+The import is resumable, not a transaction spanning every repository. Each committed
+phase remains if a later phase fails. Cancellation propagates after the current
+commit completes. No compensating rollback deletes existing or edited data. Track
+publication still refuses to overwrite a different file with the same ID; older
+truncated/conflicting files are not silently removed. Incoming backups still reject
+negative track timestamps; normalization applies to interchange and existing logs.
 
 ## Validation
 
-Focused JVM regression tests cover repository deletion and regeneration, backup
-ownership, deferred guide data, billing attempt ownership, KML geometry nesting,
-interrupted track publication, coordinate validation and zone boundaries, and
-great-circle/tile download behavior.
+New JVM regression coverage exercises actual waypoint, graphics, and course
+repository transactions; route ownership and stale selection; course deletion,
+restoration, run identity and completion; billing response/deadline ownership;
+dateline projection and route bearings/sketches; GPX/backup compatibility; nested
+archive limits; and import failures, retries, identity stability and cancellation.
+Existing track staging/publication tests complement the coordinator tests.
 
-The local Gradle invocation was blocked before compilation because this workspace
-could not reach `services.gradle.org` to obtain Gradle 8.11.1. The connected GitHub
-integration also refused source publication with HTTP 403, so no pull request or
-CI run was created. Compilation and the tests remain unverified. After the patch
-is pushed, GitHub Actions is the build and test gate, including debug tests/APK
-and unsigned minified release APK/AAB.
+The base 1.0.2 source passed JVM tests, debug builds, and signed minified release
+APK/AAB builds in GitHub Actions run `35628105020`. The 1.0.3 changes have received
+static and independent cross-review, but have not compiled locally: this environment
+cannot download the Gradle distribution. The delivered workflow runs the complete
+JVM suite, debug build, signed minified release APK/AAB builds, and mapping checks
+before it commits the embedded source or publishes a release. Installer validation
+is separate from Android compilation and must not be reported as a passing build.
 
-Device checks still needed: recreate the activity while pocket guidance runs with
-manual declination; edit/delete/select targets during guidance; exercise Play's
-unavailable-to-retry flow; restore tracks on supported Android internal storage;
-and inspect dateline terrain/download messages on the map. JVM tests do not
-substitute for service lifecycle, Play integration, or device smoke testing.
+Device checks after CI:
+
+1. Run a course with pocket guidance, then try selecting another point from Map,
+   Waypoints, and Navigate. Confirm both navigation and guidance stay on the current
+   checkpoint. End the course and confirm free target selection returns.
+2. Remove the current or a future checkpoint, including by shortening a route.
+   Confirm blocked guidance/scoring, useful missing-point text, and recovery when
+   the same UUIDs return. Check that elapsed time includes the blocked interval.
+3. Delete and regenerate a route vertex, restore an older backup, and regenerate
+   again. Confirm the live vertex UUID and selection survive.
+4. Retry billing while an earlier request is delayed, then deliver the old failure.
+   Confirm the newly loaded plans remain available.
+5. Compare a dateline-crossing route's card and PDF in true, magnetic, and grid
+   north modes. Confirm forward/return references and sketch direction.
+6. Import a GPX with historical dates and export/restore a whole backup. Import a
+   mixed package with an oversized supported entry and confirm nothing is added.
+7. Interrupt a multi-type import after a committed phase, retry the unchanged file,
+   and confirm no duplicate records or lost edits.
+
+The 1.0.2 repairs remain in place, including authoritative guide synchronization,
+guide command ordering, billing connection attempts, KML geometry handling,
+atomic track publication, coordinate validation, NGA zone selection, and wrapped
+terrain/elevation coverage. The earlier review's NaN-paste crash claim was corrected:
+the old widget filtered the text; the underlying math validation was the real gap.

@@ -90,6 +90,7 @@ class BillingManager(private val context: Context) {
 
     private var client: BillingClient? = null
     private val connectionAttempts = BillingConnectionAttempts()
+    private val planQueries = BillingPlanQueries()
     private var userRestore = false
     private var closed = false
     private var purchasesGeneration = 0L
@@ -144,6 +145,7 @@ class BillingManager(private val context: Context) {
         val old = client
         client = null
         connectionAttempts.clear()
+        planQueries.clear()
         old?.endConnection()
     }
 
@@ -185,7 +187,7 @@ class BillingManager(private val context: Context) {
         }
         val attempt = connectionAttempts.begin() ?: return
         plansStatusFlow.value = PlansStatus.LOADING
-        ++plansGeneration // An old product query's timer cannot expire this connection.
+        planQueries.clear() // Neither an old product response nor its timer owns this connection.
         val c = BillingClient.newBuilder(context)
             .setListener { result, purchases -> onPurchasesUpdated(attempt, result, purchases) }
             .enablePendingPurchases(
@@ -235,15 +237,10 @@ class BillingManager(private val context: Context) {
     }
 
     /** A plan query that never answers must not leave the paywall spinning. */
-    /** Bumped by every query; a timeout only fires for the query that armed it. */
-    private var plansGeneration = 0
-
-    private fun armPlansTimeout() {
-        val generation = ++plansGeneration
+    private fun armPlansTimeout(query: BillingPlanQueries.Query) {
         scope.launch {
             delay(STARTUP_TIMEOUT_MS)
-            // A later query may already have answered; only the newest timer may speak.
-            if (generation == plansGeneration && plansStatusFlow.value == PlansStatus.LOADING) {
+            if (!closed && plansStatusFlow.value == PlansStatus.LOADING && planQueries.expire(query)) {
                 plansStatusFlow.value = PlansStatus.ERROR
                 if (noticeFlow.value == null) {
                     noticeFlow.value = "Google Play is not answering — check your connection and tap Retry"
@@ -398,8 +395,9 @@ class BillingManager(private val context: Context) {
 
     private fun queryPlans() {
         val c = client ?: return
+        val query = planQueries.begin()
         plansStatusFlow.value = PlansStatus.LOADING
-        armPlansTimeout()
+        armPlansTimeout(query)
         val params = QueryProductDetailsParams.newBuilder()
             .setProductList(
                 listOf(MONTHLY, ANNUAL).map { id ->
@@ -411,20 +409,24 @@ class BillingManager(private val context: Context) {
             )
             .build()
         c.queryProductDetailsAsync(params) { result, detailsResult ->
-            if (closed || c !== client) return@queryProductDetailsAsync
-            if (result.responseCode != BillingClient.BillingResponseCode.OK) {
-                plansStatusFlow.value = PlansStatus.ERROR
-                noticeFlow.value = "Google Play could not load the plans — " + describe(result)
-                return@queryProductDetailsAsync
-            }
-            val list = detailsResult.productDetailsList.mapNotNull { toPlan(it) }
-            plansFlow.value = list.sortedBy { if (it.productId == MONTHLY) 0 else 1 }
-            if (list.isEmpty()) {
-                plansStatusFlow.value = PlansStatus.EMPTY
-                noticeFlow.value = "No plans are available for this install. Install MGRS GPS " +
-                    "from the Play Store and make sure you are signed in to Google Play."
-            } else {
-                plansStatusFlow.value = PlansStatus.LOADED
+            scope.launch {
+                // Multiple Restore taps can overlap on one ready client. An old
+                // empty/error result must not undo the newer query's plans or status.
+                if (closed || c !== client || !planQueries.complete(query)) return@launch
+                if (result.responseCode != BillingClient.BillingResponseCode.OK) {
+                    plansStatusFlow.value = PlansStatus.ERROR
+                    noticeFlow.value = "Google Play could not load the plans — " + describe(result)
+                    return@launch
+                }
+                val list = detailsResult.productDetailsList.mapNotNull { toPlan(it) }
+                plansFlow.value = list.sortedBy { if (it.productId == MONTHLY) 0 else 1 }
+                if (list.isEmpty()) {
+                    plansStatusFlow.value = PlansStatus.EMPTY
+                    noticeFlow.value = "No plans are available for this install. Install MGRS GPS " +
+                        "from the Play Store and make sure you are signed in to Google Play."
+                } else {
+                    plansStatusFlow.value = PlansStatus.LOADED
+                }
             }
         }
     }

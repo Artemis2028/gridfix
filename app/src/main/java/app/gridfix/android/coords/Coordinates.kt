@@ -20,6 +20,12 @@ import kotlin.math.tan
 
 object Coordinates {
 
+    /** Canonical longitude, also used for a shortest signed longitude difference. */
+    internal fun normalizeLongitude(longitude: Double): Double {
+        if (longitude >= -180.0 && longitude < 180.0) return longitude
+        return ((longitude + 180.0) % 360.0 + 360.0) % 360.0 - 180.0
+    }
+
     data class MgrsParts(
         val gzd: String,
         val square: String,
@@ -334,8 +340,10 @@ object Coordinates {
     /** UTM easting/northing of a point projected in a SPECIFIC zone (for grid drawing). */
     fun utmForZone(lat: Double, lon: Double, zone: Int, north: Boolean): DoubleArray {
         val latRad = Math.toRadians(lat)
-        val lonOrigin = Math.toRadians(((zone - 1) * 6 - 180 + 3).toDouble())
-        val lonRad = Math.toRadians(lon)
+        val lonOrigin = ((zone - 1) * 6 - 180 + 3).toDouble()
+        // A point just west of -180 is still close to zone 60's +177 meridian.
+        // The polynomial must see +3 degrees, not a -357-degree displacement.
+        val deltaLon = Math.toRadians(normalizeLongitude(lon - lonOrigin))
         val a = 6378137.0
         val f = 1.0 / 298.257223563
         val k0 = 0.9996
@@ -344,7 +352,7 @@ object Coordinates {
         val n = a / sqrt(1.0 - e2 * sin(latRad).pow(2))
         val t = tan(latRad).pow(2)
         val c = ep2 * cos(latRad).pow(2)
-        val bigA = cos(latRad) * (lonRad - lonOrigin)
+        val bigA = cos(latRad) * deltaLon
         val m = a * (
             (1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0) * latRad -
                 (3.0 * e2 / 8.0 + 3.0 * e2 * e2 / 32.0 + 45.0 * e2 * e2 * e2 / 1024.0) * sin(2.0 * latRad) +
@@ -402,7 +410,7 @@ object Coordinates {
                 (1.0 + 2.0 * t1 + c1) * d.pow(3) / 6.0 +
                 (5.0 - 2.0 * c1 + 28.0 * t1 - 3.0 * c1 * c1 + 8.0 * ep2 + 24.0 * t1 * t1) * d.pow(5) / 120.0
             ) / cos1
-        return doubleArrayOf(Math.toDegrees(lat), Math.toDegrees(lon))
+        return doubleArrayOf(Math.toDegrees(lat), normalizeLongitude(Math.toDegrees(lon)))
     }
 
     /** MGRS latitude band letter for a latitude in -80..84, e.g. 'R' for Dubai. */
