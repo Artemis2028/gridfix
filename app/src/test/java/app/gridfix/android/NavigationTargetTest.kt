@@ -36,10 +36,10 @@ class NavigationTargetTest {
     }
 
     @Test
-    fun nothingSelectedFallsBackToFirstVisible() {
+    fun nothingSelectedRequiresChoosingATarget() {
         val list = NavigationTarget.navigable(listOf(bHidden, cHiddenFolder, a), folders, null)
         assertEquals(listOf("A"), list.map { it.id })
-        assertEquals("A", NavigationTarget.resolve(list, null)?.id)
+        assertNull(NavigationTarget.resolve(list, null))
     }
 
     @Test

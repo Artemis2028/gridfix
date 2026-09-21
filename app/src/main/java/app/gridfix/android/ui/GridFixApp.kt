@@ -120,6 +120,8 @@ import app.gridfix.android.location.TrackRecorderService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import org.osmdroid.util.GeoPoint
 import kotlin.random.Random
@@ -127,6 +129,7 @@ import java.io.File
 import app.gridfix.android.location.LocationTracker
 import app.gridfix.android.location.isUsableForNavigation
 import app.gridfix.android.location.PocketGuideService
+import app.gridfix.android.location.pocketGuideUpdates
 import app.gridfix.android.ui.screens.MapScreen
 import app.gridfix.android.ui.screens.NavigateScreen
 import app.gridfix.android.ui.screens.PositionScreen
@@ -232,16 +235,35 @@ fun GridFixApp() {
     // to that point, never to whichever visible one happens to come first.
     val navigableWaypoints = NavigationTarget.navigable(waypoints, folders, selectedId)
     val scope = rememberCoroutineScope()
-    // The running pocket guide follows its target by ID from here, not from the
-    // Navigate screen: a waypoint moved from the Waypoints list, or a manual G-M
-    // angle changed in Settings, reaches the service whether or not Navigate is
-    // composed. Deleting the target stops it.
-    val guideState by PocketGuideService.active.collectAsStateWithLifecycle()
-    LaunchedEffect(guideState?.targetId, waypoints, settings.declinationOverride) {
-        val guidedId = guideState?.targetId ?: return@LaunchedEffect
-        val target = waypoints.firstOrNull { it.id == guidedId }
-        if (target == null) PocketGuideService.stop(context)
-        else PocketGuideService.update(context, target, settings.declinationOverride)
+    val navigationSelections = remember { java.util.concurrent.atomic.AtomicLong(0L) }
+    // Read authoritative flows even when Navigate is not composed or the activity
+    // is stopped. Their first emissions must arrive before deciding a target was
+    // deleted; the UI's initial empty list/default settings are not saved data.
+    LaunchedEffect(waypointRepo, repo) {
+        pocketGuideUpdates(
+            waypointRepo.waypoints,
+            repo.settings,
+            PocketGuideService.active.map { it?.targetId }.distinctUntilChanged(),
+        ).collect { update ->
+            val target = update.waypoint
+            if (target == null) PocketGuideService.stop(context, update.expectedTargetId)
+            else PocketGuideService.update(context, target, update.declinationOverride, update.expectedTargetId)
+        }
+    }
+    suspend fun selectNavigationTarget(id: String) {
+        val selection = navigationSelections.incrementAndGet()
+        val previousGuide = PocketGuideService.active.value
+        waypointRepo.select(id)
+        if (previousGuide != null) {
+            val target = waypointRepo.waypoints.first().firstOrNull { it.id == id } ?: return
+            val preferences = repo.settings.first()
+            // A slower read for B must not undo a newer selection C. A stopped or
+            // explicitly restarted guide is a different run and must be left alone.
+            if (selection != navigationSelections.get() ||
+                PocketGuideService.active.value?.runId != previousGuide.runId
+            ) return
+            PocketGuideService.update(context, target, preferences.declinationOverride, previousGuide.targetId, retarget = true)
+        }
     }
     LaunchedEffect(entitlement) {
         if (!BuildConfig.DEBUG && entitlement == BillingManager.State.LOCKED) PocketGuideService.stop(context)
@@ -763,7 +785,7 @@ fun GridFixApp() {
                                         ),
                                         System.currentTimeMillis(),
                                     )
-                                    waypointRepo.select(id)
+                                    selectNavigationTarget(id)
                                 }
                             }
                         },
@@ -776,7 +798,7 @@ fun GridFixApp() {
                         settings = settings,
                         waypoints = navigableWaypoints,
                         selectedId = selectedId,
-                        onSelect = { id -> scope.launch { waypointRepo.select(id) } },
+                        onSelect = { id -> scope.launch { selectNavigationTarget(id) } },
                     )
                 }
                 composable("map") {
@@ -794,17 +816,15 @@ fun GridFixApp() {
                             scope.launch { waypointRepo.update(id, draft) }
                         },
                         onNavigateTo = { id ->
-                            scope.launch { waypointRepo.select(id) }
+                            scope.launch { selectNavigationTarget(id) }
                             goTo("navigate")
                         },
                         graphics = graphics,
                         onAddGraphic = { name, type, points, folder, affiliation, echelon ->
-                            scope.launch {
-                                // addFolder returns the stored spelling (case-insensitive match) and
-                                // makes sure the overlay eye toggle exists
-                                val f = waypointRepo.addFolder(folder)
-                                graphicsRepo.add(name, type, points, f, affiliation, System.currentTimeMillis(), echelon)
-                            }
+                            // addFolder returns the stored spelling (case-insensitive match) and
+                            // makes sure the overlay eye toggle exists
+                            val f = waypointRepo.addFolder(folder)
+                            graphicsRepo.add(name, type, points, f, affiliation, System.currentTimeMillis(), echelon)
                         },
                         onUpdateGraphic = { id, name, folder, affiliation, echelon ->
                             scope.launch {
@@ -816,29 +836,8 @@ fun GridFixApp() {
                             scope.launch { graphicsRepo.updatePoints(id, points) }
                         },
                         onDeleteGraphic = { id -> scope.launch { graphicsRepo.delete(id) } },
-                        onSaveRouteWps = { base, pts, folder ->
-                            scope.launch {
-                                val f = waypointRepo.addFolder(folder)
-                                val prefix = "$base WP "
-                                // Replace only this folder's generated points. A route of the
-                                // same name saved into another folder keeps its own set.
-                                waypointRepo.deleteAll(
-                                    waypoints.filter { it.folder == f && it.name.startsWith(prefix) }.map { it.id }.toSet()
-                                )
-                                waypointRepo.addAll(
-                                    pts.mapIndexed { i, v ->
-                                        WaypointDraft(
-                                            name = prefix + (i + 1),
-                                            lat = v.lat,
-                                            lon = v.lon,
-                                            folder = f,
-                                            symbol = "",
-                                            affiliation = "none",
-                                        )
-                                    },
-                                    System.currentTimeMillis(),
-                                )
-                            }
+                        onSaveRouteWps = { routeId, base, pts, folder ->
+                            waypointRepo.replaceRouteWaypoints(routeId, base, pts, folder, System.currentTimeMillis())
                         },
                         viewedTrackId = shownTrackId,
                         onRecordStart = beginRecording,
@@ -941,7 +940,7 @@ fun GridFixApp() {
                             }
                         },
                         onNavigateTo = { id ->
-                            scope.launch { waypointRepo.select(id) }
+                            scope.launch { selectNavigationTarget(id) }
                             goTo("navigate")
                         },
                         graphics = graphics,
@@ -1147,7 +1146,7 @@ fun GridFixApp() {
                         val ids = waypoints.filter { it.folder == f }.map { it.id }
                         if (ids.size >= 2) {
                             courseRepo.start(f, ids, System.currentTimeMillis())
-                            ids.firstOrNull()?.let { waypointRepo.select(it) }
+                            ids.firstOrNull()?.let { selectNavigationTarget(it) }
                         }
                     }
                 },
@@ -1195,7 +1194,7 @@ fun GridFixApp() {
                             }
                             if (ids.size >= 2) {
                                 courseRepo.start(folderName, ids, System.currentTimeMillis())
-                                ids.firstOrNull()?.let { waypointRepo.select(it) }
+                                ids.firstOrNull()?.let { selectNavigationTarget(it) }
                             }
                         }
                     }
@@ -1216,7 +1215,7 @@ fun GridFixApp() {
         LaunchedEffect(activeCourse?.nextIndex, activeCourse?.name) {
             val c = activeCourse ?: return@LaunchedEffect
             if (!c.done) {
-                c.waypointIds.getOrNull(c.nextIndex)?.let { waypointRepo.select(it) }
+                c.waypointIds.getOrNull(c.nextIndex)?.let { selectNavigationTarget(it) }
             }
         }
         LaunchedEffect(

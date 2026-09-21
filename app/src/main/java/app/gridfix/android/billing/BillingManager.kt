@@ -18,7 +18,6 @@ import com.android.billingclient.api.BillingResult
 import com.android.billingclient.api.PendingPurchasesParams
 import com.android.billingclient.api.ProductDetails
 import com.android.billingclient.api.Purchase
-import com.android.billingclient.api.PurchasesUpdatedListener
 import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
 import kotlinx.coroutines.CoroutineScope
@@ -57,7 +56,7 @@ private val Context.billingStore by preferencesDataStore(
  * error path lands on the cache, only one BillingClient exists at a time, and
  * every user action that can fail produces a readable notice.
  */
-class BillingManager(private val context: Context) : PurchasesUpdatedListener {
+class BillingManager(private val context: Context) {
 
     enum class State { CHECKING, ENTITLED, LOCKED }
 
@@ -90,7 +89,7 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
     private val acknowledgementWakeups = Channel<Unit>(Channel.CONFLATED)
 
     private var client: BillingClient? = null
-    private var connecting = false
+    private val connectionAttempts = BillingConnectionAttempts()
     private var userRestore = false
     private var closed = false
     private var purchasesGeneration = 0L
@@ -142,9 +141,10 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
     fun close() {
         closed = true
         scope.cancel()
-        client?.endConnection()
+        val old = client
         client = null
-        connecting = false
+        connectionAttempts.clear()
+        old?.endConnection()
     }
 
     /** Re-check purchases when the app comes back to the foreground. */
@@ -152,7 +152,7 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
         if (closed) return
         retryAcknowledgements()
         val c = client
-        if (c != null && c.isReady) refreshPurchases() else if (!connecting) connect()
+        if (c != null && c.isReady) refreshPurchases() else if (!connectionAttempts.isConnecting) connect()
     }
 
     /** Paywall "Restore purchases" / retry: reconnect if needed, re-query everything. */
@@ -172,18 +172,22 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
     }
 
     private fun connect() {
-        if (closed || connecting) return
+        if (closed || connectionAttempts.isConnecting) return
         client?.let { old ->
             if (old.isReady) {
                 refreshPurchases()
                 queryPlans()
                 return
             }
+            client = null
+            connectionAttempts.clear()
             old.endConnection()
         }
-        connecting = true
+        val attempt = connectionAttempts.begin() ?: return
+        plansStatusFlow.value = PlansStatus.LOADING
+        ++plansGeneration // An old product query's timer cannot expire this connection.
         val c = BillingClient.newBuilder(context)
-            .setListener(this)
+            .setListener { result, purchases -> onPurchasesUpdated(attempt, result, purchases) }
             .enablePendingPurchases(
                 PendingPurchasesParams.newBuilder().enableOneTimeProducts().build()
             )
@@ -192,10 +196,10 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
             .enableAutoServiceReconnection()
             .build()
         client = c
+        armConnectionTimeout(c, attempt)
         c.startConnection(object : BillingClientStateListener {
             override fun onBillingSetupFinished(result: BillingResult) {
-                if (c !== client) return   // superseded by a newer client
-                connecting = false
+                if (closed || c !== client || !connectionAttempts.complete(attempt)) return
                 if (result.responseCode == BillingClient.BillingResponseCode.OK) {
                     refreshPurchases()
                     queryPlans()
@@ -206,8 +210,7 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
             }
 
             override fun onBillingServiceDisconnected() {
-                if (c !== client) return
-                connecting = false
+                if (closed || c !== client || !connectionAttempts.complete(attempt)) return
                 if (stateFlow.value == State.CHECKING) fallBackToCache(null)
                 if (plansStatusFlow.value == PlansStatus.LOADING) {
                     plansStatusFlow.value = PlansStatus.ERROR
@@ -215,7 +218,20 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
                 }
             }
         })
-        armPlansTimeout()
+    }
+
+    private fun armConnectionTimeout(c: BillingClient, attempt: BillingConnectionAttempts.Attempt) {
+        scope.launch {
+            delay(STARTUP_TIMEOUT_MS)
+            if (closed || c !== client || !connectionAttempts.expire(attempt)) return@launch
+            // Clear ownership before endConnection: it may itself produce callbacks.
+            client = null
+            c.endConnection()
+            plansStatusFlow.value = PlansStatus.ERROR
+            val message = "Google Play is not answering — check your connection and tap Retry"
+            noticeFlow.value = message
+            fallBackToCache(message)
+        }
     }
 
     /** A plan query that never answers must not leave the paywall spinning. */
@@ -487,9 +503,13 @@ class BillingManager(private val context: Context) : PurchasesUpdatedListener {
         }
     }
 
-    override fun onPurchasesUpdated(result: BillingResult, purchases: List<Purchase>?) {
+    private fun onPurchasesUpdated(
+        attempt: BillingConnectionAttempts.Attempt,
+        result: BillingResult,
+        purchases: List<Purchase>?,
+    ) {
         scope.launch {
-            if (closed) return@launch
+            if (closed || !connectionAttempts.isCurrent(attempt)) return@launch
             when (result.responseCode) {
                 BillingClient.BillingResponseCode.OK -> {
                     ++purchasesGeneration

@@ -33,8 +33,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+import java.util.concurrent.atomic.AtomicLong
 
-data class PocketGuideState(val targetId: String, val targetName: String, val status: String)
+data class PocketGuideState(val targetId: String, val targetName: String, val status: String, val runId: Long)
 
 /**
  * Owns live location, compass and haptics independently of the screen lifecycle.
@@ -47,6 +48,7 @@ class PocketGuideService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var target: Target? = null
     private var running = false
+    private val commands = PocketGuideCommands()
     private val arrival = ArrivalAlertState()
     private val vibrator by lazy { deviceVibrator(this) }
 
@@ -65,6 +67,16 @@ class PocketGuideService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val expectedTargetId = intent?.getStringExtra(EXPECTED_TARGET_ID)
+        val expectedRun = intent?.getLongExtra(EXPECTED_RUN, -1L) ?: -1L
+        val sequence = intent?.getLongExtra(COMMAND_SEQUENCE, -1L) ?: -1L
+        // Delayed deletion cannot stop a different target or a newly started run.
+        if (intent?.action == ACTION_STOP && expectedTargetId != null &&
+            (!running || !commands.canStop(expectedRun, sequence, expectedTargetId))
+        ) {
+            if (!running) stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
         if (intent == null || intent.action == ACTION_STOP) {
             finishGuidance()
             stopSelf()
@@ -73,19 +85,33 @@ class PocketGuideService : Service() {
         val id = intent.getStringExtra("target_id")
         val lat = intent.getDoubleExtra("latitude", Double.NaN)
         val lon = intent.getDoubleExtra("longitude", Double.NaN)
-        if (intent.action != ACTION_START || id.isNullOrBlank() || !lat.isFinite() || lat !in -90.0..90.0 ||
+        if (intent.action !in listOf(ACTION_START, ACTION_UPDATE) || id.isNullOrBlank() || !lat.isFinite() || lat !in -90.0..90.0 ||
             !lon.isFinite() || lon !in -180.0..180.0
         ) {
+            if (intent.action == ACTION_UPDATE) {
+                if (!running) stopSelfResult(startId)
+                return START_NOT_STICKY
+            }
             finishGuidance()
             stopSelf()
             return START_NOT_STICKY
+        }
+        if (intent.action == ACTION_UPDATE) {
+            if (!running || expectedTargetId == null || !commands.update(
+                    expectedRun, sequence, expectedTargetId, id, intent.getBooleanExtra(RETARGET, false),
+                )
+            ) {
+                if (!running) stopSelfResult(startId)
+                return START_NOT_STICKY
+            }
+        } else {
+            commands.start(nextRunId.incrementAndGet(), id)
         }
         target = Target(
             id, intent.getStringExtra("name") ?: "Waypoint", lat, lon,
             intent.getFloatExtra("declination", Float.NaN).takeIf { it.isFinite() },
         )
-        lastSent = target
-        val initial = PocketGuideState(id, target!!.name, "Waiting for a fresh location and heading")
+        val initial = PocketGuideState(id, target!!.name, "Waiting for a fresh location and heading", commands.runId!!)
         try {
             if (Build.VERSION.SDK_INT >= 29) {
                 ServiceCompat.startForeground(this, NOTIF_ID, notification(initial), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
@@ -165,7 +191,7 @@ class PocketGuideService : Service() {
                 cue == GuideCue.RIGHT -> "Turn right · two short taps"
                 else -> "Turn left · one long pulse"
             }
-            val state = PocketGuideState(t.id, t.name, status)
+            val state = PocketGuideState(t.id, t.name, status, commands.runId!!)
             if (state != _active.value) {
                 _active.value = state
                 runCatching { (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, notification(state)) }
@@ -220,7 +246,7 @@ class PocketGuideService : Service() {
     private fun finishGuidance() {
         running = false
         target = null
-        lastSent = null
+        commands.clear()
         scope.cancel()
         runCatching { location.stop() }
         runCatching { compass.stop() }
@@ -247,11 +273,16 @@ class PocketGuideService : Service() {
         private const val CHANNEL_ID = "gridfix_pocket_guide"
         private const val NOTIF_ID = 43   // 42 is the track recorder's error notification
         private const val ACTION_START = "app.gridfix.android.guide.START"
+        private const val ACTION_UPDATE = "app.gridfix.android.guide.UPDATE"
         private const val ACTION_STOP = "app.gridfix.android.guide.STOP"
+        private const val EXPECTED_TARGET_ID = "expected_target_id"
+        private const val EXPECTED_RUN = "expected_run"
+        private const val COMMAND_SEQUENCE = "command_sequence"
+        private const val RETARGET = "retarget"
+        private val nextRunId = AtomicLong(0L)
+        private val nextCommandSequence = AtomicLong(0L)
         private val _active = MutableStateFlow<PocketGuideState?>(null)
         val active: StateFlow<PocketGuideState?> = _active.asStateFlow()
-        /** The last target the service accepted; lets [update] skip no-op restarts. */
-        @Volatile private var lastSent: Target? = null
         private val _error = MutableStateFlow<String?>(null)
         val error: StateFlow<String?> = _error.asStateFlow()
 
@@ -271,28 +302,51 @@ class PocketGuideService : Service() {
 
         /**
          * Push the target's current coordinates and declination to a guide that is
-         * already running for [waypoint]. Safe from anywhere: with the foreground
+         * already running for [expectedTargetId]. Safe from anywhere: with the foreground
          * service up the app is not "background" for startService, and a guide that
-         * is not running (or runs for another point) is left alone.
+         * is not running (or runs for another point) is left alone. Explicit
+         * [retarget] selections may advance within the same run; the app checks
+         * that the initiating run and selection request are still current.
          */
-        fun update(context: Context, waypoint: Waypoint, declinationOverride: Float?) {
+        fun update(
+            context: Context,
+            waypoint: Waypoint,
+            declinationOverride: Float?,
+            expectedTargetId: String = waypoint.id,
+            retarget: Boolean = false,
+        ) {
             val state = _active.value ?: return
-            if (state.targetId != waypoint.id) return
+            if (!retarget && state.targetId != expectedTargetId) return
             val dec = declinationOverride ?: Float.NaN
-            val same = lastSent?.let {
-                it.id == waypoint.id && it.lat == waypoint.lat && it.lon == waypoint.lon &&
-                    it.name == waypoint.name && (it.declination ?: Float.NaN).equals(dec)
-            } ?: false
-            if (same) return
-            val intent = Intent(context, PocketGuideService::class.java).setAction(ACTION_START)
+            // Flow distinctUntilChanged handles no-ops. Comparing only with the
+            // last accepted target here could drop a revert while an edit is queued.
+            val intent = Intent(context, PocketGuideService::class.java).setAction(ACTION_UPDATE)
+                .putExtra(EXPECTED_TARGET_ID, expectedTargetId)
+                .putExtra(EXPECTED_RUN, state.runId)
+                .putExtra(COMMAND_SEQUENCE, nextCommandSequence.incrementAndGet())
+                .putExtra(RETARGET, retarget)
                 .putExtra("target_id", waypoint.id).putExtra("name", waypoint.name)
                 .putExtra("latitude", waypoint.lat).putExtra("longitude", waypoint.lon)
                 .putExtra("declination", dec)
             runCatching { context.startService(intent) }
         }
 
-        fun stop(context: Context) {
-            context.stopService(Intent(context, PocketGuideService::class.java))
+        fun stop(context: Context, expectedTargetId: String? = null) {
+            val state = _active.value
+            if (expectedTargetId == null) {
+                context.stopService(Intent(context, PocketGuideService::class.java))
+            } else if (state != null && state.targetId == expectedTargetId) {
+                // A delayed deletion for A must not stop a guide already retargeted
+                // to B; an unconditional stopService would bypass the receiver guard.
+                runCatching {
+                    context.startService(
+                        Intent(context, PocketGuideService::class.java).setAction(ACTION_STOP)
+                            .putExtra(EXPECTED_TARGET_ID, expectedTargetId)
+                            .putExtra(EXPECTED_RUN, state.runId)
+                            .putExtra(COMMAND_SEQUENCE, nextCommandSequence.incrementAndGet()),
+                    )
+                }
+            }
         }
     }
 }

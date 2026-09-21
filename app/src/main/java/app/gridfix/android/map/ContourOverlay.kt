@@ -16,14 +16,11 @@ import kotlinx.coroutines.launch
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.Projection
 import org.osmdroid.views.overlay.Overlay
-import kotlin.math.asinh
 import kotlin.math.atan
 import kotlin.math.ceil
 import kotlin.math.cos
-import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.sinh
-import kotlin.math.tan
 
 /**
  * Contour lines generated on-device from the same Terrarium elevation tiles the
@@ -107,13 +104,6 @@ class ContourOverlay(
         if (ok) failedAt.remove(key) else failedAt[key] = SystemClock.elapsedRealtime()
     }
 
-    private fun tileX(lon: Double): Double = (lon + 180.0) / 360.0 * (1 shl Elevation.ZOOM)
-
-    private fun tileY(lat: Double): Double {
-        val latRad = Math.toRadians(lat)
-        return (1.0 - asinh(tan(latRad)) / Math.PI) / 2.0 * (1 shl Elevation.ZOOM)
-    }
-
     private fun tileLat(y: Double): Double =
         Math.toDegrees(atan(sinh(Math.PI * (1.0 - 2.0 * y / (1 shl Elevation.ZOOM)))))
 
@@ -135,11 +125,8 @@ class ContourOverlay(
             else -> 50
         }
 
-        val x0 = floor(tileX(bbox.lonWest)).toInt()
-        val x1 = floor(tileX(bbox.lonEast)).toInt()
-        val y0 = floor(tileY(latN)).toInt()
-        val y1 = floor(tileY(latS)).toInt()
-        if ((x1 - x0 + 1).toLong() * (y1 - y0 + 1).toLong() > 72L) return
+        val coverage = terrainTileCoverage(latN, latS, bbox.lonWest, bbox.lonEast, Elevation.ZOOM)
+        if (coverage.count > 72L) return
 
         val lineColor = if (nightMode) Color.rgb(196, 45, 36) else Color.rgb(148, 94, 42)
         minorPaint.color = lineColor
@@ -148,9 +135,8 @@ class ContourOverlay(
         majorPaint.alpha = if (nightMode) 190 else 215
 
         var anyReady = false
-        for (ty in y0..y1) {
-            for (tx in x0..x1) {
-                if (ty < 0 || ty >= (1 shl Elevation.ZOOM)) continue
+        for (ty in coverage.rows) {
+            for (tx in coverage.columns.asSequence().flatMap { it.asSequence() }) {
                 val key = "$tx/$ty/$interval"
                 val tc = cached(key)
                 if (tc == null) {

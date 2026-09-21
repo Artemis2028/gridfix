@@ -312,66 +312,27 @@ object InterchangeFiles {
         val parser = newParser()
         parser.setInput(stream, null)
 
-        val folderStack = ArrayDeque<String>()
-        var awaitingFolderName = false
-        var inPlacemark = false
-        var pmName = ""
-        var geomType = ""        // point / line / polygon
-        var coordText = ""
-        var inCoordinates = false
-        var textBuf = ""
+        val folderStack = ArrayDeque<Pair<Int, String>>()
 
         var event = parser.eventType
         while (event != XmlPullParser.END_DOCUMENT) {
             when (event) {
                 XmlPullParser.START_TAG -> {
-                    textBuf = ""
-                    when (parser.name) {
-                        "Folder" -> {
-                            folderStack.addLast("")
-                            awaitingFolderName = true
+                    when (if (isKmlNamespace(parser.namespace)) parser.name else "") {
+                        "Folder" -> folderStack.addLast(parser.depth to "")
+                        "name" -> if (folderStack.lastOrNull()?.first == parser.depth - 1) {
+                            val depth = folderStack.removeLast().first
+                            folderStack.addLast(depth to parser.nextText().trim())
                         }
                         "Placemark" -> {
-                            inPlacemark = true
-                            pmName = ""
-                            geomType = ""
-                            coordText = ""
-                        }
-                        "Point" -> if (inPlacemark) geomType = "point"
-                        "LineString" -> if (inPlacemark) geomType = "line"
-                        "Polygon" -> if (inPlacemark) geomType = "polygon"
-                        "coordinates" -> inCoordinates = true
-                    }
-                }
-                XmlPullParser.TEXT -> textBuf += parser.text ?: ""
-                XmlPullParser.END_TAG -> {
-                    when (parser.name) {
-                        "name" -> {
-                            val t = textBuf.trim()
-                            if (inPlacemark) {
-                                if (pmName.isEmpty()) pmName = t
-                            } else if (awaitingFolderName && folderStack.isNotEmpty()) {
-                                folderStack.removeLast()
-                                folderStack.addLast(t)
-                                awaitingFolderName = false
-                            }
-                        }
-                        "coordinates" -> {
-                            inCoordinates = false
-                            if (inPlacemark && coordText.isEmpty()) coordText = textBuf
-                        }
-                        "Folder" -> {
-                            if (folderStack.isNotEmpty()) folderStack.removeLast()
-                            awaitingFolderName = false
-                        }
-                        "Placemark" -> {
-                            if (inPlacemark) {
-                                val folder = folderStack.lastOrNull { it.isNotBlank() } ?: IMPORT_FOLDER
-                                val pts = parseKmlCoordinates(coordText, geomType == "polygon")
+                            val folder = folderStack.lastOrNull { it.second.isNotBlank() }?.second ?: IMPORT_FOLDER
+                            val (name, geometries) = readKmlPlacemark(parser)
+                            for (geometry in geometries) {
+                                val pts = geometry.points
                                 when {
-                                    geomType == "point" && pts.isNotEmpty() -> wps.add(
+                                    geometry.type == "Point" && pts.size == 1 -> wps.add(
                                         WaypointDraft(
-                                            name = pmName.ifBlank { "WP ${wps.size + 1}" },
+                                            name = name.ifBlank { "WP ${wps.size + 1}" },
                                             lat = pts[0].lat,
                                             lon = pts[0].lon,
                                             folder = folder,
@@ -379,22 +340,106 @@ object InterchangeFiles {
                                             affiliation = "none",
                                         )
                                     )
-                                    geomType == "line" && pts.size >= 2 -> lines.add(
-                                        ImportedLine(pmName.ifBlank { "Imported line" }, folder, pts)
+                                    geometry.type == "LineString" && pts.size >= 2 -> lines.add(
+                                        ImportedLine(name.ifBlank { "Imported line" }, folder, pts)
                                     )
-                                    geomType == "polygon" && pts.size >= 3 -> areas.add(
-                                        ImportedLine(pmName.ifBlank { "Imported area" }, folder, pts)
+                                    geometry.type == "Polygon" && pts.size >= 3 -> areas.add(
+                                        ImportedLine(name.ifBlank { "Imported area" }, folder, pts)
                                     )
                                 }
                             }
-                            inPlacemark = false
                         }
                     }
+                }
+                XmlPullParser.END_TAG -> if (isKmlNamespace(parser.namespace) && parser.name == "Folder" &&
+                    folderStack.lastOrNull()?.first == parser.depth
+                ) {
+                    folderStack.removeLast()
                 }
             }
             event = parser.next()
         }
         return ImportedData(waypoints = wps, lines = lines, areas = areas)
+    }
+
+    private data class KmlGeometry(val type: String, val points: List<GeoVertex>)
+
+    private val kmlNamespaces = setOf(
+        "http://www.opengis.net/kml/2.2", "http://earth.google.com/kml/2.0", "http://earth.google.com/kml/2.1",
+        "http://earth.google.com/kml/2.2",
+    )
+    private fun isKmlNamespace(namespace: String?): Boolean = namespace.isNullOrEmpty() || namespace in kmlNamespaces
+
+    /** Consume one element, visiting only its direct children. Each visitor consumes its child. */
+    private fun readKmlChildren(parser: XmlPullParser, child: () -> Unit) {
+        val depth = parser.depth
+        while (parser.next() != XmlPullParser.END_DOCUMENT) {
+            if (parser.eventType == XmlPullParser.END_TAG && parser.depth == depth) return
+            if (parser.eventType == XmlPullParser.START_TAG) child()
+        }
+    }
+
+    private fun skipKmlElement(parser: XmlPullParser) {
+        val depth = parser.depth
+        while (parser.next() != XmlPullParser.END_DOCUMENT) {
+            if (parser.eventType == XmlPullParser.END_TAG && parser.depth == depth) return
+        }
+    }
+
+    private fun readKmlPlacemark(parser: XmlPullParser): Pair<String, List<KmlGeometry>> {
+        var name = ""
+        val geometries = ArrayList<KmlGeometry>()
+        readKmlChildren(parser) {
+            if (isKmlNamespace(parser.namespace) && parser.name == "name") name = parser.nextText().trim()
+            else geometries.addAll(readKmlGeometry(parser))
+        }
+        return name to geometries
+    }
+
+    /** Each MultiGeometry child owns its coordinates; siblings can never exchange positions or types. */
+    private fun readKmlGeometry(parser: XmlPullParser, nesting: Int = 0): List<KmlGeometry> {
+        require(nesting <= 64) { "KML geometry nesting is too deep" }
+        if (!isKmlNamespace(parser.namespace)) {
+            skipKmlElement(parser)
+            return emptyList()
+        }
+        val type = parser.name
+        return when (type) {
+            "MultiGeometry" -> buildList {
+                readKmlChildren(parser) { addAll(readKmlGeometry(parser, nesting + 1)) }
+            }
+            "Point", "LineString" -> listOf(KmlGeometry(type, readKmlGeometryCoordinates(parser, false)))
+            "Polygon" -> {
+                var points = emptyList<GeoVertex>()
+                readKmlChildren(parser) {
+                    when (if (isKmlNamespace(parser.namespace)) parser.name else "") {
+                        "outerBoundaryIs" -> readKmlChildren(parser) {
+                            if (isKmlNamespace(parser.namespace) && parser.name == "LinearRing") {
+                                points = readKmlGeometryCoordinates(parser, true)
+                            } else skipKmlElement(parser)
+                        }
+                        // Our area model has one outline. Filling a hole would change the supplied area.
+                        "innerBoundaryIs" -> throw IllegalArgumentException("KML polygons with holes are not supported")
+                        else -> skipKmlElement(parser)
+                    }
+                }
+                listOf(KmlGeometry(type, points))
+            }
+            else -> {
+                skipKmlElement(parser)
+                emptyList()
+            }
+        }
+    }
+
+    private fun readKmlGeometryCoordinates(parser: XmlPullParser, polygon: Boolean): List<GeoVertex> {
+        var points = emptyList<GeoVertex>()
+        readKmlChildren(parser) {
+            if (isKmlNamespace(parser.namespace) && parser.name == "coordinates") {
+                points = parseKmlCoordinates(parser.nextText(), polygon)
+            } else skipKmlElement(parser)
+        }
+        return points
     }
 
     /** KML coordinate lists are "lon,lat[,alt]" tuples separated by whitespace. */

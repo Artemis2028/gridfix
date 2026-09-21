@@ -134,6 +134,82 @@ class InterchangeFilesTest {
     }
 
     @Test
+    fun `mixed KML geometries retain their own coordinates in either order`() {
+        val line = "<LineString><coordinates>54,24 55,25</coordinates></LineString>"
+        val point = "<Point><coordinates>60,30</coordinates></Point>"
+        for (children in listOf(line + point, point + line)) {
+            val data = kml("""
+                <Folder><name>Mission</name><Placemark><MultiGeometry>$children</MultiGeometry>
+                  <name>Mixed geometry</name>
+                </Placemark></Folder>
+            """.trimIndent())
+            val waypoint = data.waypoints.single()
+            assertEquals(30.0, waypoint.lat, 0.0)
+            assertEquals(60.0, waypoint.lon, 0.0)
+            assertEquals("Mixed geometry", waypoint.name)
+            assertEquals("Mission", waypoint.folder)
+            assertEquals(listOf(GeoVertex(24.0, 54.0), GeoVertex(25.0, 55.0)), data.lines.single().points)
+            assertEquals("Mixed geometry", data.lines.single().name)
+            assertEquals("Mission", data.lines.single().folder)
+            assertTrue(data.areas.isEmpty())
+        }
+    }
+
+    @Test
+    fun `nested KML MultiGeometry preserves every polygon line and point`() {
+        val data = kml("""
+            <Placemark><name>Compound</name><MultiGeometry>
+              <Point><coordinates>60,30</coordinates></Point>
+              <MultiGeometry>
+                <Polygon><outerBoundaryIs><LinearRing>
+                  <coordinates>10,20 11,20 11,21 10,20</coordinates>
+                </LinearRing></outerBoundaryIs></Polygon>
+                <LineString><coordinates>54,24 55,25</coordinates></LineString>
+                <Point><coordinates>61,31</coordinates></Point>
+              </MultiGeometry>
+            </MultiGeometry></Placemark>
+        """.trimIndent())
+        assertEquals(listOf(30.0, 31.0), data.waypoints.map { it.lat })
+        assertEquals(listOf(60.0, 61.0), data.waypoints.map { it.lon })
+        assertEquals(listOf(GeoVertex(20.0, 10.0), GeoVertex(20.0, 11.0), GeoVertex(21.0, 11.0)), data.areas.single().points)
+        assertEquals(listOf(GeoVertex(24.0, 54.0), GeoVertex(25.0, 55.0)), data.lines.single().points)
+    }
+
+    @Test
+    fun `unrelated KML extension coordinates cannot become a geometry`() {
+        val data = kml("""
+            <Placemark><ExtendedData><Point><coordinates>1,2</coordinates></Point></ExtendedData>
+              <MultiGeometry xmlns:other="urn:other">
+                <other:Point><other:coordinates>3,4</other:coordinates></other:Point>
+                <Point><coordinates>60,30</coordinates></Point>
+              </MultiGeometry>
+            </Placemark>
+        """.trimIndent())
+        assertEquals(30.0, data.waypoints.single().lat, 0.0)
+        assertEquals(60.0, data.waypoints.single().lon, 0.0)
+    }
+
+    @Test
+    fun `KML polygons with holes are rejected instead of silently filled`() {
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            kml("""
+                <Placemark><Polygon>
+                  <outerBoundaryIs><LinearRing><coordinates>0,0 4,0 4,4 0,0</coordinates></LinearRing></outerBoundaryIs>
+                  <innerBoundaryIs><LinearRing><coordinates>1,1 2,1 2,2 1,1</coordinates></LinearRing></innerBoundaryIs>
+                </Polygon></Placemark>
+            """.trimIndent())
+        }
+        assertTrue(failure.message.orEmpty().contains("holes"))
+    }
+
+    @Test
+    fun `deeply nested KML geometry is rejected before exhausting the stack`() {
+        val children = "<MultiGeometry>".repeat(70) +
+            "<Point><coordinates>60,30</coordinates></Point>" + "</MultiGeometry>".repeat(70)
+        assertThrows(IllegalArgumentException::class.java) { kml("<Placemark>$children</Placemark>") }
+    }
+
+    @Test
     fun `KML exports a range ring as a closed circular outline`() {
         val center = GeoVertex(24.0, 54.0)
         val edge = GeoVertex(24.01, 54.0)

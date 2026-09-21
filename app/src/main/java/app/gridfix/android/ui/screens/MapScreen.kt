@@ -125,6 +125,7 @@ import app.gridfix.android.ui.SunMoonDialog
 import app.gridfix.android.ui.WaypointDialog
 import app.gridfix.android.ui.WaypointMarker
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -211,6 +212,13 @@ private class MapHolder {
     var appliedGrid: Boolean? = null
 }
 
+private data class RouteWaypointOffer(
+    val routeId: String,
+    val base: String,
+    val points: List<GeoVertex>,
+    val folder: String,
+)
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun MapScreen(
@@ -224,11 +232,11 @@ fun MapScreen(
     onUpdate: (id: String, draft: WaypointDraft) -> Unit,
     onNavigateTo: (String) -> Unit,
     graphics: List<TacGraphic>,
-    onAddGraphic: (name: String, type: String, points: List<GeoVertex>, folder: String, affiliation: String, echelon: String) -> Unit,
+    onAddGraphic: suspend (name: String, type: String, points: List<GeoVertex>, folder: String, affiliation: String, echelon: String) -> String,
     onUpdateGraphic: (id: String, name: String, folder: String, affiliation: String, echelon: String) -> Unit,
     onUpdateGraphicPoints: (id: String, points: List<GeoVertex>) -> Unit,
     onDeleteGraphic: (String) -> Unit,
-    onSaveRouteWps: (base: String, points: List<GeoVertex>, folder: String) -> Unit = { _, _, _ -> },
+    onSaveRouteWps: suspend (routeId: String, base: String, points: List<GeoVertex>, folder: String) -> Unit = { _, _, _, _ -> },
     viewedTrackId: String?,
     onRecordStart: () -> Unit,
     onRecordStop: (name: String?, discard: Boolean) -> Unit,
@@ -280,7 +288,10 @@ fun MapScreen(
     var editPointsFor by remember { mutableStateOf<TacGraphic?>(null) }
     var editPts by remember { mutableStateOf<List<GeoVertex>>(emptyList()) }
     var routeCardFor by remember { mutableStateOf<TacGraphic?>(null) }
-    var routeWpOffer by remember { mutableStateOf<Triple<String, List<GeoVertex>, String>?>(null) }
+    var routeWpOffer by remember { mutableStateOf<RouteWaypointOffer?>(null) }
+    var savingGraphic by remember { mutableStateOf(false) }
+    var savingRouteWaypoints by remember { mutableStateOf(false) }
+    var routeWaypointError by remember { mutableStateOf<String?>(null) }
     var gotoOpen by remember { mutableStateOf(false) }
     var stopTrackOpen by remember { mutableStateOf(false) }
     var fieldToolsOpen by remember { mutableStateOf(false) }
@@ -1517,14 +1528,17 @@ fun MapScreen(
                             if (bbox != null) {
                                 downloadStatus = "Fetching elevation…"
                                 scope.launch {
-                                    val n = Elevation.prefetchArea(
+                                    val result = Elevation.prefetchArea(
                                         context,
                                         bbox.latNorth, bbox.latSouth,
                                         bbox.lonWest, bbox.lonEast,
                                     )
-                                    downloadStatus =
-                                        if (n > 0) "Elevation cached — $n tiles"
-                                        else "Elevation fetch failed — check connection"
+                                    downloadStatus = when {
+                                        result.tooLarge -> "Area needs ${result.expected} elevation tiles (limit ${app.gridfix.android.map.ELEVATION_PREFETCH_MAX_TILES}) — zoom in; nothing downloaded"
+                                        result.complete -> "Elevation cached — ${result.cached}/${result.expected} tiles"
+                                        result.expected == 0L -> "Elevation unavailable for this area"
+                                        else -> "Elevation incomplete — ${result.cached}/${result.expected} cached, ${result.failed} failed"
+                                    }
                                 }
                             }
                         }) {
@@ -1696,8 +1710,9 @@ fun MapScreen(
             var gFolder by remember(dt) { mutableStateOf(app.gridfix.android.data.DEFAULT_FOLDER) }
             var gAff by remember(dt) { mutableStateOf(drawAffiliation) }
             var gEch by remember(dt) { mutableStateOf("") }
+            var graphicSaveError by remember(dt) { mutableStateOf<String?>(null) }
             AlertDialog(
-                onDismissRequest = { drawNameOpen = false },
+                onDismissRequest = { if (!savingGraphic) drawNameOpen = false },
                 title = { Text("Save ${GraphicTypes.label(dt).lowercase()}") },
                 text = {
                     Column(
@@ -1772,24 +1787,42 @@ fun MapScreen(
                             singleLine = true,
                             supportingText = reservedFolderHint(gFolder)?.let { { Text(it) } },
                         )
+                        graphicSaveError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                     }
                 },
                 confirmButton = {
-                    TextButton(onClick = {
+                    TextButton(enabled = !savingGraphic, onClick = {
                         val finalName = gName.trim().ifBlank { "${graphics.size + 1}" }
-                        onAddGraphic(finalName, dt, drawPoints, gFolder, gAff, gEch)
-                        if (dt == "route" && drawPoints.size >= 2) {
-                            val base = if (finalName.all { it.isDigit() }) "Route $finalName" else finalName
-                            routeWpOffer = Triple(base, drawPoints, gFolder)
+                        val points = drawPoints.toList()
+                        val folder = app.gridfix.android.data.matchFolder(folders.map { it.name }, gFolder)
+                        val affiliation = gAff
+                        val echelon = gEch
+                        graphicSaveError = null
+                        savingGraphic = true
+                        scope.launch {
+                            try {
+                                val routeId = onAddGraphic(finalName, dt, points, folder, affiliation, echelon)
+                                if (dt == "route" && points.size >= 2) {
+                                    val base = if (finalName.all { it.isDigit() }) "Route $finalName" else finalName
+                                    routeWaypointError = null
+                                    routeWpOffer = RouteWaypointOffer(routeId, base, points, folder)
+                                }
+                                drawNameOpen = false
+                                drawType = null
+                                drawPoints = emptyList()
+                                holder.map?.invalidate()
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                graphicSaveError = "Could not save drawing. Try again."
+                            } finally {
+                                savingGraphic = false
+                            }
                         }
-                        drawNameOpen = false
-                        drawType = null
-                        drawPoints = emptyList()
-                        holder.map?.invalidate()
-                    }) { Text("Save") }
+                    }) { Text(if (savingGraphic) "Saving…" else "Save") }
                 },
                 dismissButton = {
-                    TextButton(onClick = { drawNameOpen = false }) { Text("Keep drawing") }
+                    TextButton(enabled = !savingGraphic, onClick = { drawNameOpen = false }) { Text("Keep drawing") }
                 },
             )
         }
@@ -1931,7 +1964,8 @@ fun MapScreen(
                         }) { Text("Route card") }
                         TextButton(onClick = {
                             val base = if (g.name.all { it.isDigit() }) "Route ${g.name}" else g.name
-                            routeWpOffer = Triple(base, g.points, g.folder)
+                            routeWaypointError = null
+                            routeWpOffer = RouteWaypointOffer(g.id, base, g.points, g.folder)
                             editingGraphic = null
                         }) { Text("Waypoints") }
                     }
@@ -1950,32 +1984,45 @@ fun MapScreen(
         )
     }
 
-    routeWpOffer?.let { (base, pts, folder) ->
+    routeWpOffer?.let { (routeId, base, pts, folder) ->
         val prefix = "$base WP "
-        // Counts what the save will actually replace: this folder's matching points.
-        // (addFolder canonicalises the spelling, so compare case-insensitively.)
-        val existing = waypoints.count { it.name.startsWith(prefix) && it.folder.equals(folder, ignoreCase = true) }
+        val existing = waypoints.count { it.sourceRouteId == routeId }
         AlertDialog(
-            onDismissRequest = { routeWpOffer = null },
+            onDismissRequest = { if (!savingRouteWaypoints) routeWpOffer = null },
             title = { Text("Navigate this route") },
             text = {
-                Text(
-                    "Save ${pts.size} waypoints ($prefix" + "1 to $prefix" + "${pts.size}) " +
-                        "so each point can be a Navigate target?" +
-                        if (existing > 0) {
-                            "\n\nThis replaces the $existing existing \"$base WP\" waypoints in the $folder folder."
-                        } else ""
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Save ${pts.size} waypoints ($prefix" + "1 to $prefix" + "${pts.size}) " +
+                            "in $folder so each point can be a Navigate target?" +
+                            if (existing > 0) {
+                                "\n\nThis replaces the $existing waypoints previously generated from this route."
+                            } else ""
+                    )
+                    routeWaypointError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                }
             },
             confirmButton = {
-                TextButton(onClick = {
-                    onSaveRouteWps(base, pts, folder)
-                    routeWpOffer = null
-                    notice = "$prefix" + "1 to $prefix" + "${pts.size} saved - pick them in Navigate"
-                }) { Text("Save waypoints") }
+                TextButton(enabled = !savingRouteWaypoints, onClick = {
+                    savingRouteWaypoints = true
+                    routeWaypointError = null
+                    scope.launch {
+                        try {
+                            onSaveRouteWps(routeId, base, pts, folder)
+                            routeWpOffer = null
+                            notice = "$prefix" + "1 to $prefix" + "${pts.size} saved - pick them in Navigate"
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            routeWaypointError = "Could not save waypoints. Try again."
+                        } finally {
+                            savingRouteWaypoints = false
+                        }
+                    }
+                }) { Text(if (savingRouteWaypoints) "Saving…" else "Save waypoints") }
             },
             dismissButton = {
-                TextButton(onClick = { routeWpOffer = null }) { Text("Not now") }
+                TextButton(enabled = !savingRouteWaypoints, onClick = { routeWpOffer = null }) { Text("Not now") }
             },
         )
     }

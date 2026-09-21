@@ -39,17 +39,7 @@ object Backup {
             .put("version", VERSION)
             .put("exportedAt", nowMillis)
         root.put("waypoints", JSONArray().also { a ->
-            for (w in waypoints) a.put(
-                JSONObject()
-                    .put("id", w.id).put("name", w.name)
-                    .put("lat", w.lat).put("lon", w.lon)
-                    .put("createdAt", w.createdAt).put("folder", w.folder)
-                    .put("symbol", w.symbol).put("affiliation", w.affiliation)
-                    .put("echelon", w.echelon).put("designation", w.designation)
-                    .put("kind", w.kind).put("rotation", w.rotation.toDouble())
-                    .put("visible", w.visible)
-                    .put("metadata", w.metadata.toJson())
-            )
+            for (w in waypoints) a.put(w.toWaypointJson())
         })
         root.put("folders", JSONArray().also { a ->
             for (f in folders) a.put(JSONObject().put("name", f.name).put("visible", f.visible))
@@ -254,6 +244,10 @@ object Backup {
                         rotation = o.optDouble("rotation", 0.0).toFloat(),
                         visible = o.optBoolean("visible", true),
                         metadata = WaypointMetadata.fromJson(o.optJSONObject("metadata")),
+                        sourceRouteId = o.optString("sourceRouteId", "").takeIf { it.isNotBlank() },
+                        sourceRoutePointIndex = if (o.has("sourceRoutePointIndex") && !o.isNull("sourceRoutePointIndex")) {
+                            o.getInt("sourceRoutePointIndex").also { require(it >= 0) { "Invalid route point index" } }
+                        } else null,
                     )
                 )
             }

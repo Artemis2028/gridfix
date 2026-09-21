@@ -4,7 +4,6 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.io.Closeable
 import java.nio.file.Files
-import java.nio.file.StandardOpenOption
 import java.util.Locale
 import java.util.UUID
 
@@ -56,6 +55,9 @@ internal class StagedTrackFiles(private val directory: File) : Closeable {
         val file = File.createTempFile("restore-", ".part", directory)
         staged[id] = file
         file.bufferedWriter().use { out -> points.forEach { out.write(trackPointLine(it)) } }
+        // Publish only complete, synced content. A killed process may leave this
+        // private .part file behind, but never a partial final track filename.
+        RandomAccessFile(file, "rw").use { it.fd.sync() }
         check(!target.exists() || sameContents(target, file)) {
             "A different track file already exists for $id; it was not overwritten"
         }
@@ -69,10 +71,12 @@ internal class StagedTrackFiles(private val directory: File) : Closeable {
             // committed. Reattach only byte-identical content on an idempotent retry.
             // This file was not created by this attempt and must survive rollback.
             if (target.exists() && sameContents(target, stage)) continue
-            Files.newOutputStream(target.toPath(), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE).use { out ->
-                created.add(target)
-                stage.inputStream().use { it.copyTo(out) }
-            }
+            // Both names are in the app's internal tracks directory. A hard link
+            // publishes the completed inode atomically and fails if target exists;
+            // ATOMIC_MOVE alone permits replacing an existing destination.
+            // Do not fall back to copying: death mid-copy would poison later retries.
+            Files.createLink(target.toPath(), stage.toPath())
+            created.add(target)
         }
     }
 

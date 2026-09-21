@@ -171,13 +171,8 @@ fun NavigateScreen(
             notificationRequest.launch(Manifest.permission.POST_NOTIFICATIONS)
         } else startGuide()
     }
-    // Explicit target/declination changes update the already running guide. Do not
-    // stop it when this composable leaves the foreground: screen lock is supported.
-    LaunchedEffect(target, settings.declinationOverride) {
-        if (PocketGuideService.active.value != null) {
-            if (target == null) PocketGuideService.stop(context) else startGuide()
-        }
-    }
+    // GridFixApp follows authoritative repository flows for a running guide.
+    // This screen's loading/default snapshots must never stop or retarget it.
 
     val arrival = remember { ArrivalAlertState() }
     LaunchedEffect(loc?.elapsedRealtimeNanos, target?.id, hapticGuide) {

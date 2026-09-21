@@ -7,8 +7,8 @@ package app.gridfix.android.data
  * Navigate never swaps it for a different point because the selected one is
  * hidden, in a hidden folder, or gone. A hidden selection is offered anyway
  * (the user asked for it by name); a missing selection shows as "no target"
- * until the user picks again. Only when nothing at all is selected does the
- * first visible waypoint stand in as a default.
+ * until the user picks again. An absent selection also means no target: merely
+ * importing, restoring or deleting points must not choose a new destination.
  */
 object NavigationTarget {
 
@@ -25,6 +25,5 @@ object NavigationTarget {
      * null — never another waypoint.
      */
     fun resolve(candidates: List<Waypoint>, selectedId: String?): Waypoint? =
-        if (selectedId == null) candidates.firstOrNull()
-        else candidates.firstOrNull { it.id == selectedId }
+        selectedId?.let { id -> candidates.firstOrNull { it.id == id } }
 }

@@ -6,13 +6,13 @@ import app.gridfix.android.BuildConfig
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
-import kotlin.math.asinh
 import kotlin.math.floor
-import kotlin.math.tan
+import kotlin.coroutines.coroutineContext
 
 /**
  * Elevation from the open Mapzen/AWS Terrarium terrain tiles
@@ -58,19 +58,12 @@ object Elevation {
         }
     }
 
-    private fun tileX(lon: Double, z: Int): Double = (lon + 180.0) / 360.0 * (1 shl z)
-
-    private fun tileY(lat: Double, z: Int): Double {
-        val latRad = Math.toRadians(lat)
-        return (1.0 - asinh(tan(latRad)) / Math.PI) / 2.0 * (1 shl z)
-    }
-
     /** Elevation in metres, or null when unavailable (no data yet / ocean tile miss). */
     suspend fun elevationAt(context: Context, lat: Double, lon: Double): Double? =
         withContext(Dispatchers.IO) {
-            if (lat > 85.0 || lat < -85.0) return@withContext null
-            val xF = tileX(lon, ZOOM)
-            val yF = tileY(lat, ZOOM)
+            if (!lat.isFinite() || !lon.isFinite() || lat > 85.0 || lat < -85.0) return@withContext null
+            val xF = terrainTileX(lon, ZOOM)
+            val yF = terrainTileY(lat, ZOOM)
             val x = floor(xF).toInt()
             val y = floor(yF).toInt()
             val bmp = tileBitmap(context, ZOOM, x, y) ?: return@withContext null
@@ -88,25 +81,16 @@ object Elevation {
     suspend fun tile(context: Context, z: Int, x: Int, y: Int): Bitmap? =
         withContext(Dispatchers.IO) { tileBitmap(context, z, x, y) }
 
-    /** Fetch every elevation tile covering the box; returns tiles now cached. */
+    /** Fetch the complete box, or reject an oversized request before downloading any tiles. */
     suspend fun prefetchArea(
         context: Context,
         latNorth: Double, latSouth: Double, lonWest: Double, lonEast: Double,
-    ): Int = withContext(Dispatchers.IO) {
-        val x0 = floor(tileX(lonWest, ZOOM)).toInt()
-        val x1 = floor(tileX(lonEast, ZOOM)).toInt()
-        val y0 = floor(tileY(latNorth, ZOOM)).toInt()
-        val y1 = floor(tileY(latSouth, ZOOM)).toInt()
-        var ok = 0
-        var count = 0
-        for (x in minOf(x0, x1)..maxOf(x0, x1)) {
-            for (y in minOf(y0, y1)..maxOf(y0, y1)) {
-                count++
-                if (count > 400) return@withContext ok   // sanity cap ~ a division sector
-                if (tileBitmap(context, ZOOM, x, y) != null) ok++
-            }
+    ): ElevationDownloadResult = withContext(Dispatchers.IO) {
+        val coverage = terrainTileCoverage(latNorth, latSouth, lonWest, lonEast, ZOOM)
+        prefetchTerrainTiles(coverage) { x, y ->
+            coroutineContext.ensureActive()
+            tileBitmap(context, ZOOM, x, y) != null
         }
-        ok
     }
 
     @Synchronized

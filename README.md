@@ -4,7 +4,7 @@ An offline-first MGRS land-navigation app for Android. Built for people who are
 taught to navigate with a map, a compass and a pace count, and who want the grid
 in their pocket to agree with the one on the sheet.
 
-**Status: 1.0.1** — the Google Play launch build. Closed testing and the production-access review are complete.
+**Status: 1.0.2 development** — navigation, import, billing, and terrain reliability fixes following the 1.0.1 launch build. See [review repair notes](docs/review-repairs.md) for behavior changes and validation.
 
 Package `app.gridfix.android` · repository `gridfix` (the original working name;
 the product is **MGRS GPS** everywhere a user can see it).
@@ -55,8 +55,9 @@ Release builds are minified by R8 and need signing config in the environment
 (`GRIDFIX_KS`, `GRIDFIX_KS_PASS`). CI publishes `mapping.txt` with every build so
 a Play crash report can be de-obfuscated.
 
-Unit tests cover the field math — MGRS round trips, zone exceptions, ray fixes,
-angle wrap, folder naming, twilight ordering:
+Unit tests cover field math, zone boundaries, invalid ray inputs, waypoint selection
+and route ownership, imports, track restore, guide state, billing retries, and terrain
+sampling and download accounting:
 
 ```
 ./gradlew testDebugUnitTest

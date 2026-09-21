@@ -3,6 +3,7 @@ package app.gridfix.android.coords
 import mil.nga.grid.features.Point
 import mil.nga.mgrs.MGRS
 import mil.nga.mgrs.grid.GridType
+import mil.nga.mgrs.gzd.GridZones
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -65,7 +66,7 @@ object Coordinates {
 
     /** Lat/lon (WGS84) to standard UTM. Valid for lat -80..84. */
     fun utm(lat: Double, lon: Double): UtmCoord? {
-        if (lat < -80.0 || lat > 84.0) return null
+        if (!isUtmPoint(lat, lon)) return null
 
         val zone = utmZone(lat, lon)
 
@@ -166,22 +167,12 @@ object Coordinates {
         else -> String.format(Locale.US, "%.1f km/h", metersPerSecond * 3.6)
     }
 
-    private fun utmZone(lat: Double, lon: Double): Int {
-        var zone = (floor((lon + 180.0) / 6.0) + 1.0).toInt().coerceIn(1, 60)
-        // Norway exception
-        if (lat in 56.0..64.0 && lon in 3.0..12.0) zone = 32
-        // Svalbard exceptions
-        if (lat in 72.0..84.0) {
-            zone = when {
-                lon in 0.0..9.0 -> 31
-                lon in 9.0..21.0 -> 33
-                lon in 21.0..33.0 -> 35
-                lon in 33.0..42.0 -> 37
-                else -> zone
-            }
-        }
-        return zone
-    }
+    // Use the same selector as MGRS.from: borders belong to the eastern zone
+    // and northern band, including the Norway and Svalbard exceptions.
+    private fun utmZone(lat: Double, lon: Double): Int = GridZones.getZoneNumber(lon, lat)
+
+    private fun isUtmPoint(lat: Double, lon: Double): Boolean =
+        lat.isFinite() && lat in -80.0..84.0 && lon.isFinite() && lon in -180.0..180.0
 
     /** Grid convergence angle (degrees): grid north minus true north for this UTM zone. */
     fun gridConvergence(lat: Double, lon: Double): Double {
@@ -202,34 +193,49 @@ object Coordinates {
     /** Result of a two-ray fix: the intersection plus the range from each observer. */
     data class RayFix(val lat: Double, val lon: Double, val dist1: Double, val dist2: Double)
 
+    /** A complete azimuth in degrees, from a degree or NATO-mil entry. */
+    fun parseAzimuth(text: String, angleUnit: Int): Double? {
+        val entered = text.trim().toDoubleOrNull()?.takeIf { it.isFinite() } ?: return null
+        val fullTurn = if (angleUnit == 1) 6400.0 else 360.0
+        if (entered !in 0.0..fullTurn) return null
+        return entered * (360.0 / fullTurn)
+    }
+
     /**
      * Intersection of two rays given in TRUE bearings, solved in the UTM plane of
      * the first point's zone (grid bearings via per-point convergence). Null when
-     * the rays are near-parallel, diverge, or the fix lands beyond 100 km — the
-     * cases a map-reading instructor would also reject.
+     * inputs are invalid or outside UTM coverage, the rays are near-parallel,
+     * diverge, or the fix lands beyond 100 km.
      */
     fun rayIntersection(
         lat1: Double, lon1: Double, bearing1True: Double,
         lat2: Double, lon2: Double, bearing2True: Double,
     ): RayFix? {
+        if (!isUtmPoint(lat1, lon1) || !isUtmPoint(lat2, lon2) ||
+            !bearing1True.isFinite() || !bearing2True.isFinite()
+        ) return null
         val zone = utmZone(lat1, lon1)
         val north = lat1 >= 0
         val p1 = utmForZone(lat1, lon1, zone, north)
         val p2 = utmForZone(lat2, lon2, zone, north)
-        val g1 = Math.toRadians(bearing1True - gridConvergenceForZone(lat1, lon1, zone))
-        val g2 = Math.toRadians(bearing2True - gridConvergenceForZone(lat2, lon2, zone))
+        if (p1.any { !it.isFinite() } || p2.any { !it.isFinite() }) return null
+        val g1 = Math.toRadians(bearing1True % 360.0 - gridConvergenceForZone(lat1, lon1, zone))
+        val g2 = Math.toRadians(bearing2True % 360.0 - gridConvergenceForZone(lat2, lon2, zone))
         val d1x = sin(g1)
         val d1y = cos(g1)
         val d2x = sin(g2)
         val d2y = cos(g2)
         val cross = d1x * d2y - d1y * d2x
-        if (abs(cross) < 1e-6) return null
+        if (!cross.isFinite() || abs(cross) < 1e-6) return null
         val dx = p2[0] - p1[0]
         val dy = p2[1] - p1[1]
         val t = (dx * d2y - dy * d2x) / cross
         val s = (dx * d1y - dy * d1x) / cross
-        if (t <= 0.0 || s <= 0.0 || t > 100_000.0 || s > 100_000.0) return null
+        if (!t.isFinite() || !s.isFinite() ||
+            t <= 0.0 || s <= 0.0 || t > 100_000.0 || s > 100_000.0
+        ) return null
         val ll = utmInverse(p1[0] + t * d1x, p1[1] + t * d1y, zone, north)
+        if (!isUtmPoint(ll[0], ll[1])) return null
         return RayFix(ll[0], ll[1], t, s)
     }
 

@@ -120,41 +120,36 @@ fun RayFixDialog(
         else -> "T"
     }
 
-    fun trueBearing(point: RayPoint, entered: Float): Double {
-        val deg = if (settings.angleUnit == 1) entered * 360f / 6400f else entered
+    fun trueBearing(point: RayPoint, degrees: Double): Double {
         val adjusted = when (settings.northRef) {
-            1 -> deg + Declination.at(settings, point.lat, point.lon)
-            2 -> deg + Coordinates.gridConvergence(point.lat, point.lon).toFloat()
-            else -> deg
+            1 -> degrees + Declination.at(settings, point.lat, point.lon)
+            2 -> degrees + Coordinates.gridConvergence(point.lat, point.lon)
+            else -> degrees
         }
-        val asTrue = (((adjusted % 360f) + 360f) % 360f).toDouble()
+        val asTrue = ((adjusted % 360.0) + 360.0) % 360.0
         return if (resection) (asTrue + 180.0) % 360.0 else asTrue
     }
 
     val p1 = options.getOrNull(sel1)
     val p2 = options.getOrNull(sel2)
-    val fix = run {
-        val a1 = az1.toFloatOrNull() ?: return@run null
-        val a2 = az2.toFloatOrNull() ?: return@run null
-        val q1 = p1 ?: return@run null
-        val q2 = p2 ?: return@run null
-        if (sel1 == sel2) return@run null
+    val a1 = Coordinates.parseAzimuth(az1, settings.angleUnit)
+    val a2 = Coordinates.parseAzimuth(az2, settings.angleUnit)
+    val bearing1 = if (p1 != null && a1 != null) trueBearing(p1, a1).takeIf { it.isFinite() } else null
+    val bearing2 = if (p2 != null && a2 != null) trueBearing(p2, a2).takeIf { it.isFinite() } else null
+    val fix = if (p1 != null && p2 != null && bearing1 != null && bearing2 != null && sel1 != sel2) {
         Coordinates.rayIntersection(
-            q1.lat, q1.lon, trueBearing(q1, a1),
-            q2.lat, q2.lon, trueBearing(q2, a2),
+            p1.lat, p1.lon, bearing1,
+            p2.lat, p2.lon, bearing2,
         )
-    }
+    } else null
     // Angle of cut between the two rays: a fix is only as good as its geometry.
     // Doctrine wants roughly 30 to 150 degrees; outside that, small compass
     // errors move the fix a long way.
-    val cutAngle = run {
-        val a1 = az1.toFloatOrNull() ?: return@run null
-        val a2 = az2.toFloatOrNull() ?: return@run null
-        val q1 = p1 ?: return@run null
-        val q2 = p2 ?: return@run null
-        val d = kotlin.math.abs(trueBearing(q1, a1) - trueBearing(q2, a2)) % 360.0
+    val cutAngle = if (bearing1 != null && bearing2 != null) {
+        val d = kotlin.math.abs(bearing1 - bearing2) % 360.0
         if (d > 180.0) 360.0 - d else d
-    }
+    } else null
+    val azimuthError = if (settings.angleUnit == 1) "Enter 0 to 6400 mils" else "Enter 0 to 360 degrees"
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -182,6 +177,7 @@ fun RayFixDialog(
                     onAz = { az1 = it },
                     angleLabel = angleLabel,
                     refLetter = refLetter,
+                    error = azimuthError.takeIf { az1.isNotBlank() && a1 == null },
                 )
                 RayInputRow(
                     label = if (resection) "Known point 2" else "Observer 2",
@@ -192,6 +188,7 @@ fun RayFixDialog(
                     onAz = { az2 = it },
                     angleLabel = angleLabel,
                     refLetter = refLetter,
+                    error = azimuthError.takeIf { az2.isNotBlank() && a2 == null },
                 )
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)
                 if (fix != null) {
@@ -276,6 +273,7 @@ private fun RayInputRow(
     onAz: (String) -> Unit,
     angleLabel: String,
     refLetter: String,
+    error: String?,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -307,8 +305,10 @@ private fun RayInputRow(
         }
         OutlinedTextField(
             value = az,
-            onValueChange = { v -> onAz(v.filter { it.isDigit() || it == '.' }.take(6)) },
+            onValueChange = onAz,
             label = { Text("Azimuth ($angleLabel $refLetter)") },
+            isError = error != null,
+            supportingText = if (error != null) ({ Text(error) }) else null,
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
         )

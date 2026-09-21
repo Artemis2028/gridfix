@@ -23,6 +23,28 @@ class BackupSafetyTest {
         assertEquals(WaypointMetadata(), Backup.parse(backup(manifest())).waypoints.single().metadata)
     }
 
+    @Test fun backupRoundTripsRouteOwnershipThroughTheSharedWriter() {
+        val point = Waypoint("route-point", "Patrol WP 1", 34.0, -117.0, 1L,
+            sourceRouteId = "route-A", sourceRoutePointIndex = 0)
+        val root = manifest().put("waypoints", JSONArray().put(point.toWaypointJson()))
+        assertEquals(point, Backup.parse(backup(root)).waypoints.single())
+    }
+
+    @Test fun legacyAndManualBackupPointsNeverGainOwnershipFromTheirNames() {
+        val root = manifest()
+        root.getJSONArray("waypoints").getJSONObject(0).put("name", "Patrol WP 1")
+        val restored = Backup.parse(backup(root)).waypoints.single()
+        assertNull(restored.sourceRouteId)
+        assertNull(restored.sourceRoutePointIndex)
+    }
+
+    @Test fun malformedRoutePointIndexRejectsTheBackup() {
+        val root = manifest()
+        root.getJSONArray("waypoints").getJSONObject(0)
+            .put("sourceRouteId", "route-A").put("sourceRoutePointIndex", -1)
+        assertThrows(IllegalArgumentException::class.java) { Backup.parse(backup(root)) }
+    }
+
     private val id = "f4ebbead-09c6-4c52-9391-7c430510f281"
 
     private fun manifest() = JSONObject().put("app", "GridFix").put("version", 1)

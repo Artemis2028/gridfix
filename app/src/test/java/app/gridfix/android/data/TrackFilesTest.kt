@@ -80,6 +80,61 @@ class TrackFilesTest {
         assertEquals(listOf("$id.txt"), root.list()!!.toList())
     }
 
+    @Test fun interruptedStagingDoesNotCreateAFinalFileOrBlockRetry() {
+        val root = folder.newFolder("tracks")
+        // Durable state left by a process killed partway through writing its private stage.
+        val partial = File(root, "restore-interrupted.part").apply { writeText("34.000") }
+        assertFalse(File(root, "$id.txt").exists())
+        StagedTrackFiles(root).use { retry ->
+            retry.stage(id, listOf(point))
+            retry.publish(listOf(id))
+        }
+        assertEquals(trackPointLine(point), File(root, "$id.txt").readText())
+        assertEquals("34.000", partial.readText())
+    }
+
+    @Test fun interruptedBatchPublicationCanBeRetriedWithoutLosingCompletedTrack() {
+        val root = folder.newFolder("tracks")
+        val secondPoints = listOf(point, point.copy(time = 2000))
+        // Simulate death after the first final filename appears, before publishing
+        // the second or committing metadata. No rollback runs for that process.
+        StagedTrackFiles(root).use { interrupted ->
+            interrupted.stage(id, listOf(point))
+            interrupted.stage(secondId, secondPoints)
+            interrupted.publish(listOf(id))
+            assertEquals(trackPointLine(point), File(root, "$id.txt").readText())
+            assertFalse(File(root, "$secondId.txt").exists())
+            StagedTrackFiles(root).use { retry ->
+                retry.stage(id, listOf(point))
+                retry.stage(secondId, secondPoints)
+                retry.publish(listOf(id, secondId))
+                // A later metadata failure may remove only this retry's publication.
+                retry.rollback(IOException("metadata still unavailable"))
+            }
+            assertEquals(trackPointLine(point), File(root, "$id.txt").readText())
+            assertFalse(File(root, "$secondId.txt").exists())
+        }
+        StagedTrackFiles(root).use { retry ->
+            retry.stage(id, listOf(point))
+            retry.stage(secondId, secondPoints)
+            retry.publish(listOf(id, secondId))
+        }
+        assertEquals(trackPointLine(point), File(root, "$id.txt").readText())
+        assertEquals(secondPoints.joinToString("") { trackPointLine(it) }, File(root, "$secondId.txt").readText())
+        assertEquals(setOf("$id.txt", "$secondId.txt"), root.list()!!.toSet())
+    }
+
+    @Test fun mismatchingPartialFinalFileIsNeverOverwritten() {
+        val root = folder.newFolder("tracks")
+        // Legacy copies or unrelated files cannot be claimed as this attempt's
+        // own work merely because their bytes prefix the desired track.
+        val partial = File(root, "$id.txt").apply { writeText("34.000") }
+        StagedTrackFiles(root).use { retry ->
+            assertThrows(IllegalStateException::class.java) { retry.stage(id, listOf(point)) }
+        }
+        assertEquals("34.000", partial.readText())
+    }
+
     @Test fun timelessGpxPointDoesNotBecome1970() {
         val gpx = TrackRepository.buildGpx("Walk", listOf(point.copy(time = 0)))
         assertFalse(gpx.contains("<time>"))

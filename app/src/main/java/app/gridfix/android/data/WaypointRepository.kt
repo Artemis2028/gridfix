@@ -1,7 +1,9 @@
 package app.gridfix.android.data
 
 import android.content.Context
+import androidx.datastore.core.DataStore
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -69,6 +71,10 @@ data class Waypoint(
      */
     val visible: Boolean = true,
     val metadata: WaypointMetadata = WaypointMetadata(),
+    /** Stable owner of generated route points. Legacy and manually created points are unowned. */
+    val sourceRouteId: String? = null,
+    /** The vertex within [sourceRouteId]; preserves identity even if another generated point is deleted. */
+    val sourceRoutePointIndex: Int? = null,
 )
 
 const val KIND_WP = "wp"
@@ -93,20 +99,24 @@ data class WaypointDraft(
 /** A waypoint folder ("overlay"): can exist empty, and can be toggled visible/hidden. */
 data class FolderInfo(val name: String, val visible: Boolean = true)
 
-class WaypointRepository(private val context: Context) {
+class WaypointRepository internal constructor(private val store: DataStore<Preferences>) {
+
+    constructor(context: Context) : this(context.wpStore)
 
     private val listKey = stringPreferencesKey("list")
     private val selectedKey = stringPreferencesKey("selected")
     private val foldersKey = stringPreferencesKey("folders")
 
-    val waypoints: Flow<List<Waypoint>> = context.wpStore.data.map { p ->
+    val waypoints: Flow<List<Waypoint>> = store.data.map { p ->
         decode(p[listKey] ?: "[]")
     }
 
-    val selectedId: Flow<String?> = context.wpStore.data.map { p -> p[selectedKey] }
+    // An empty stored value records an explicit no-target state after deletion.
+    // It survives restart/restore and prevents add() from choosing a new target.
+    val selectedId: Flow<String?> = store.data.map { p -> p[selectedKey]?.takeIf { it.isNotEmpty() } }
 
     /** Stored folders unioned with any folder referenced by a waypoint: Base first, then by name. */
-    val folders: Flow<List<FolderInfo>> = context.wpStore.data.map { p ->
+    val folders: Flow<List<FolderInfo>> = store.data.map { p ->
         val stored = decodeFolders(p[foldersKey] ?: "[]")
         val referenced = decode(p[listKey] ?: "[]").map { it.folder }
         val names = (stored.map { it.name } + referenced + DEFAULT_FOLDER).distinct()
@@ -120,13 +130,13 @@ class WaypointRepository(private val context: Context) {
 
     /** The spelling this name will be stored under (case-insensitive match against existing folders). */
     suspend fun resolveFolder(raw: String): String =
-        matchFolder(knownNames(context.wpStore.data.first()), raw)
+        matchFolder(knownNames(store.data.first()), raw)
 
     /** Create a folder (or match an existing one, ignoring case). Returns the stored name. */
     suspend fun addFolder(name: String): String {
         if (name.isBlank()) return DEFAULT_FOLDER
         var stored = canonicalFolder(name)
-        context.wpStore.edit { p ->
+        store.edit { p ->
             stored = matchFolder(knownNames(p), name)
             p[foldersKey] = encodeFolders(
                 upsertFolder(decodeFolders(p[foldersKey] ?: "[]"), stored, null)
@@ -136,7 +146,7 @@ class WaypointRepository(private val context: Context) {
     }
 
     suspend fun setFolderVisible(name: String, visible: Boolean) {
-        context.wpStore.edit { p ->
+        store.edit { p ->
             p[foldersKey] = encodeFolders(
                 upsertFolder(decodeFolders(p[foldersKey] ?: "[]"), name, visible)
             )
@@ -150,7 +160,7 @@ class WaypointRepository(private val context: Context) {
     suspend fun renameFolder(from: String, to: String): String {
         if (from == DEFAULT_FOLDER || to.isBlank()) return from
         var target = canonicalFolder(to)
-        context.wpStore.edit { p ->
+        store.edit { p ->
             val stored = decodeFolders(p[foldersKey] ?: "[]")
             target = matchFolder(knownNames(p).filter { it != from }, to)
             if (target == from) return@edit
@@ -169,20 +179,19 @@ class WaypointRepository(private val context: Context) {
      */
     suspend fun deleteFolder(name: String, deleteContents: Boolean) {
         if (name == DEFAULT_FOLDER) return
-        context.wpStore.edit { p ->
+        store.edit { p ->
             val current = decode(p[listKey] ?: "[]")
             val kept = if (deleteContents) current.filterNot { it.folder == name }
             else current.map { if (it.folder == name) it.copy(folder = DEFAULT_FOLDER) else it }
             p[listKey] = encode(kept)
             p[foldersKey] = encodeFolders(decodeFolders(p[foldersKey] ?: "[]").filterNot { it.name == name })
-            val sel = p[selectedKey]
-            if (sel != null && kept.none { it.id == sel }) p.remove(selectedKey)
+            retainSelectionAfterRemoval(p, kept)
         }
     }
 
     suspend fun add(draft: WaypointDraft, nowMillis: Long): String {
         val newId = UUID.randomUUID().toString()
-        context.wpStore.edit { p ->
+        store.edit { p ->
             val current = decode(p[listKey] ?: "[]")
             val wp = Waypoint(
                 id = newId,
@@ -213,7 +222,7 @@ class WaypointRepository(private val context: Context) {
     /** Bulk add (imports): one datastore write however many points arrive. */
     suspend fun addAll(drafts: List<WaypointDraft>, nowMillis: Long) {
         if (drafts.isEmpty()) return
-        context.wpStore.edit { p ->
+        store.edit { p ->
             val current = decode(p[listKey] ?: "[]")
             var folders = decodeFolders(p[foldersKey] ?: "[]")
             val known = knownNames(p).toMutableList()
@@ -243,13 +252,62 @@ class WaypointRepository(private val context: Context) {
     }
 
     /**
+     * Regenerate one route's points in one transaction. Names and folders are
+     * presentation only: they never establish ownership of existing waypoints.
+     * Legacy points without an owner are retained, even when their names match.
+     */
+    suspend fun replaceRouteWaypoints(
+        routeId: String,
+        name: String,
+        points: List<GeoVertex>,
+        folder: String,
+        nowMillis: Long,
+    ) {
+        require(routeId.isNotBlank()) { "A route ID is required" }
+        require(points.all { it.lat.isFinite() && it.lat in -90.0..90.0 && it.lon.isFinite() && it.lon in -180.0..180.0 }) {
+            "Invalid route coordinates"
+        }
+        store.edit { p ->
+            val current = decode(p[listKey] ?: "[]")
+            val storedFolder = matchFolder(knownNames(p), folder)
+            val ownedByIndex = current.filter { it.sourceRouteId == routeId && it.sourceRoutePointIndex != null }
+                .associateBy { it.sourceRoutePointIndex }
+            val generated = points.mapIndexed { index, point ->
+                val previous = ownedByIndex[index]
+                (previous ?: Waypoint(
+                    id = UUID.randomUUID().toString(),
+                    name = "",
+                    lat = point.lat,
+                    lon = point.lon,
+                    createdAt = nowMillis,
+                )).copy(
+                    name = "$name WP ${index + 1}",
+                    lat = point.lat,
+                    lon = point.lon,
+                    folder = storedFolder,
+                    sourceRouteId = routeId,
+                    sourceRoutePointIndex = index,
+                )
+            }
+            val updated = current.filterNot { it.sourceRouteId == routeId } + generated
+            p[listKey] = encode(updated)
+            retainSelectionAfterRemoval(p, updated)
+            p[foldersKey] = encodeFolders(
+                upsertFolder(decodeFolders(p[foldersKey] ?: "[]"), storedFolder, null)
+            )
+            // Reused vertex IDs keep their selection. Removing a selected vertex
+            // requires a new explicit selection, including if a vertex is re-added.
+        }
+    }
+
+    /**
      * Merge a backup: waypoints keep their original ids and ids already on the
      * device are skipped, so restoring twice never duplicates. Folder entries
      * merge by name (existing visibility wins). Returns how many were added.
      */
     suspend fun restore(imported: List<Waypoint>, importedFolders: List<FolderInfo>): Int {
         var added = 0
-        context.wpStore.edit { p ->
+        store.edit { p ->
             val current = decode(p[listKey] ?: "[]")
             val ids = current.map { it.id }.toSet()
             val fresh = imported.filter { it.id !in ids }
@@ -269,7 +327,7 @@ class WaypointRepository(private val context: Context) {
     }
 
     suspend fun update(id: String, draft: WaypointDraft) {
-        context.wpStore.edit { p ->
+        store.edit { p ->
             val current = decode(p[listKey] ?: "[]")
             val folder = matchFolder(knownNames(p), draft.folder)
             p[listKey] = encode(
@@ -296,12 +354,11 @@ class WaypointRepository(private val context: Context) {
     }
 
     suspend fun delete(id: String) {
-        context.wpStore.edit { p ->
+        store.edit { p ->
             val current = decode(p[listKey] ?: "[]")
-            p[listKey] = encode(current.filterNot { it.id == id })
-            if (p[selectedKey] == id) {
-                p.remove(selectedKey)
-            }
+            val kept = current.filterNot { it.id == id }
+            p[listKey] = encode(kept)
+            retainSelectionAfterRemoval(p, kept)
         }
     }
 
@@ -310,7 +367,7 @@ class WaypointRepository(private val context: Context) {
      * folder's eye. The list still shows it, marked hidden.
      */
     suspend fun setVisible(id: String, visible: Boolean) {
-        context.wpStore.edit { p ->
+        store.edit { p ->
             p[listKey] = encode(decode(p[listKey] ?: "[]").map { if (it.id == id) it.copy(visible = visible) else it })
         }
     }
@@ -326,7 +383,7 @@ class WaypointRepository(private val context: Context) {
      */
     suspend fun toggleVisible(ids: Set<String>) {
         if (ids.isEmpty()) return
-        context.wpStore.edit { p ->
+        store.edit { p ->
             p[listKey] = encode(
                 decode(p[listKey] ?: "[]").map { if (it.id in ids) it.copy(visible = !it.visible) else it }
             )
@@ -336,14 +393,26 @@ class WaypointRepository(private val context: Context) {
     /** Delete every id in [ids] in one transaction. */
     suspend fun deleteAll(ids: Set<String>) {
         if (ids.isEmpty()) return
-        context.wpStore.edit { p ->
-            p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id in ids })
-            if (p[selectedKey] in ids) p.remove(selectedKey)
+        store.edit { p ->
+            val kept = decode(p[listKey] ?: "[]").filterNot { it.id in ids }
+            p[listKey] = encode(kept)
+            retainSelectionAfterRemoval(p, kept)
+        }
+    }
+
+    private fun retainSelectionAfterRemoval(
+        p: androidx.datastore.preferences.core.MutablePreferences,
+        kept: List<Waypoint>,
+    ) {
+        val selected = p[selectedKey]
+        if (selected != null && kept.none { it.id == selected }) {
+            // Do not remove the key: add() only auto-selects on a never-selected store.
+            p[selectedKey] = ""
         }
     }
 
     suspend fun select(id: String) {
-        context.wpStore.edit { p -> p[selectedKey] = id }
+        store.edit { p -> p[selectedKey] = id }
     }
 
     // One damaged record must not take the whole list with it: skip it, keep the rest.
@@ -372,6 +441,10 @@ class WaypointRepository(private val context: Context) {
                         rotation = o.optDouble("rotation", 0.0).toFloat(),
                         visible = o.optBoolean("visible", true),
                         metadata = WaypointMetadata.fromJson(o.optJSONObject("metadata")),
+                        sourceRouteId = o.optString("sourceRouteId", "").takeIf { it.isNotBlank() },
+                        sourceRoutePointIndex = if (o.has("sourceRoutePointIndex") && !o.isNull("sourceRoutePointIndex")) {
+                            o.getInt("sourceRoutePointIndex").takeIf { it >= 0 }
+                        } else null,
                     )
                 }.getOrNull()?.let { add(it) }
             }
@@ -417,27 +490,25 @@ class WaypointRepository(private val context: Context) {
         return arr.toString()
     }
 
-    private fun encode(list: List<Waypoint>): String {
-        val arr = JSONArray()
-        for (w in list) {
-            arr.put(
-                JSONObject()
-                    .put("id", w.id)
-                    .put("name", w.name)
-                    .put("lat", w.lat)
-                    .put("lon", w.lon)
-                    .put("createdAt", w.createdAt)
-                    .put("folder", w.folder)
-                    .put("symbol", w.symbol)
-                    .put("affiliation", w.affiliation)
-                    .put("echelon", w.echelon)
-                    .put("designation", w.designation)
-                    .put("kind", w.kind)
-                    .put("rotation", w.rotation.toDouble())
-                    .put("visible", w.visible)
-                    .put("metadata", w.metadata.toJson())
-            )
-        }
-        return arr.toString()
-    }
+    private fun encode(list: List<Waypoint>): String =
+        JSONArray().also { a -> list.forEach { a.put(it.toWaypointJson()) } }.toString()
 }
+
+/** Shared by the datastore and backup writer so route ownership survives both. */
+internal fun Waypoint.toWaypointJson(): JSONObject = JSONObject()
+    .put("id", id)
+    .put("name", name)
+    .put("lat", lat)
+    .put("lon", lon)
+    .put("createdAt", createdAt)
+    .put("folder", folder)
+    .put("symbol", symbol)
+    .put("affiliation", affiliation)
+    .put("echelon", echelon)
+    .put("designation", designation)
+    .put("kind", kind)
+    .put("rotation", rotation.toDouble())
+    .put("visible", visible)
+    .put("metadata", metadata.toJson())
+    .put("sourceRouteId", sourceRouteId)
+    .put("sourceRoutePointIndex", sourceRoutePointIndex)

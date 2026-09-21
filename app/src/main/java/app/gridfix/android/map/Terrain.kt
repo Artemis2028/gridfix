@@ -5,12 +5,10 @@ import android.graphics.Bitmap
 import app.gridfix.android.data.GeoVertex
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlin.math.atan2
 import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.sin
-import kotlin.math.sqrt
 
 /**
  * Terrain analysis on the cached elevation data: line-of-sight between two
@@ -24,8 +22,6 @@ import kotlin.math.sqrt
  * to a sea-level horizon.
  */
 object Terrain {
-
-    private const val EARTH_R = TerrainSight.EARTH_R
 
     data class Profile(
         val distancesM: FloatArray,   // cumulative along-path distance per sample
@@ -59,15 +55,6 @@ object Terrain {
         }
     }
 
-    private fun haversineM(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val dLat = Math.toRadians(lat2 - lat1)
-        val dLon = Math.toRadians(lon2 - lon1)
-        val h = sin(dLat / 2) * sin(dLat / 2) +
-            cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) *
-            sin(dLon / 2) * sin(dLon / 2)
-        return 2 * EARTH_R * atan2(sqrt(h), sqrt(1 - h))
-    }
-
     /** Sample elevations along a multi-leg path, ~[stepM] apart, capped at [maxSamples]. */
     suspend fun profile(
         context: Context,
@@ -79,7 +66,7 @@ object Terrain {
         val legLens = DoubleArray(points.size - 1)
         var total = 0.0
         for (i in 0 until points.size - 1) {
-            legLens[i] = haversineM(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon)
+            legLens[i] = terrainDistanceM(points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon)
             total += legLens[i]
         }
         if (total <= 0.0) return null
@@ -109,11 +96,10 @@ object Terrain {
                 var d = step
                 while (d < len) {
                     val t = d / len
-                    sampleAt(
-                        points[i].lat + (points[i + 1].lat - points[i].lat) * t,
-                        points[i].lon + (points[i + 1].lon - points[i].lon) * t,
-                        walked + d,
+                    val position = terrainPositionAt(
+                        points[i].lat, points[i].lon, points[i + 1].lat, points[i + 1].lon, t,
                     )
+                    sampleAt(position.first, position.second, walked + d)
                     d += step
                 }
             }
@@ -292,6 +278,7 @@ object Terrain {
         val tgtGround = prof.elevations.last()
         val blockIdx = analysis.blockIndex
         val blockT = if (blockIdx >= 0) prof.distancesM[blockIdx] / prof.totalM else 0f
+        val blockPosition = terrainPositionAt(obsLat, obsLon, tgtLat, tgtLon, blockT.toDouble())
         return LosResult(
             status = analysis.status,
             profile = prof,
@@ -301,8 +288,8 @@ object Terrain {
             targetHeight = targetHeight,
             blockIndex = blockIdx,
             blockDistM = if (blockIdx >= 0) prof.distancesM[blockIdx] else 0f,
-            blockLat = obsLat + (tgtLat - obsLat) * blockT,
-            blockLon = obsLon + (tgtLon - obsLon) * blockT,
+            blockLat = blockPosition.first,
+            blockLon = blockPosition.second,
             clearObserverHeight = analysis.clearObserverHeight,
             minClearanceM = analysis.minClearanceM,
             minClearanceDistM = analysis.minClearanceDistM,
