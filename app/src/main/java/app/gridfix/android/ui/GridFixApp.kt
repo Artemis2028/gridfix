@@ -102,6 +102,7 @@ import app.gridfix.android.billing.BillingManager
 import app.gridfix.android.data.AppSettings
 import app.gridfix.android.data.Backup
 import app.gridfix.android.data.CourseRepository
+import app.gridfix.android.data.NavigationTarget
 import app.gridfix.android.data.CourseResult
 import app.gridfix.android.data.DataPackage
 import app.gridfix.android.data.DEFAULT_FOLDER
@@ -161,6 +162,7 @@ private val RAIL_DIVIDER = 13.dp   // 6 dp padding either side of a 1 dp line
  * to hard-code. A short centred rule reads as a group separator anyway.
  */
 private val RAIL_DIVIDER_WIDTH = 48.dp
+private const val RECORDING_KEPT = "The track being recorded was kept. Stop recording before deleting it."
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -192,7 +194,11 @@ fun GridFixApp() {
     val folders by waypointRepo.folders.collectAsStateWithLifecycle(initialValue = emptyList())
     val graphicsRepo = remember { GraphicsRepository(context.applicationContext) }
     val graphics by graphicsRepo.graphics.collectAsStateWithLifecycle(initialValue = emptyList())
-    val trackRepo = remember { TrackRepository(context.applicationContext) }
+    val trackRepo = remember {
+        TrackRepository(context.applicationContext).apply {
+            activeRecordingId = { TrackRecorderService.active.value?.trackId }
+        }
+    }
     val recordingFailure by TrackRecorderService.error.collectAsStateWithLifecycle()
     val tracks by trackRepo.tracks.collectAsStateWithLifecycle(initialValue = emptyList())
     var viewedTrackId by remember { mutableStateOf<String?>(null) }
@@ -221,19 +227,21 @@ fun GridFixApp() {
     // Waypoints offered for navigation: the overlay's eye open and the waypoint's own
     // eye open. A hidden waypoint is held, not navigable - it is not on the map either,
     // and offering a target you cannot see would be worse than not offering it.
-    val navigableWaypoints = run {
-        val shown = waypoints.filter { it.visible }
-        if (folders.isEmpty()) shown else {
-            val visibleNames = folders.filter { it.visible }.map { it.name }.toSet()
-            shown.filter { it.folder in visibleNames }
-        }
-    }
+    // The selected point stays in the list even when hidden: an explicit NAVIGATE
+    // on a hidden waypoint (or a course checkpoint in a hidden folder) must guide
+    // to that point, never to whichever visible one happens to come first.
+    val navigableWaypoints = NavigationTarget.navigable(waypoints, folders, selectedId)
     val scope = rememberCoroutineScope()
-    LaunchedEffect(waypointRepo) {
-        waypointRepo.waypoints.collect { saved ->
-            val guidedId = PocketGuideService.active.value?.targetId
-            if (guidedId != null && saved.none { it.id == guidedId }) PocketGuideService.stop(context)
-        }
+    // The running pocket guide follows its target by ID from here, not from the
+    // Navigate screen: a waypoint moved from the Waypoints list, or a manual G-M
+    // angle changed in Settings, reaches the service whether or not Navigate is
+    // composed. Deleting the target stops it.
+    val guideState by PocketGuideService.active.collectAsStateWithLifecycle()
+    LaunchedEffect(guideState?.targetId, waypoints, settings.declinationOverride) {
+        val guidedId = guideState?.targetId ?: return@LaunchedEffect
+        val target = waypoints.firstOrNull { it.id == guidedId }
+        if (target == null) PocketGuideService.stop(context)
+        else PocketGuideService.update(context, target, settings.declinationOverride)
     }
     LaunchedEffect(entitlement) {
         if (!BuildConfig.DEBUG && entitlement == BillingManager.State.LOCKED) PocketGuideService.stop(context)
@@ -812,9 +820,11 @@ fun GridFixApp() {
                             scope.launch {
                                 val f = waypointRepo.addFolder(folder)
                                 val prefix = "$base WP "
-                                waypoints.filter { it.name.startsWith(prefix) }.forEach {
-                                    waypointRepo.delete(it.id)
-                                }
+                                // Replace only this folder's generated points. A route of the
+                                // same name saved into another folder keeps its own set.
+                                waypointRepo.deleteAll(
+                                    waypoints.filter { it.folder == f && it.name.startsWith(prefix) }.map { it.id }.toSet()
+                                )
                                 waypointRepo.addAll(
                                     pts.mapIndexed { i, v ->
                                         WaypointDraft(
@@ -900,7 +910,7 @@ fun GridFixApp() {
                             scope.launch {
                                 waypointRepo.deleteAll(wpIds)
                                 graphicsRepo.deleteAll(graphicIds)
-                                trackRepo.deleteAll(trackIds)
+                                if (!trackRepo.deleteAll(trackIds)) snackbarHostState.showSnackbar(RECORDING_KEPT)
                             }
                         },
                         onRenameFolder = { from, to ->
@@ -918,7 +928,11 @@ fun GridFixApp() {
                                     if (tracks.any { it.id == viewedTrackId && it.folder == name }) viewedTrackId = null
                                     waypointRepo.deleteFolder(name, true)
                                     graphicsRepo.deleteFolder(name)
-                                    trackRepo.deleteFolder(name)
+                                    if (!trackRepo.deleteFolder(name)) {
+                                        // The folder is gone; its live recording moves to Base.
+                                        trackRepo.renameFolder(name, DEFAULT_FOLDER)
+                                        snackbarHostState.showSnackbar(RECORDING_KEPT)
+                                    }
                                 } else {
                                     waypointRepo.deleteFolder(name, false)
                                     graphicsRepo.renameFolder(name, DEFAULT_FOLDER)
@@ -948,7 +962,7 @@ fun GridFixApp() {
                         },
                         onDeleteTrack = { id ->
                             if (viewedTrackId == id) viewedTrackId = null
-                            scope.launch { trackRepo.delete(id) }
+                            scope.launch { if (!trackRepo.delete(id)) snackbarHostState.showSnackbar(RECORDING_KEPT) }
                         },
                         onMoveTrack = { id, folder ->
                             scope.launch {

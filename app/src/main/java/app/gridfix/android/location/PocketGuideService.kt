@@ -84,6 +84,7 @@ class PocketGuideService : Service() {
             id, intent.getStringExtra("name") ?: "Waypoint", lat, lon,
             intent.getFloatExtra("declination", Float.NaN).takeIf { it.isFinite() },
         )
+        lastSent = target
         val initial = PocketGuideState(id, target!!.name, "Waiting for a fresh location and heading")
         try {
             if (Build.VERSION.SDK_INT >= 29) {
@@ -219,6 +220,7 @@ class PocketGuideService : Service() {
     private fun finishGuidance() {
         running = false
         target = null
+        lastSent = null
         scope.cancel()
         runCatching { location.stop() }
         runCatching { compass.stop() }
@@ -243,11 +245,13 @@ class PocketGuideService : Service() {
 
     companion object {
         private const val CHANNEL_ID = "gridfix_pocket_guide"
-        private const val NOTIF_ID = 42
+        private const val NOTIF_ID = 43   // 42 is the track recorder's error notification
         private const val ACTION_START = "app.gridfix.android.guide.START"
         private const val ACTION_STOP = "app.gridfix.android.guide.STOP"
         private val _active = MutableStateFlow<PocketGuideState?>(null)
         val active: StateFlow<PocketGuideState?> = _active.asStateFlow()
+        /** The last target the service accepted; lets [update] skip no-op restarts. */
+        @Volatile private var lastSent: Target? = null
         private val _error = MutableStateFlow<String?>(null)
         val error: StateFlow<String?> = _error.asStateFlow()
 
@@ -263,6 +267,28 @@ class PocketGuideService : Service() {
             } catch (_: Exception) {
                 _error.value = "Pocket guide could not start. Open the app, check location permission, and try again."
             }
+        }
+
+        /**
+         * Push the target's current coordinates and declination to a guide that is
+         * already running for [waypoint]. Safe from anywhere: with the foreground
+         * service up the app is not "background" for startService, and a guide that
+         * is not running (or runs for another point) is left alone.
+         */
+        fun update(context: Context, waypoint: Waypoint, declinationOverride: Float?) {
+            val state = _active.value ?: return
+            if (state.targetId != waypoint.id) return
+            val dec = declinationOverride ?: Float.NaN
+            val same = lastSent?.let {
+                it.id == waypoint.id && it.lat == waypoint.lat && it.lon == waypoint.lon &&
+                    it.name == waypoint.name && (it.declination ?: Float.NaN).equals(dec)
+            } ?: false
+            if (same) return
+            val intent = Intent(context, PocketGuideService::class.java).setAction(ACTION_START)
+                .putExtra("target_id", waypoint.id).putExtra("name", waypoint.name)
+                .putExtra("latitude", waypoint.lat).putExtra("longitude", waypoint.lon)
+                .putExtra("declination", dec)
+            runCatching { context.startService(intent) }
         }
 
         fun stop(context: Context) {

@@ -4,7 +4,7 @@ An offline-first MGRS land-navigation app for Android. Built for people who are
 taught to navigate with a map, a compass and a pace count, and who want the grid
 in their pocket to agree with the one on the sheet.
 
-**Status: 1.0.0** — the Google Play launch build. Closed testing and the production-access review are complete.
+**Status: 1.0.1** — the Google Play launch build. Closed testing and the production-access review are complete.
 
 Package `app.gridfix.android` · repository `gridfix` (the original working name;
 the product is **MGRS GPS** everywhere a user can see it).

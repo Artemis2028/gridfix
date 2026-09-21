@@ -1550,8 +1550,9 @@ fun MapScreen(
         if (map == null) {
             downloadOpen = false
         } else {
-            val zMin = map.zoomLevelDouble.toInt().coerceAtLeast(3)
-            val zMax = (zMin + 4).coerceAtMost(layer.maxDownloadZoom).coerceAtLeast(zMin)
+            val zRange = MapSetup.downloadZoomRange(map.zoomLevelDouble, layer)
+            val zMin = zRange.first
+            val zMax = zRange.last
             val bbox = map.boundingBox
             val tiles = remember(zMin, zMax) {
                 runCatching { CacheManager(map).possibleTilesInArea(bbox, zMin, zMax) }.getOrDefault(0)
@@ -1578,20 +1579,17 @@ fun MapScreen(
                             downloadOpen = false
                             downloadStatus = "Starting download…"
                             try {
-                                // Pin the expiry of everything fetched during the download
-                                // (USGS is public domain, so a ten-year TTL is fine), then
-                                // restore header-driven expiry for ordinary browsing.
-                                MapSetup.pinDownloadExpiry(true)
-                                CacheManager(map).downloadAreaAsyncNoUI(
+                                // A per-download writer pins every tile in the box (re-fetching
+                                // ones browsing had cached) to a ten-year expiry; browsing on
+                                // any layer keeps its providers' own headers meanwhile.
+                                CacheManager(map, MapSetup.downloadWriter()).downloadAreaAsyncNoUI(
                                     context, bbox, zMin, zMax,
                                     object : CacheManager.CacheManagerCallback {
                                         override fun onTaskComplete() {
-                                            MapSetup.pinDownloadExpiry(false)
                                             downloadStatus = "Offline area saved"
                                         }
 
                                         override fun onTaskFailed(errors: Int) {
-                                            MapSetup.pinDownloadExpiry(false)
                                             downloadStatus = "Download done, $errors tiles failed"
                                         }
 
@@ -1612,7 +1610,6 @@ fun MapScreen(
                                     },
                                 )
                             } catch (e: Exception) {
-                                MapSetup.pinDownloadExpiry(false)
                                 downloadStatus = "Download failed to start"
                             }
                         },
@@ -1955,7 +1952,9 @@ fun MapScreen(
 
     routeWpOffer?.let { (base, pts, folder) ->
         val prefix = "$base WP "
-        val existing = waypoints.count { it.name.startsWith(prefix) }
+        // Counts what the save will actually replace: this folder's matching points.
+        // (addFolder canonicalises the spelling, so compare case-insensitively.)
+        val existing = waypoints.count { it.name.startsWith(prefix) && it.folder.equals(folder, ignoreCase = true) }
         AlertDialog(
             onDismissRequest = { routeWpOffer = null },
             title = { Text("Navigate this route") },
@@ -1964,7 +1963,7 @@ fun MapScreen(
                     "Save ${pts.size} waypoints ($prefix" + "1 to $prefix" + "${pts.size}) " +
                         "so each point can be a Navigate target?" +
                         if (existing > 0) {
-                            "\n\nThis replaces the $existing existing \"$base WP\" waypoints."
+                            "\n\nThis replaces the $existing existing \"$base WP\" waypoints in the $folder folder."
                         } else ""
                 )
             },

@@ -199,7 +199,22 @@ class TrackRepository(private val context: Context) {
         }
     }
 
-    suspend fun delete(id: String) {
+    /**
+     * Supplies the ID of the recording in progress, if any. Every deletion route
+     * skips that track: removing its metadata while the recorder keeps appending
+     * would leave a live log no screen can reach. Only [discard], which the
+     * recorder calls after it has stopped, bypasses the guard.
+     */
+    var activeRecordingId: () -> String? = { null }
+
+    /** Delete one track; false when it was the active recording and was kept. */
+    suspend fun delete(id: String): Boolean {
+        if (id == activeRecordingId()) return false
+        deleteUnguarded(id)
+        return true
+    }
+
+    private suspend fun deleteUnguarded(id: String) {
         context.trackStore.edit { p ->
             p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id == id })
         }
@@ -234,15 +249,22 @@ class TrackRepository(private val context: Context) {
         }
     }
 
-    /** Delete every id in [ids] in one transaction. */
-    suspend fun deleteAll(ids: Set<String>) {
-        if (ids.isEmpty()) return
-        context.trackStore.edit { p ->
-            p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id in ids })
+    /**
+     * Delete every id in [ids] in one transaction; false when the active recording
+     * was among them and was kept (everything else is still deleted).
+     */
+    suspend fun deleteAll(ids: Set<String>): Boolean {
+        val active = activeRecordingId()
+        val doomed = if (active == null) ids else ids - active
+        if (doomed.isNotEmpty()) {
+            context.trackStore.edit { p ->
+                p[listKey] = encode(decode(p[listKey] ?: "[]").filterNot { it.id in doomed })
+            }
+            // The log files go with them, after the store is written: a leftover file is
+            // recoverable, a store entry pointing at nothing is not.
+            withContext(Dispatchers.IO) { doomed.forEach { pointsFile(context, it).delete() } }
         }
-        // The log files go with them, after the store is written: a leftover file is
-        // recoverable, a store entry pointing at nothing is not.
-        withContext(Dispatchers.IO) { ids.forEach { pointsFile(context, it).delete() } }
+        return doomed.size == ids.size
     }
 
     /** Move every track in [from] to [to] (folder rename, or emptying a folder into Base). */
@@ -254,14 +276,17 @@ class TrackRepository(private val context: Context) {
         }
     }
 
-    /** Delete every track in [folder], point logs included. */
-    suspend fun deleteFolder(folder: String) {
-        val doomed = decode(context.trackStore.data.first()[listKey] ?: "[]").filter { it.folder == folder }
-        for (t in doomed) delete(t.id)
+    /**
+     * Delete every track in [folder], point logs included; false when the active
+     * recording lives there and was kept (the caller decides where it goes).
+     */
+    suspend fun deleteFolder(folder: String): Boolean {
+        val inFolder = decode(context.trackStore.data.first()[listKey] ?: "[]").filter { it.folder == folder }
+        return deleteAll(inFolder.map { it.id }.toSet())
     }
 
-    /** Remove a recording that was discarded before saving. */
-    suspend fun discard(id: String) = delete(id)
+    /** Remove a recording that was discarded before saving. The recorder has stopped by then. */
+    suspend fun discard(id: String) = deleteUnguarded(id)
 
     /**
      * Heal recordings the OS killed mid-way: any track still open (endedAt == 0)

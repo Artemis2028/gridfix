@@ -67,6 +67,7 @@ import app.gridfix.android.location.CompassTracker
 import app.gridfix.android.location.FixData
 import app.gridfix.android.location.ArrivalAlertState
 import app.gridfix.android.location.NavigationFixPolicy
+import app.gridfix.android.data.NavigationTarget
 import app.gridfix.android.location.PocketGuideService
 import app.gridfix.android.location.deviceVibrator
 import app.gridfix.android.location.isUsableForNavigation
@@ -119,7 +120,9 @@ fun NavigateScreen(
     }
     val nowNanos = maxOf(freshnessTickNanos, SystemClock.elapsedRealtimeNanos())
     val loc = fix.location?.takeIf { it.isUsableForNavigation(nowNanos) }
-    val target = waypoints.firstOrNull { it.id == selectedId } ?: waypoints.firstOrNull()
+    // A selected ID that is no longer offered (deleted, or replaced by the course
+    // engine) shows "Select target" — it is never silently swapped for another point.
+    val target = NavigationTarget.resolve(waypoints, selectedId)
 
     // Magnetic declination: the manual G-M angle if one is set, else the phone's
     // World Magnetic Model, refreshed when we move ~10 km

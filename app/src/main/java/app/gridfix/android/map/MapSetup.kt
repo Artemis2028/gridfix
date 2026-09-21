@@ -53,20 +53,31 @@ object MapSetup {
             // expired tile while offline; it only asks the server again once it can.
             // Deliberate USGS area downloads are pinned with [pinDownloadExpiry].
             expirationExtendedDuration = 0L
-            expirationOverrideDuration = null
         }
     }
 
     /**
-     * Ten years. Applied for the duration of a USGS area download so those tiles
-     * never expire and are the last thing the cache trim would evict (it deletes
-     * in expiry order). Only public-domain layers are bulk-downloadable, so no
-     * commercial tile is ever pinned this way.
+     * Ten years: the expiry [PinnedTileWriter] stamps on every tile of a USGS
+     * area download, so they never expire and are the last thing the cache trim
+     * would evict (it deletes in expiry order). Nothing else is affected: the
+     * writer is per-download, not a global policy.
      */
-    private const val DOWNLOAD_TTL_MS = 10L * 365 * 24 * 60 * 60 * 1000
+    const val DOWNLOAD_TTL_MS = 10L * 365 * 24 * 60 * 60 * 1000
 
-    fun pinDownloadExpiry(on: Boolean) {
-        Configuration.getInstance().expirationOverrideDuration = if (on) DOWNLOAD_TTL_MS else null
+    fun downloadWriter(): PinnedTileWriter = PinnedTileWriter(DOWNLOAD_TTL_MS)
+
+    /**
+     * Zoom range for "download this area" on [layer] from the map's current zoom:
+     * five levels from the current one, both ends held inside what the source
+     * serves and what the layer's terms allow. Overzoomed past the source's top
+     * level (the map allows 21.5; USGS stops at 16), the range starts at the top
+     * tile level that actually exists, not at the on-screen zoom.
+     */
+    fun downloadZoomRange(currentZoom: Double, layer: BaseLayer): IntRange {
+        val top = minOf(layer.maxDownloadZoom, layer.source.maximumZoomLevel)
+        val zMin = currentZoom.toInt().coerceIn(3, top)
+        val zMax = (zMin + 4).coerceAtMost(top)
+        return zMin..zMax
     }
 
     /** {z}/{y}/{x} ArcGIS tile scheme, optionally with a `?token=` suffix. */
